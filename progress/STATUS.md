@@ -2542,6 +2542,15 @@ chunking behavior observed (does it call `onRead` per-sector, or with arbitrary 
 happens), and a real end-to-end test (classic ESP32 -> wired UART -> S3 -> real car radio)
 before trusting it the way the rest of this project's fixes have been trusted.
 
+**Real hardware limitation worth flagging, not a firmware problem**: Muni sent the actual
+purchase listing for the target board (ESP32-S3-WROOM-1 N16R8 DevKitC-1) — confirms PSRAM=opi
+is the right build flag (8MB Octal PSRAM, not a guess), and that GPIO 26-37 are reserved for
+flash+PSRAM on this specific module (the placeholder UART pins, 17/18, are outside that range,
+fine). One thing worth being aware of for a car deployment specifically: the listed operating
+range is **-40°C to +65°C**. A parked car's interior in direct summer sun can genuinely exceed
+65°C — nothing to fix in firmware, just a real environmental constraint worth knowing about for
+mounting location (e.g. behind a dash panel out of direct sun is safer than on top of one).
+
 **Checklist for tomorrow, once the board exists**:
 1. Flash `esp32-s3-msc.ino` (`arduino-cli upload --fqbn esp32:esp32:esp32s3:USBMode=default,PSRAM=opi`
    after confirming board settings match — verify PSRAM type against the actual module's

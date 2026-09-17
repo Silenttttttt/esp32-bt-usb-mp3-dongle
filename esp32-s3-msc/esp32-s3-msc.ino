@@ -12,17 +12,22 @@
 //
 // STATUS AS OF 2026-09-17 (written the night before the physical board
 // arrives -- see progress/STATUS.md for the full writeup): this compiles
-// clean against esp32:esp32:esp32s3 with USB in OTG/TinyUSB mode, and the
-// logic has been carefully cross-checked line-by-line against the
-// already-validated Python prototype, but **it has NEVER run on real
-// ESP32-S3 hardware** -- there was no board to test on yet. Two things
+// clean against esp32:esp32:esp32s3:USBMode=default,PSRAM=opi (confirmed
+// the right PSRAM setting from the actual purchase listing: ESP32-S3-
+// WROOM-1 N16R8, 16MB Quad flash + 8MB Octal PSRAM), and the logic has
+// been carefully cross-checked line-by-line against the already-validated
+// Python prototype (see esp32-s3-msc/crosscheck/ -- boot sector, FAT
+// table, root directory, ring-buffer/backpressure logic, and UART
+// framing/resync all confirmed byte-for-byte or step-for-step identical
+// to the proven reference), but **it has NEVER run on real ESP32-S3
+// hardware** -- there was no board to test on yet. Two things still
 // specifically need real-hardware verification before trusting this:
 // (1) UART_S3_RX_PIN below (the actual wiring isn't known yet), and
 // (2) whether TinyUSB's msc_read_cb granularity assumptions here
 // (arbitrary byte-range reads, looped internally -- see read_at()) match
 // real host behavior. Treat every "should work" comment below as
-// "reasoned from the working Python prototype and the TinyUSB API docs,
-// not yet hardware-confirmed."
+// "reasoned from the working Python prototype, the TinyUSB API docs, and
+// the real board's own datasheet -- not yet hardware-confirmed."
 //
 // To regenerate silence_primer.h after changing sim/silence_primer.mp3:
 //   python3 -c "
@@ -52,6 +57,17 @@ static const uint32_t MAX_FRAME_LEN = 4096;
 // *** NOT YET HARDWARE-VERIFIED *** -- placeholder pin, pick a real
 // UART-capable GPIO once the board's actual wiring is decided; these are
 // just commonly-free pins on typical ESP32-S3-WROOM-1 DevKitC-1 boards.
+//
+// Real target board confirmed 2026-09-17 (Muni sent the actual purchase
+// listing): ESP32-S3-WROOM-1 N16R8 DevKitC-1 -- 16MB Quad flash + 8MB
+// Octal PSRAM. This matters for pin choice: GPIO 26-32 are dedicated to
+// the Quad flash on ANY ESP32-S3 module, and Octal PSRAM (this module
+// has it -- confirms PSRAM=opi below is the right build flag, not a
+// guess) additionally dedicates GPIO 33-37 (Espressif's own
+// ESP32-S3-WROOM-1 datasheet: "not recommended for other uses" on
+// octal-PSRAM variants). GPIO 17/18 below are well outside that reserved
+// 26-37 range, so no conflict -- but if this pin choice changes once the
+// real wiring is decided, stay outside 26-37 on this specific module.
 #define UART_S3_RX_PIN 18
 #define UART_S3_TX_PIN 17  // unused (classic ESP32 -> S3 is one-way), kept for symmetry
 #define UART_BAUD 921600
