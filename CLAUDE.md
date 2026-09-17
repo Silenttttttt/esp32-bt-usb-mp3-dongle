@@ -35,6 +35,59 @@ purchase listing seen 2026-09-17): ESP32-S3-WROOM-1 N16R8 DevKitC-1 — 16MB Qua
 Octal PSRAM (`PSRAM=opi` build flag, not a guess), dual USB-C, rated -40 to +65°C (a parked car
 in direct summer sun can exceed that — mounting placement matters, not a firmware concern).
 
+## Real power architecture — ONE USB cable into the car radio powers both boards (decided 2026-09-17)
+
+Only ONE physical cable goes into the car radio's USB port. Power for both ESP32 boards comes
+from that same connection, chained:
+
+```
+CAR RADIO's USB port --5V/GND (bus power)--> ESP32-S3 (native USB-OTG port)
+                                                  |
+                                                  +--5V/GND out (tap S3's own 5V/GND pins)--> classic ESP32 (5V/VIN + GND)
+                                                  |
+                                                  +--UART data: S3's UART_S3_RX_PIN <-- classic ESP32's UART0 TX (GPIO1)
+                                                     (+ shared GND, already common via the power tap above)
+```
+
+- The S3's native USB-OTG port (the one presenting as USB-MSC to the radio) is a standard USB
+  connection, so it draws 5V bus power from the radio's port automatically — no separate
+  wiring needed for that leg.
+- The classic ESP32 gets ITS power by tapping the S3's own 5V and GND pins (sourced from that
+  same USB VBUS) — NOT a separate cable/supply. So physically plugging the S3 into the car
+  radio is the only power-related connection needed at install time.
+- Data: classic ESP32's UART0 TX (GPIO1 on a standard classic ESP32 DevKit — the SAME physical
+  signal already being tested over its USB-serial bridge, see below) wires directly to the S3's
+  `UART_S3_RX_PIN` (`esp32-s3-msc.ino`, currently GPIO18 — still a placeholder pending final
+  pin choice once the real board is in hand and GPIO 26-37 stay avoided, see the file's own pin
+  comment). One-way link (classic → S3 only); `UART_S3_TX_PIN` is unused.
+
+**⚠️ Real, unverified risk, flagged here rather than assumed away**: whether a typical cheap
+aftermarket car radio's USB port can actually supply enough current for TWO active Wi-Fi/BT-
+capable ESP32 modules (not just a passive flash drive, which is what these ports are usually
+speced for — some cheap head units budget as little as ~500mA on their USB port). Both boards
+doing real work (Bluetooth classic + Shine MP3 encoding on the classic; USB-OTG + FAT12 serving
+on the S3) could plausibly exceed that. **This needs a real current-draw measurement once the
+S3 board is in hand** (a USB power meter inline, or a multimeter across the tap) — if the
+radio's port can't supply enough, the fallback is powering both boards from an independent
+12V-to-5V step-down (car battery/ignition-switched line) instead of the radio's own USB power,
+while the S3's USB-OTG DATA lines still go to the radio for the actual MSC connection (USB
+allows a device to be data-only from the host's perspective if it doesn't also draw bus power
+for anything beyond what a self-powered device declares). Not yet built or tested either way.
+
+**Clarifying what the CURRENT PC-based test setup actually is, since it's easy to
+misremember**: the classic ESP32 is currently connected to this PC via its own USB cable,
+running `sim/s3_real_firmware_host.cpp` on the PC as a stand-in for the physical S3. This is
+**not** WiFi — WiFi was tried early in this project and abandoned (confirmed by direct heap
+measurement to starve Bluetooth's own init on this chip; see the PC-prototype table below).
+The current connection is genuinely the classic ESP32's real UART0, the exact same signal
+that will run directly to the S3 in the final product — it's just currently tapped through the
+USB-serial bridge chip to reach a PC instead of running straight to another board's RX pin.
+**No firmware code differs between "test mode" and "real mode" for the classic ESP32's data
+path** — only the electrical destination differs (a PC via USB now, a directly-wired S3 later).
+The genuinely real-mode-only pieces still to build/verify are the power-chaining wiring above
+and the final UART pin choice, both hardware tasks that need the physical S3 board in hand, not
+firmware work.
+
 ## What's real hardware vs. what's a PC-side prototype (READ THIS BEFORE "fixing" anything)
 
 | Component | Real hardware, ships as-is | PC-side prototype, gets ported/rewritten, never itself ships |
