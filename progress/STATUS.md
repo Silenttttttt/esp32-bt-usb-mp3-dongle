@@ -2967,3 +2967,69 @@ real but too low-severity/probability (a possible single ~23ms masked blip, at m
 adding synchronization complexity to a real-time-critical Bluedroid task path. No fixes
 warranted from this round — a reassuring result after the major crash fix, not a gap in the
 review.
+
+## Real S3 firmware logic now actually running live in the pipeline, not just cross-checked in isolation (2026-09-17)
+
+Earlier tonight's `esp32-s3-msc/crosscheck/*.cpp` programs re-implemented the same disk logic
+by hand for isolated testing — never the real `.ino`'s own compiled source, never wired into
+the live pipeline. Since the physical S3 board is still a few days out, that gap needed
+closing: the *actual* firmware logic needed to run against the *actual* live classic-ESP32 →
+UART → disk → car radio pipeline, not a parallel simulation of it.
+
+**What changed**: extracted `esp32-s3-msc.ino`'s core disk logic — all of `build_boot_sector`,
+`build_fat`, `build_root_dir`, `disk_append`, `disk_valid_bytes`, `disk_read_at`, and their
+constants/globals — into a new shared header, `esp32-s3-msc/fat_disk_shared.h`, compiled
+verbatim into BOTH the real `.ino` (FreeRTOS mutex primitives) and a new PC-hosted program,
+`sim/s3_real_firmware_host.cpp` (`std::timed_mutex`), via a small `FATDISK_MUTEX_*` macro
+layer. One source, not two hand-copies that could silently drift (the exact class of bug this
+project already hit once: a fix applied to one call site not propagated to another). Re-verified
+`esp32-s3-msc.ino` still compiles clean for `esp32:esp32:esp32s3:USBMode=default,PSRAM=opi`
+after the extraction — unchanged binary size/RAM footprint.
+
+`sim/s3_real_firmware_host.cpp` is the new PC stand-in: opens the real classic ESP32's serial
+port (resolved by serial number, same self-healing reconnect design as
+`s3_sim_serial.py`'s `open_serial_resilient`/`run_serial_bridge`), parses the same UART framing,
+and feeds real frames into the shared `disk_append()`. Serves the mock car radio
+(`car_sim.py`, completely unmodified) over the same `sector_protocol.py` TCP wire format,
+calling the shared `disk_read_at()` directly. **Deliberately does NOT reuse
+`s3_sim_serial.py`'s retry/block-based `serve_radio()` read strategy** — that retry loop is a
+Python-simulator-only design; real hardware's TinyUSB callback can't block, so this program
+calls `disk_read_at()` once per request with no retry, matching what the real firmware will
+actually do. `run_resilient_real_firmware.sh` mirrors `run_resilient.sh` with
+`s3_real_firmware_host` in place of `s3_sim_serial.py`.
+
+Live-tested end to end against the real running classic ESP32 (serial `5B52096812`) and real
+`car_sim.py`: real UART frames ingested (`ENCODE_US` control-frame stats from the real Shine
+encoder visible in the log), real FAT12 volume served and mounted by `car_sim.py`'s own BPB
+parser, real audio flowing through to a real player.
+
+**Resource usage vs. real hardware budget** (ESP32-S3-WROOM-1 N16R8: 512KB SRAM, 8MB Octal
+PSRAM): reported every 5s, split explicitly into what's apples-to-apples comparable to the
+real target (ring buffer = 468.0KB of the 8192KB PSRAM budget, 5.71%; static boot/FAT/root
+caches = 1.5KB of the 512KB SRAM budget, 0.29%) versus PC-process-only overhead that doesn't
+apply to the embedded target (RSS ~4.9MB, most of it libc/thread-stack overhead a firmware
+image never carries). Both real-target-comparable numbers sit comfortably inside budget — no
+resource-sizing surprise waiting for the real board.
+
+**One real, actionable finding from running the real non-retry read logic against real live
+timing** (something no amount of isolated cross-checking could have surfaced): added optional
+diagnostic out-params to the shared `disk_read_at()` (`out_straddled`/`out_lock_missed`,
+default `nullptr`, zero cost on the real `.ino`'s call site) and measured straddle-triggered
+zero-fill events over a continuous ~96s live run. Result: 26 straddles, ALL during the initial
+~0-37s ring-fill/cold-start ramp (expected — the ring genuinely doesn't have real content yet
+at that point, same as a fresh start of the old simulator), then **zero additional straddles
+over 44+ continuous steady-state seconds** once the ring was fully warmed. The corresponding
+`ffmpeg` "Header missing" decoder errors stopped in lockstep (last one ~30s after the last
+straddle, consistent with the already-documented ~9.5-10.6s MP3 decode-buffering floor plus
+backlog). Conclusion: the real firmware's `READ_MARGIN_BYTES` (2 clusters, sized for TinyUSB's
+non-blocking constraint, never tuned against the reader/writer speed data `s3_sim_serial.py`
+had to discover the hard way) is NOT under-provisioned in steady state against currently
+measured real Bluetooth-encoding timing — cold-start-only glitching, not a recurring one.
+Worth re-confirming once the real board is in (a PC's read/scheduling timing isn't identical to
+TinyUSB's), but this is a genuinely reassuring result, not a gap.
+
+Not yet done: a real Bluetooth pause/resume or reconnect exercised specifically against this
+new pipeline (only continuous playback was tested tonight); `run_resilient_real_firmware.sh`
+itself hasn't been stress-tested for its own crash-recovery paths the way `run_resilient.sh`
+was. This program is a stand-in, not a substitute for real-hardware testing once the S3 board
+arrives — see `progress/MORNING_RUNBOOK.md`.
