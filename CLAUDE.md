@@ -24,8 +24,12 @@ PHONE --Bluetooth A2DP--> ESP32 (classic) --wired UART/serial--> ESP32-S3 --USB-
 **Two separate real ESP32 boards are involved, permanently, by hardware design** (not a
 temporary test setup): the classic ESP32 does Bluetooth + encoding; the ESP32-S3 does the
 USB-MSC device role, because only S2/S3 chips have the USB-OTG peripheral needed for that.
-**The S3 side has not been built yet.** Target board once that work starts: ESP32-S3-WROOM-1
-N16R8 DevKitC-1 (16MB flash, 8MB PSRAM, dual USB-C).
+**The physical S3 board has not arrived yet** (expected 2026-09-18) — but its firmware
+(`esp32-s3-msc/esp32-s3-msc.ino`) has already been written and extensively verified without
+hardware (see the table below and `esp32-s3-msc/crosscheck/`). Confirmed target board (real
+purchase listing seen 2026-09-17): ESP32-S3-WROOM-1 N16R8 DevKitC-1 — 16MB Quad flash, 8MB
+Octal PSRAM (`PSRAM=opi` build flag, not a guess), dual USB-C, rated -40 to +65°C (a parked car
+in direct summer sun can exceed that — mounting placement matters, not a firmware concern).
 
 ## What's real hardware vs. what's a PC-side prototype (READ THIS BEFORE "fixing" anything)
 
@@ -34,7 +38,7 @@ N16R8 DevKitC-1 (16MB flash, 8MB PSRAM, dual USB-C).
 | `esp32-bt-mp3-test/esp32-bt-mp3-test.ino` | ✅ **This is real, flashed firmware** running on real hardware right now. Bugs here are real bugs affecting a real drive. | |
 | `sim/fat12_disk.py` (`GrowingFat12Disk`) | | ✅ Prototype — but its **logic** (ring buffer, on-demand sector generation, avoid_straddle margin, unread_protect backpressure) is explicitly meant to be ported near-verbatim into the eventual S3 firmware's `onRead()`/`onWrite()` callbacks. The *algorithm* matters; the Python file itself never ships. |
 | `sim/s3_sim_serial.py` | | ✅ **Pure desktop stand-in for the not-yet-built ESP32-S3.** It runs on a PC/laptop, talks to the real classic-ESP32 over USB-serial (standing in for the eventual wired UART link), and serves the FAT12 ring over a fake local TCP "SCSI READ10" protocol. **This will never run in the car long-term** — it exists purely to validate the ring-buffer/backpressure logic before writing real C for the S3. |
-| `esp32-s3-msc/esp32-s3-msc.ino` | ✅ **Real S3 firmware, written 2026-09-17, night before the board arrives.** A careful line-by-line port of `fat12_disk.py`'s ring-buffer/FAT12 algorithm into C++, using the ESP32 Arduino core's real `USBMSC` class (TinyUSB) for the actual USB-MSC device role, plus a UART receiver matching the classic ESP32's real wire protocol exactly. **Compiles clean, has NEVER run on real hardware** (no board existed yet when it was written) — see its own header comment and `progress/STATUS.md`'s 2026-09-17 S3-firmware entry for the full list of what needs real-hardware verification before trusting it (UART pin assignment, actual TinyUSB read-callback chunking behavior, real timing under the no-blocking-in-onRead design). | |
+| `esp32-s3-msc/esp32-s3-msc.ino` | ✅ **Real S3 firmware, written 2026-09-17, night before the board arrives.** A careful line-by-line port of `fat12_disk.py`'s ring-buffer/FAT12 algorithm into C++, using the ESP32 Arduino core's real `USBMSC` class (TinyUSB) for the actual USB-MSC device role, plus a UART receiver matching the classic ESP32's real wire protocol exactly. **Compiles clean, has NEVER run on real hardware** (no board existed yet when it was written) — but extensively verified without one: `esp32-s3-msc/crosscheck/` has host-only tests proving the FAT12 structures byte-for-byte identical to the Python reference, the ring/backpressure/straddle logic step-for-step identical, real multi-threaded concurrent simulations (real wall-clock timing, hundreds of real seconds, adversarial reader-stall scenarios) showing zero data corruption, and a real uint32_t overflow bug found and fixed (see item 10 below). See the firmware's own header comment and `progress/STATUS.md`'s 2026-09-17 entries for the full list of what STILL needs real-hardware verification (UART pin assignment, actual TinyUSB read-callback timing under real USB host pressure). | |
 | `sim/car_sim.py` | | ✅ **Pure desktop stand-in for the real car radio.** A real FAT12 client that reads the fake SCSI protocol exactly like a real head unit's USB-MSC driver would — used to verify the disk-serving side behaves correctly, without needing the real radio for every test. **Never ships; the real target is the user's actual physical car stereo.** |
 | `firmware/main.c` (Digispark/ATtiny) | | Historical "Stage 1" proof-of-concept — the *original* validation that "declare a fixed FAT12 size, serve sectors on demand" works on real USB-MSC hardware at all, done on completely different (AVR) hardware before the ESP32 phase began. Not part of the current pipeline; kept for reference only. Its vendored dependencies (V-USB, DigiCDC, the micronucleus flashing tool) are intentionally **not** in this repo — they're third-party libraries, not project code; pull them from upstream if this stage is ever revisited. |
 
@@ -100,6 +104,14 @@ Real bugs found and fixed on the real ESP32 firmware + PC-side prototype so far:
    (targeting a suspected MP3-decoder startup floor) had **zero measured effect** — the real
    delay turned out to live in AVDTP negotiation (see item 7), a completely different layer.
    Left in place since it's harmless, just not doing anything useful.
+10. A real `uint32_t` overflow bug in the new S3 firmware — a session-lifetime byte counter
+    would overflow after ~74.6 hours of continuous operation, silently disabling write-side
+    backpressure for ~30s right at that mark. C++-specific (Python's ints are
+    arbitrary-precision, so the earlier byte-for-byte cross-check against `fat12_disk.py`
+    couldn't have caught it) — found by reasoning through fixed-width arithmetic over a long
+    timescale, not by any test failure. Fixed by capping the counter instead of growing it
+    forever; caught and fixed a second bug in the first fix attempt (the capping addition
+    could itself overflow) before trusting it. See `progress/STATUS.md` 2026-09-17.
 
 **Known still-open items**: the residual reconnect-crash rate (item 5, ~15%, likely not
 fixable from application code — see `progress/STATUS.md` for the full stress-test writeup and
@@ -112,6 +124,30 @@ discrepancy between some sessions (low priority); the real ESP32-S3 firmware
 (`esp32-s3-msc/esp32-s3-msc.ino`, written 2026-09-17) has never run on real hardware — see its
 own file header and `progress/STATUS.md`'s bring-up checklist for what needs verification once
 the physical board exists.
+
+## Build/flash commands (for tomorrow, once the S3 board exists)
+
+Classic ESP32 (already flashed, only needed again after a code change):
+```
+cd esp32-bt-mp3-test
+arduino-cli compile --fqbn esp32:esp32:esp32 \
+  --build-property "compiler.c.extra_flags=-DINT2IDX_SIZE=4000 -DDIAG_LOOP_DRAIN -DDIAG_FRAG_TRACE" \
+  --build-property "compiler.cpp.extra_flags=-DINT2IDX_SIZE=4000 -DDIAG_LOOP_DRAIN -DDIAG_FRAG_TRACE" .
+# confirm target port's serial number matches 5B52096812 (see Safety-critical section above) before uploading:
+arduino-cli upload -p /dev/ttyACM<N> --fqbn esp32:esp32:esp32 .
+```
+
+ESP32-S3 (never flashed yet — this is the actual first real upload):
+```
+cd esp32-s3-msc
+arduino-cli compile --fqbn "esp32:esp32:esp32s3:USBMode=default,PSRAM=opi" .
+# confirm the port is actually the S3, not the classic ESP32 or Fin-ESP, before uploading:
+arduino-cli upload -p /dev/ttyACM<N> --fqbn "esp32:esp32:esp32s3:USBMode=default,PSRAM=opi" .
+```
+`PSRAM=opi` is confirmed correct for the real N16R8 module (8MB Octal PSRAM) — don't change it
+without checking the actual module's datasheet first if a different board variant ever gets
+used. `UART_S3_RX_PIN`/`UART_S3_TX_PIN` in the .ino are placeholders (GPIO 18/17) — update them
+to match whatever pins actually get wired to the classic ESP32's TX0 once that's decided.
 
 ## Working conventions established this session
 
