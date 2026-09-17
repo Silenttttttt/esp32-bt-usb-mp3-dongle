@@ -28,9 +28,12 @@ Removing it removes that whole class of bug along with the assumption.
 """
 import argparse
 import gc
+import json
+import os
 import socket
 import subprocess
 import sys
+import time
 
 from sector_protocol import SECTOR_SIZE, read_sectors
 
@@ -56,6 +59,7 @@ def parse_boot_sector(bs):
     total_sectors_16 = int.from_bytes(bs[19:21], "little")
     fat_size_sectors = int.from_bytes(bs[22:24], "little")
     total_sectors_32 = int.from_bytes(bs[32:36], "little")
+    volume_serial = int.from_bytes(bs[39:43], "little")
     assert bytes_per_sector == SECTOR_SIZE, f"unexpected sector size {bytes_per_sector}"
     root_dir_lba = reserved_sectors + num_fats * fat_size_sectors
     root_dir_sectors = -(-(root_entries * 32) // bytes_per_sector)
@@ -84,6 +88,7 @@ def parse_boot_sector(bs):
         "root_dir_sectors": root_dir_sectors,
         "data_lba": data_lba,
         "fat_type": fat_type,
+        "volume_serial": volume_serial,
     }
 
 
@@ -129,6 +134,31 @@ def end_of_chain_marker(fat_type):
     return 0xFF8 if fat_type == "FAT12" else 0xFFF8
 
 
+RESUME_CACHE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".car_sim_resume_cache.json")
+
+
+def load_resume_cache():
+    try:
+        with open(RESUME_CACHE_PATH) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def resume_cache_key(volume_serial, filename):
+    return f"{volume_serial:08x}:{filename}"
+
+
+def save_resume_position(volume_serial, filename, cluster_pos):
+    cache = load_resume_cache()
+    cache[resume_cache_key(volume_serial, filename)] = cluster_pos
+    try:
+        with open(RESUME_CACHE_PATH, "w") as f:
+            json.dump(cache, f)
+    except OSError:
+        pass
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=9003, help="port to connect to (s3_sim_serial.py, or a real-hardware bridge)")
@@ -140,6 +170,23 @@ def main():
                           "only reads at the real MP3 bitrate -- isolates whether real-time "
                           "PACING ALONE (independent of any actual audio decode/output "
                           "complexity) is enough to reproduce a suspected periodic stall.")
+    ap.add_argument("--simulate-radio-resume-cache", action="store_true",
+                     help="OFF by default -- this tool's whole point is being a dumb, direct "
+                          "reader with no memory of its own (see the module docstring). "
+                          "Opt-in simulation of a theorized REAL car radio behavior, not "
+                          "confirmed fact: a real radio hung mid-file on first pairing during "
+                          "actual hardware testing (2026-09-17), and one plausible explanation "
+                          "was the radio caching 'resume playback position' keyed on volume "
+                          "serial + filename -- if the S3's ring content changed underneath an "
+                          "identical-looking volume, resuming into a stale position would "
+                          "explain exactly that symptom. When enabled, persists the last read "
+                          "cluster position per (volume serial, filename) to "
+                          "sim/.car_sim_resume_cache.json and resumes from there on a matching "
+                          "reconnect, instead of always starting at cluster 0 -- lets the real "
+                          "firmware's random-per-boot volume serial (fixed the same night, see "
+                          "progress/STATUS.md) be validated against this specific theorized "
+                          "failure mode entirely on a PC, without needing another physical "
+                          "car-radio trip to find out if it actually defeats it.")
     args = ap.parse_args()
 
     print(f"[radio] connecting to board on port {args.port}...", file=sys.stderr)
@@ -181,6 +228,21 @@ def main():
             cluster_list.append(c)
             c = fat_entry(fat, c, layout["fat_type"])
         num_clusters = len(cluster_list)
+
+        start_cluster_pos = 0
+        if args.simulate_radio_resume_cache:
+            cache = load_resume_cache()
+            key = resume_cache_key(layout["volume_serial"], entry["name"])
+            cached_pos = cache.get(key)
+            if cached_pos is not None and cached_pos < num_clusters:
+                start_cluster_pos = cached_pos
+                print(f"[radio] simulated resume cache hit for {key} -- "
+                      f"resuming at cluster_pos={start_cluster_pos} instead of 0 "
+                      f"(this is the theorized real-radio behavior, not this tool's "
+                      f"normal default)", file=sys.stderr)
+            else:
+                print(f"[radio] simulated resume cache: no entry for {key}, starting at 0",
+                      file=sys.stderr)
 
         if args.throttled_sink:
             # Reads bytes as fast as the OS delivers them but only ever
@@ -253,7 +315,8 @@ def main():
         capture_f = open(args.capture, "wb") if args.capture else None
 
         print("[radio] playing (Ctrl-C to stop)...", file=sys.stderr)
-        cluster_pos = 0
+        cluster_pos = start_cluster_pos
+        last_cache_save = time.monotonic() if args.simulate_radio_resume_cache else None
         while True:
             cluster = cluster_list[cluster_pos]
             lba = layout["data_lba"] + (cluster - 2) * layout["sectors_per_cluster"]
@@ -276,6 +339,9 @@ def main():
                     break
             total_read += len(data)
             cluster_pos = (cluster_pos + 1) % num_clusters
+            if args.simulate_radio_resume_cache and time.monotonic() - last_cache_save >= 1.0:
+                save_resume_position(layout["volume_serial"], entry["name"], cluster_pos)
+                last_cache_save = time.monotonic()
     except KeyboardInterrupt:
         pass
     except FileNotFoundError:

@@ -3283,3 +3283,17 @@ margin-to-ring fraction. Decision: leave it parameterized and documented (see th
 block directly above `SECTORS_PER_CLUSTER` in `fat_disk_shared.h`), and test the real tradeoff
 once the physical S3 board and real car radio are both available together -- no point guessing
 the right number without the hardware that would actually validate it.
+
+## car_sim.py: opt-in simulation of the theorized real-radio resume-cache behavior (2026-09-17)
+
+Muni asked for `car_sim.py` to more closely resemble what the real radio actually does, given
+tonight's findings. Added `--simulate-radio-resume-cache` (default OFF -- the tool's whole
+point is being a dumb, direct reader per its own docstring): when enabled, persists the last
+read cluster position per (volume serial, filename) to `sim/.car_sim_resume_cache.json`
+(gitignored) and resumes from there on a matching reconnect, instead of always starting at
+cluster 0. This models ONE specific, plausible (not confirmed) explanation for the real radio's
+original "started mid-file" symptom -- lets the random-per-boot volume serial fix be validated
+against this exact theorized failure mode entirely on a PC, without needing another physical
+car-radio trip to find out whether it actually defeats it. Not yet functionally tested (syntax-
+checked only) -- the live pipeline was mid-real-audio-session when this was written and wasn't
+interrupted to test it.
