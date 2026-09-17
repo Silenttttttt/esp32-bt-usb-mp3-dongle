@@ -3204,3 +3204,54 @@ independent 12V-to-5V buck converter off switched 12V instead of relying on the 
 power. **This is research-based estimation, not a real measurement** -- still needs a real
 current-draw check (inline USB power meter or multimeter) once the physical S3 board is in
 hand, per CLAUDE.md's power-architecture section.
+
+## MAJOR: FAT12 confirmed compatible with the real car radio (2026-09-17, same night)
+
+The single biggest previously-flagged, previously-unconfirmable risk in this whole project --
+whether Muni's actual real aftermarket car radio would even mount a FAT12 volume at all, since
+many cheap embedded USB-MSC host stacks only support FAT16/32 -- is now resolved, tested against
+the real hardware, independent of the S3 board (which hasn't arrived yet): **prepared real
+physical FAT12 and FAT16 USB thumb drives** (both cheap counterfeit-capacity-inflated sticks;
+one drive of the same batch turned out to be genuinely defective per `f3probe`, 0 usable bytes,
+and was discarded) and plugged each directly into the real radio.
+
+**First attempt, real and informative failure**: FAT12 mounted, found the file, but played
+garbled -- started mid-file, cut off early believing that was the real end. FAT16 mounted, found
+the file, then hung forever trying to read it. Both symptoms pattern-matched the exact bug class
+already found and fixed in `sim/car_sim.py` hours earlier that same night (a FAT driver
+misinterpreting the wrong entry width, corrupting or infinite-looping the cluster chain) --
+though an MP3-decoder-header-misparse (ID3v2/Xing "Info" frame) was an equally plausible
+alternative explanation for the FAT12 symptom specifically, since a decoder-level bug wouldn't
+explain FAT16's outright hang the way a filesystem-level bug would.
+
+**Fix, all plausible variables changed at once given the real cost of each test trip** (physical
+access, not a quick loop): re-encoded the test track with zero ID3/Xing metadata (removes any
+decoder header-misparse risk), reformatted both volumes with much larger clusters -- 32KB
+(64 sectors/cluster), the largest conventionally-supported FAT cluster size -- cutting the
+file's own cluster-chain length from ~695 clusters to ~44 (FAT12) and ~2777 to ~44 (FAT16),
+directly reducing exposure to any chain-walk bug regardless of its exact mechanism; used a fresh
+volume serial/label and a new filename on each drive to rule out any resume-position caching by
+filename/serial; and shortened the test clip to 90s (faster for a real, physical-trip-based
+test to fully judge, and further shrinks chain length on its own). FAT16's minimum-cluster-count
+floor (4085) forced its volume to ~135MB even with 32KB clusters -- unavoidable, but harmless
+for a disposable test file.
+
+**Result: BOTH FAT12 and FAT16 now mount and play correctly, start to finish**, on the real
+radio -- confirmed by Muni directly. ("Ends abruptly at 1:29" on a 90s clip with no fade-out is
+the correct, expected end of the file, not a bug.) Since multiple variables changed
+simultaneously, the exact root cause of the original failure (decoder header vs. FAT chain-walk
+bug vs. something else) is not conclusively isolated -- but the practical, load-bearing result
+is unambiguous: **FAT12, the primary design with the far better ~12.8s catch-up-lag bound, is
+now confirmed to work on the actual target hardware.** This removes the single largest
+previously-open risk before the S3 board itself even arrives.
+
+**Scale check against the real production firmware**: the successful test used a ~44-cluster
+file chain (out of 251 total volume clusters); the ORIGINAL failing test used a ~695-cluster
+chain. The primary firmware's actual production ring (`fat_disk_shared.h`, post tonight's
+ring-size reduction) has only `DATA_CLUSTERS = 50` total -- comparable in scale to the
+SUCCESSFUL test, not the long-chain failure. This is a reasonable (not proven) basis for
+extrapolated confidence that the real firmware's actual small ring won't hit whatever caused
+the original failure, even though it uses smaller 4096B/8-sector clusters rather than the
+32KB clusters used in this diagnostic test -- cluster COUNT, not byte size, is what plausibly
+matters if the failure mode is chain-walk-length-related. Still not a substitute for testing
+the real firmware's actual ring once the S3 board exists.

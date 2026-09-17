@@ -237,14 +237,21 @@ Real bugs found and fixed on the real ESP32 firmware + PC-side prototype so far:
 testing) as of 2026-09-17 night, but 52 cycles isn't infinite and this was tested via the
 desktop as a BlueZ-based BT source, not a real phone yet (see `progress/STATUS.md` for the
 full writeup and methodology caveats) — worth re-confirming with real-phone use before fully
-trusting it's gone; **⚠️ a real, unconfirmed risk found via research (2026-09-17): many cheap
-embedded USB-MSC host stacks (exactly the class of thing in a cheap car radio) only fully
-support FAT16/FAT32 and may reject FAT12 entirely** — this project's whole volume is FAT12
-(chosen for the small ~470KB/~30s declared size, which FAT16 can't do at any reasonable
-cluster size — FAT16 needs ≥4085 clusters). Not confirmed as an actual problem (can only be
-tested with the real radio), but if the radio doesn't mount the drive at all, THIS is the
-first thing to check — see `progress/STATUS.md`'s dedicated entry for the real tradeoff
-(FAT16 would need a much bigger, ~2-minute-catch-up-lag volume) before picking a fix; `/dev/ttyACMx` path
+trusting it's gone; **✅ RESOLVED 2026-09-17: FAT12 confirmed compatible with the real car
+radio.** The earlier flagged risk (cheap USB-MSC host stacks sometimes only support FAT16/32)
+was tested directly — prepared real physical FAT12 and FAT16 test thumb drives and plugged
+each into the actual radio. First attempt failed oddly on both (FAT12 played garbled/wrong
+position, FAT16 hung forever) — pattern-matched the same FAT-entry-width bug class already
+found in `sim/car_sim.py` that same night, though an MP3-decoder-header-misparse was an
+equally plausible alternate explanation. Fixed by changing several plausible variables at once
+(tag-free MP3, much larger 32KB clusters to shorten the file's cluster-chain length, fresh
+volume serial/label/filename): both FAT12 and FAT16 then played correctly, start to finish.
+Root cause not conclusively isolated (multiple variables changed together), but the practical
+result stands — **FAT12, the primary design with the far better ~12.8s catch-up-lag bound, is
+confirmed to work on Muni's actual hardware.** See `progress/STATUS.md`'s "MAJOR: FAT12
+confirmed compatible" entry for the full test, including a scale-check caveat (the real
+production ring is a much shorter cluster chain than either test, closer to the successful
+test's scale than the original failure's). `/dev/ttyACMx` path
 instability + a recurring USB-permission-settle race after re-enumeration (the real ESP32
 firmware self-heals its own reboots automatically now — item 8 — but if a PC/laptop is in the
 loop as an S3 stand-in, that PC-side script needs to auto-recover too — see
