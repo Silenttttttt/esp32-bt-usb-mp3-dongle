@@ -2774,3 +2774,19 @@ identical 200-retry-exhausted + 1-forced-write result as before) — all still s
 corruption. `ring_crosscheck.cpp` vs `fat12_disk.py` now shows one legitimate, documented
 divergence (`total_written`: 479232 capped in C++ vs 1992704 uncapped in Python) with every
 other tracked value still matching exactly.
+
+**Also swept both firmwares' `millis()` usage for the well-known ~49.7-day rollover gotcha**:
+all four usages in the classic ESP32 firmware use the overflow-safe unsigned-subtraction idiom
+(`now - last_x >= threshold`, not a raw `>` comparison), confirmed clean. Also checked
+`pcm_drops` (grows forever, never reset) — at documented real rates (~1/sec sustained
+worst-case) that's a ~136-year overflow horizon, a non-issue (very different from the ring
+counter, which overflowed in just 74.6 hours specifically because it increments by large
+chunks, not by 1, each time).
+
+**Final, real, long-window confirmation the heap-churn fix actually holds**: sampled heap
+fragmentation across the entire current boot session (not just a short window) — from t=3.4min
+through t=46min, `total_free` has sat at a perfectly flat 19964 bytes and `largest_block` at
+13300 bytes for the whole ~43-minute continuous stretch, zero drift. This is the longest real
+observation window available tonight and it's genuinely flat, not just "looked flat in a short
+sample" — solid closing evidence that eliminating the String-concatenation churn actually
+stopped the fragmentation growth, not just reduced its rate.
