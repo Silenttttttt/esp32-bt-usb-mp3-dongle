@@ -51,6 +51,43 @@ find-sync/header-validate/resync logic used in `link_task()`/`receive_from_esp32
 report parsing exactly 3 frames with identical type/length/payload, correctly skipping and
 resyncing past both malformed frames without getting stuck. Confirmed identical 2026-09-17.
 
+## Real-time concurrent simulation (std::thread/std::mutex, real wall-clock timing)
+
+```
+g++ -Wall -std=c++17 -O2 -pthread -o realtime_concurrency_sim realtime_concurrency_sim.cpp
+./realtime_concurrency_sim 180   # seconds to run; 180s = 6 full ring laps
+```
+
+Everything above is single-threaded and scripted (deterministic sequences, no real
+concurrency or timing). This one runs `disk_append()`/`disk_read_data()` (copy-pasted from the
+real firmware, `std::mutex` swapped for `xSemaphore`) on two genuinely concurrent threads with
+REAL wall-clock pacing: a writer thread paced at the real ~16000 B/s audio bitrate in
+variable-sized (256-512B) chunks, a reader thread issuing bursty 512B reads (8 back-to-back,
+then a pause) matching realistic USB-MSC client behavior more closely than a perfectly
+metronomic rate. Each 4-byte-aligned ring position holds a globally-monotonic counter value:
+any read is checked against the *exact* value that should legitimately be there given the
+writer's real total-bytes-written count at the moment of that specific read (computed
+precisely from which "lap" the position belongs to, not eyeballed) — a genuine tear/splice
+would produce a value from the wrong lap, which this catches with zero tolerance for false
+negatives.
+
+**Confirmed 2026-09-17, three separate real-time runs (45s/100s/180s, 1.5/3.34/6.01 full ring
+laps): zero corruption in every run.** Also measured real statistics worth knowing:
+straddle-avoidance triggers on ~1.7-1.8% of reads under this bursty read pattern (i.e. ~1.7-1.8%
+of reads get a brief silent gap instead of real content — the documented tradeoff working as
+designed), and mutex contention is essentially a non-issue (0-3 lock timeouts out of tens of
+thousands of reads, using a stricter zero-wait test than the real firmware's 2ms budget).
+
+**Caught and fixed two real bugs in this test harness itself before trusting the result** —
+worth knowing if this script is ever extended: (1) the first version's corruption check
+couldn't distinguish "two adjacent, legitimately different writer chunks sharing one
+fixed-size read window" from a real splice, producing a huge false-positive count; fixed by
+switching to a continuous per-4-byte-slot counter instead of a per-chunk pattern. (2) the
+fixed version still had a bug at longer runs: it captured the "expected total written" snapshot
+*after* releasing the read lock, leaving a race window for the writer to advance further in
+between and describe a state later than what was actually read; fixed by capturing that value
+atomically inside the same locked section as the actual memcpy.
+
 ## What this does NOT verify
 
 Everything hardware-dependent: real UART timing/framing over an actual

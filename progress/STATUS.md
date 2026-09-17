@@ -2602,6 +2602,47 @@ resyncing past both malformed ones without getting stuck. Also swept both firmwa
 the same class of bug just fixed (heap churn) — confirmed zero remaining dynamic
 allocation/String usage anywhere in either .ino outside the one-time PSRAM alloc at S3 boot.
 
+## Real-time concurrent simulation of the S3 firmware's actual logic (2026-09-17)
+
+Muni's ask: run something as close to the real firmware as possible and see if any real
+limits get hit, not just single-threaded logic checks. Built exactly that
+(`esp32-s3-msc/crosscheck/realtime_concurrency_sim.cpp`): `disk_append()`/`disk_read_at()`
+copy-pasted from the real .ino, `std::mutex` swapped for `xSemaphore`, run on two genuinely
+concurrent `std::thread`s with REAL wall-clock pacing — a writer at the real ~16000 B/s audio
+bitrate, a reader doing bursty 512B reads matching realistic USB-MSC client behavior — not an
+artificially-sped-up scripted sequence.
+
+**First run flagged "corruption" (7290 hits) — investigated and found it was a bug in the test
+itself, not the firmware**: the check couldn't tell "two adjacent, legitimately different
+writer chunks sharing one fixed-size read window" (completely normal, expected) from a real
+splice. Fixed by embedding a continuous globally-monotonic counter at every 4-byte ring
+position instead of a per-chunk pattern, so any read's content can be checked against the
+*exact* value that should legitimately be there. **Second attempt, at a longer duration, ALSO
+flagged corruption (48000 hits) — investigated again rather than trusting the first fix**: this
+one traced to a genuine race in the test harness itself (not the firmware): it captured the
+"expected total written" reference value *after* releasing the read lock, leaving a window for
+the writer to advance further in between and describe a state later than what was actually
+read. Fixed by capturing that reference atomically inside the same locked section as the real
+memcpy.
+
+**With both test-harness bugs fixed: zero corruption across three separate real-time runs**
+(45s/100s/180s = 1.5/3.34/6.01 full ring laps, 11k/25k/45k reads respectively). Real,
+quantified statistics also worth having: straddle-avoidance (the "serve zero-fill instead of
+blocking" tradeoff) triggers on a consistent ~1.7-1.8% of reads under this bursty read
+pattern; mutex contention is essentially a non-issue (0-3 lock timeouts out of tens of
+thousands of reads, and this used a *stricter* zero-wait test than the real firmware's 2ms
+timeout budget, so the real firmware should do at least this well); write-side backpressure
+almost never triggers (the reader comfortably stays ahead under this read cadence).
+
+This is real evidence the core ring-buffer/backpressure/straddle design holds up under
+realistic concurrent load and timing — not proof for the real hardware (FreeRTOS scheduling,
+real UART/USB interrupt latency, and real TinyUSB timing constraints are all still
+unverified), but a meaningfully stronger form of confidence than the single-threaded scripted
+cross-checks alone could provide, obtained without needing the physical board. The two
+self-caught false-positive bugs are worth remembering as a reminder that "the check said
+corruption" isn't the same as "there is corruption" — both got real, investigated, and fixed
+before being trusted, per this project's own established standard.
+
 ## Real stress test: residual reconnect-crash rate + auto-reconnect isolation (2026-09-17)
 
 A WebSearch on the exact assert (`host_recv_pkt_cb hci_hal_h4.c`) turned up other reports of
