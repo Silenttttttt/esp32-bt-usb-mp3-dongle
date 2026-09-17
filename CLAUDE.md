@@ -74,6 +74,23 @@ while the S3's USB-OTG DATA lines still go to the radio for the actual MSC conne
 allows a device to be data-only from the host's perspective if it doesn't also draw bus power
 for anything beyond what a self-powered device declares). Not yet built or tested either way.
 
+**Research-based estimate (2026-09-17, from the actual Espressif datasheets, not a real
+measurement)**: classic ESP32 DevKit ~115-160mA (BT RX-heavy A2DP sink dominates; the software
+Shine encoder itself doesn't meaningfully add to this), ESP32-S3 DevKitC-1 ~90-150mA
+(USB-OTG/MSC, no radio) — combined **~205-310mA sustained, ~300-380mA peak**, against a typical
+~500mA-1A car-radio USB port budget (one concrete data point: Kenwood DDX4021BT's spec page
+states 1A max). **Verdict: plausible, sustained draw has real headroom.** The actual risk is
+**power-up inrush**, not steady-state brownout — both DevKits' LDOs/caps/USB-bridge-chips
+charging simultaneously can spike well above these steady-state figures for tens of ms, and
+cheap ports commonly use polyfuses that trip on that transient rather than true average draw.
+Most likely failure mode: the port cutting off entirely at power-up, not gradual voltage sag.
+Mitigation, cheapest first: (1) a local bulk capacitor (100-470µF low-ESR) across the shared 5V
+input to blunt the inrush spike; (2) bare WROOM modules instead of DevKits (saves ~30-60mA
+combined, worthwhile but not decisive); (3) the independent 12V-to-5V buck fallback above if the
+radio's port still misbehaves. Still needs the real measurement — this is estimation, not proof.
+See `progress/STATUS.md` 2026-09-17's "Power budget for the real install" entry for full
+sourcing (Espressif ESP32/ESP32-S3 datasheets, DevKit-overhead references).
+
 **Clarifying what the CURRENT PC-based test setup actually is, since it's easy to
 misremember**: the classic ESP32 is currently connected to this PC via its own USB cable,
 running `sim/s3_real_firmware_host.cpp` on the PC as a stand-in for the physical S3. This is
@@ -98,7 +115,7 @@ firmware work.
 | `esp32-s3-msc/esp32-s3-msc.ino` | ✅ **Real S3 firmware, written 2026-09-17, night before the board arrives. PRIMARY — use this one first.** A careful line-by-line port of `fat12_disk.py`'s ring-buffer/FAT12 algorithm into C++, using the ESP32 Arduino core's real `USBMSC` class (TinyUSB) for the actual USB-MSC device role, plus a UART receiver matching the classic ESP32's real wire protocol exactly. **Compiles clean, has NEVER run on real hardware** (no board existed yet when it was written) — but extensively verified without one: `esp32-s3-msc/crosscheck/` has host-only tests proving the FAT12 structures byte-for-byte identical to the Python reference, the ring/backpressure/straddle logic step-for-step identical, real multi-threaded concurrent simulations (real wall-clock timing, hundreds of real seconds, adversarial reader-stall scenarios) showing zero data corruption, a real uint32_t overflow bug found and fixed (see item 10 below), and — strongest check of all — a generated disk image mounts cleanly under **Linux's own real vfat kernel driver** (not just this project's own logic), with a real independent MP3 decoder confirming the file plays. See the firmware's own header comment and `progress/STATUS.md`'s 2026-09-17 entries for what STILL needs real-hardware verification (UART pin assignment, actual TinyUSB read-callback timing under real USB host pressure). | |
 | `esp32-s3-msc/fat_disk_shared.h` | ✅ **Real firmware source** — the core disk logic (`build_boot_sector`/`build_fat`/`build_root_dir`/`disk_append`/`disk_valid_bytes`/`disk_read_at`) extracted out of `esp32-s3-msc.ino` into a shared header, `#include`d verbatim by BOTH the real `.ino` and `sim/s3_real_firmware_host.cpp` below (platform differences isolated to a `FATDISK_MUTEX_*` macro layer). One source of truth, not two hand-copies that could drift — see `progress/STATUS.md`'s 2026-09-17 "Real S3 firmware logic now actually running live" entry. | |
 | `sim/s3_real_firmware_host.cpp` | | ✅ **PC-hosted stand-in running the REAL firmware's actual disk logic** (via `fat_disk_shared.h`, not a re-implementation) until the physical S3 board arrives — a stronger substitute for `s3_sim_serial.py` while waiting. Talks to the real classic ESP32 over the real serial link (same self-healing reconnect design) and serves `car_sim.py` unmodified over the same `sector_protocol.py` TCP wire format, but deliberately serves reads with NO retry loop (unlike `s3_sim_serial.py`'s `serve_radio()`) — matching what the real TinyUSB-based firmware will actually do, not a more lenient PC-only simulation. Also reports RAM usage against the real S3's actual 512KB SRAM / 8MB PSRAM budget. Run via `sim/run_resilient_real_firmware.sh` (drop-in swap for `run_resilient.sh`). **Still never run on real hardware** — a PC's read/scheduling timing isn't identical to TinyUSB's, so this is the best available substitute, not equivalent to real-board testing. |
-| `esp32-s3-msc-fat16-fallback/` | ✅ **Real fallback firmware, written 2026-09-17. NOT primary — only use if the real radio confirms it rejects FAT12.** Research found a genuine, unconfirmed risk: many cheap embedded USB-MSC host stacks only support FAT16/32, not FAT12. This is otherwise identical to the primary firmware (same ring/backpressure/UART logic) but uses FAT16 with 512-byte clusters — the smallest cluster size that minimizes FAT16's ≥4085-cluster-minimum size penalty, still costing a real, meaningfully bigger ~2.2min catch-up-lag bound vs. the primary's ~30s (a genuine tradeoff, not a free fix). Compiles clean; also verified via a real Linux vfat mount. Never run on real hardware, never even considered the default — only reach for this if FAT12 is confirmed rejected. | |
+| `esp32-s3-msc-fat16-fallback/` (+ `fat16_disk_shared.h`, `sim/s3_real_firmware_host_fat16.cpp`) | ✅ **Real fallback firmware, written 2026-09-17. NOT primary — only use if the real radio confirms it rejects FAT12.** Research found a genuine, unconfirmed risk: many cheap embedded USB-MSC host stacks only support FAT16/32, not FAT12. This is otherwise identical to the primary firmware (same ring/backpressure/UART logic, now in its own shared header mirroring the primary's) but uses FAT16 with 512-byte clusters — the smallest cluster size that minimizes FAT16's ≥4085-cluster-minimum size penalty, still costing a real, meaningfully bigger ~2.2min catch-up-lag bound vs. the primary's ~12.8s (a genuine tradeoff, not a free fix). Compiles clean (first real compile, not just claimed); verified via a real Linux vfat mount AND live-tested against the real classic ESP32 via its own PC stand-in (`s3_real_firmware_host_fat16.cpp`) — found and fixed a real `car_sim.py` bug in the process (see bug list below). Never run on real S3 hardware, never the default — only reach for this if FAT12 is confirmed rejected. | |
 | `sim/car_sim.py` | | ✅ **Pure desktop stand-in for the real car radio.** A real FAT12 client that reads the fake SCSI protocol exactly like a real head unit's USB-MSC driver would — used to verify the disk-serving side behaves correctly, without needing the real radio for every test. **Never ships; the real target is the user's actual physical car stereo.** |
 | `firmware/main.c` (Digispark/ATtiny) | | Historical "Stage 1" proof-of-concept — the *original* validation that "declare a fixed FAT12 size, serve sectors on demand" works on real USB-MSC hardware at all, done on completely different (AVR) hardware before the ESP32 phase began. Not part of the current pipeline; kept for reference only. Its vendored dependencies (V-USB, DigiCDC, the micronucleus flashing tool) are intentionally **not** in this repo — they're third-party libraries, not project code; pull them from upstream if this stage is ever revisited. |
 
@@ -204,6 +221,17 @@ Real bugs found and fixed on the real ESP32 firmware + PC-side prototype so far:
     ~30s. Fixed by reducing `DATA_CLUSTERS` in `fat_disk_shared.h` from 117 to 50 (~12.8s),
     applying to the real `.ino` too since it's shared source. See `progress/STATUS.md`
     2026-09-17's "First real phone test" entry.
+13. Brought the FAT16 fallback up to the same real-tested rigor as the FAT12 primary (shared
+    header, live PC-stand-in test against the real classic ESP32) and found a real bug doing
+    it: `sim/car_sim.py`'s FAT chain-walker called `fat12_entry()` unconditionally regardless of
+    which volume it was reading — against a genuine FAT16 volume this misreads the flat 16-bit
+    entries as FAT12's 12-bit packed ones, producing a chain that never hits its end marker.
+    Confirmed live: the process spun forever appending to a list, consuming ~12.7GB of RAM
+    before being killed. Fixed by detecting FAT12 vs FAT16 from the actual data cluster count
+    (the real FAT spec rule) and dispatching to the correct entry-parser, plus a hard iteration
+    cap as a backstop. No regression on the FAT12 primary (re-verified). See
+    `progress/STATUS.md` 2026-09-17's "FAT16 fallback brought up to the same real-tested rigor"
+    entry.
 
 **Known still-open items**: the reconnect-crash rate (item 5) — believed solved (0/52 in
 testing) as of 2026-09-17 night, but 52 cycles isn't infinite and this was tested via the

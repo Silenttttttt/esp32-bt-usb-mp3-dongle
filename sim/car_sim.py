@@ -53,11 +53,27 @@ def parse_boot_sector(bs):
     reserved_sectors = int.from_bytes(bs[14:16], "little")
     num_fats = bs[16]
     root_entries = int.from_bytes(bs[17:19], "little")
+    total_sectors_16 = int.from_bytes(bs[19:21], "little")
     fat_size_sectors = int.from_bytes(bs[22:24], "little")
+    total_sectors_32 = int.from_bytes(bs[32:36], "little")
     assert bytes_per_sector == SECTOR_SIZE, f"unexpected sector size {bytes_per_sector}"
     root_dir_lba = reserved_sectors + num_fats * fat_size_sectors
     root_dir_sectors = -(-(root_entries * 32) // bytes_per_sector)
     data_lba = root_dir_lba + root_dir_sectors
+    total_sectors = total_sectors_16 if total_sectors_16 else total_sectors_32
+    # Real FAT drivers determine FAT12 vs FAT16 vs FAT32 from the DATA
+    # CLUSTER COUNT (the actual FAT spec rule), not the informational
+    # filesystem-type label string at bytes 54-61 (that field is
+    # advisory only, per the spec) -- REAL BUG FOUND live tonight: this
+    # reader used to call fat12_entry() unconditionally regardless of
+    # which volume it was reading, which silently misinterprets FAT16's
+    # flat 16-bit entries as FAT12's 12-bit packed ones, producing
+    # garbage cluster-chain values that may never hit an end-of-chain
+    # marker -- confirmed to spin forever appending to cluster_list,
+    # consuming a car_sim.py process's memory unboundedly (~12.7GB
+    # before being killed) against the FAT16 fallback firmware.
+    data_clusters = (total_sectors - data_lba) // sectors_per_cluster if sectors_per_cluster else 0
+    fat_type = "FAT12" if data_clusters < 4085 else "FAT16"
     return {
         "sectors_per_cluster": sectors_per_cluster,
         "reserved_sectors": reserved_sectors,
@@ -67,6 +83,7 @@ def parse_boot_sector(bs):
         "root_dir_lba": root_dir_lba,
         "root_dir_sectors": root_dir_sectors,
         "data_lba": data_lba,
+        "fat_type": fat_type,
     }
 
 
@@ -90,6 +107,26 @@ def fat12_entry(fat_bytes, cluster):
     if cluster % 2 == 0:
         return fat_bytes[offset] | ((fat_bytes[offset + 1] & 0x0F) << 8)
     return (fat_bytes[offset] >> 4) | (fat_bytes[offset + 1] << 4)
+
+
+def fat16_entry(fat_bytes, cluster):
+    offset = cluster * 2
+    return int.from_bytes(fat_bytes[offset:offset + 2], "little")
+
+
+def fat_entry(fat_bytes, cluster, fat_type):
+    return fat12_entry(fat_bytes, cluster) if fat_type == "FAT12" else fat16_entry(fat_bytes, cluster)
+
+
+def end_of_chain_marker(fat_type):
+    # FAT12 end-of-chain/reserved values start at 0xFF8; FAT16's start at
+    # 0xFFF8 -- a chain walker comparing against the wrong threshold could
+    # either stop too early (FAT16 entries 0xFF8-0xFFF7 are ordinary valid
+    # cluster numbers, not reserved) or never stop (comparing FAT12
+    # entries against 0xFFF8 would treat everything below it as a valid
+    # next-cluster, including values that share the FAT12 end-marker
+    # range from garbage/uninitialized entries).
+    return 0xFF8 if fat_type == "FAT12" else 0xFFF8
 
 
 def main():
@@ -133,9 +170,16 @@ def main():
 
         cluster_list = []
         c = entry["first_cluster"]
-        while c < 0xFF8:
+        eoc = end_of_chain_marker(layout["fat_type"])
+        # Hard safety bound (65524 is FAT16's own max valid cluster count,
+        # the largest either variant here can legitimately produce) --
+        # guards against ANY future variant of the bug above (a
+        # misdetected/corrupt FAT type producing a chain that never hits
+        # its end marker) hanging this process forever / exhausting
+        # memory again, instead of just trusting the loop to terminate.
+        while c < eoc and len(cluster_list) <= 65524:
             cluster_list.append(c)
-            c = fat12_entry(fat, c)
+            c = fat_entry(fat, c, layout["fat_type"])
         num_clusters = len(cluster_list)
 
         if args.throttled_sink:

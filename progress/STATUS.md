@@ -3113,3 +3113,94 @@ Not yet done: a real-phone confirmation that the delay is now actually ≤15s en
 validated via silence-injection proxy + analytical ring-size math so far, deliberately avoiding
 a second BT reconnection cycle that would have overwritten the phone's newly-correct
 `last_connection` NVS entry back to the desktop).
+
+**Update**: Muni retested with the real phone afterward and confirmed ~20s (down from ~30s,
+within the accepted 10-15s-ish range he called "fine"). Breakdown, backed by the actual log
+data from that test: the ring/margin logic itself was clean (straddle count didn't move at all
+during the transition to real audio), so the delay isn't a glitch -- it's two separate,
+stacking, one-time-per-play-session costs: (1) ring "catch-up" lag, now bounded to ≤12.8s (the
+reader runs faster than the writer on average, so it laps the writer repeatedly over a session;
+when real audio lands at the writer's current position, the reader has to come back around to
+that exact position again, bounded by ring size), plus (2) the already-known ~9.5-10.6s MP3
+decoder buffering floor, unrelated to the ring, inherent to decoding a live slowly-arriving
+MP3 stream. ~12.8+10 ≈ matches the observed ~20-23s. Neither recurs after the first sound.
+
+## FAT16 fallback brought up to the same real-tested rigor as the FAT12 primary, and a real bug found in the process (2026-09-17, same night)
+
+Muni asked what's actually missing before this is done, prompting a look at whether the FAT16
+fallback (written and Linux-vfat-verified earlier tonight, but never live-tested and never even
+compiled against arduino-cli per its own header comment) deserved the same treatment as the
+FAT12 primary got. It did.
+
+Extracted its disk logic into `esp32-s3-msc-fat16-fallback/fat16_disk_shared.h`, mirroring
+`esp32-s3-msc/fat_disk_shared.h`'s structure (same platform-abstraction macros, same
+ring/backpressure/read logic) but with FAT16's boot-sector/FAT-table construction. This is a
+SEPARATE file from the FAT12 primary's shared header, not a further-unified one -- build_fat()'s
+bit-packing genuinely differs (12-bit vs flat 16-bit entries) and unifying them wasn't worth the
+complexity for a low-priority fallback; a comment in both files cross-references the other so a
+future ring-logic bug fix in one is more likely to get checked against the other. Refactored
+`esp32-s3-msc-fat16-fallback.ino` to use it -- **this is now the first time this fallback has
+actually been compiled** (arduino-cli compile clean, `esp32:esp32:esp32s3:USBMode=default,
+PSRAM=opi`). Also fixed a stale copy-paste bug in its own boot log line (printed "FAT12 volume"
+unconditionally, left over from being copied from the primary).
+
+Built `sim/s3_real_firmware_host_fat16.cpp` (twin of `s3_real_firmware_host.cpp`, different
+include + port 9402) and ran it live against the real classic ESP32 with `car_sim.py` as the
+client.
+
+**Real bug found and fixed**: `car_sim.py`'s FAT cluster-chain walker called `fat12_entry()`
+unconditionally, regardless of which volume it was actually reading. Against a genuine FAT16
+volume, this misinterprets FAT16's flat 16-bit entries as FAT12's 12-bit packed ones, producing
+garbage "next cluster" values that can fail to ever hit an end-of-chain marker. Confirmed live:
+the process spun in the cluster-chain-building loop, appending forever, and had consumed
+**~12.7GB of RAM** before being killed -- a real, load-bearing bug in a tool used throughout
+this whole project, invisible until something actually exercised it against a real FAT16 volume
+for the first time tonight. Fixed by having `parse_boot_sector()` detect FAT12 vs FAT16 from
+the DATA CLUSTER COUNT (the actual FAT spec rule: <4085 clusters = FAT12, else FAT16 here --
+not the informational type-label string at bytes 54-61, which is advisory only per spec),
+dispatching to the correct entry-parser (`fat12_entry`/new `fat16_entry`) and end-of-chain
+threshold (`0xFF8` vs `0xFFF8`) accordingly. Also added a hard iteration cap (65524, FAT16's own
+max valid cluster count) on the chain walk regardless of type, as a backstop against any future
+variant of this bug class hanging the process again. Re-verified against the FAT12 primary
+afterward (no regression: `fat_type: 'FAT12'` still detected correctly, pipeline healthy).
+
+Re-tested FAT16 live after the fix: mounted correctly, reached real playback, zero crashes,
+only 3 straddle-triggered zero-fill events in the first 20s (much lower cold-start-ramp
+overhead than FAT12 relatively speaking, though the ring itself is ~10x bigger so the full
+ramp-to-steady-state would take proportionally longer, untested to completion here -- FAT12
+remains the priority, this was validation, not a full soak test). Restored the FAT12 primary
+pipeline afterward for continued real use.
+
+## Power budget for the real install: researched, not yet measured (2026-09-17, same night)
+
+Muni's planned power architecture (documented above, "Real power architecture" in CLAUDE.md):
+the car radio's USB port powers the S3, which in turn powers the classic ESP32 by tapping its
+own 5V/GND -- meaning ONE port has to supply both boards. Researched real datasheet numbers
+(Espressif ESP32 Series Datasheet v5.3, ESP32-S3 Series Datasheet v2.2, both fetched and read
+directly) rather than guessing:
+
+- Classic ESP32 DevKit (BT Classic A2DP sink + software Shine encoding): ~95-130mA chip-level
+  (BT RX-heavy workload; the encoder itself doesn't meaningfully add to this since the radio
+  dominates), ~115-160mA including typical DevKit overhead (LDO quiescent, USB-UART bridge
+  chip, status LED).
+- ESP32-S3-WROOM-1 N16R8 DevKitC-1 (USB-OTG/MSC, no BT/WiFi): ~60-130mA chip-level (Modem-sleep
+  CPU-active figures, radio off, plus an estimated PSRAM/USB-PHY adder), ~90-150mA with DevKit
+  overhead.
+- Combined: **~205-310mA sustained, ~300-380mA peak**.
+- Car radio USB ports meant for flash-drive playback commonly budget ~500mA-1A (one concrete
+  data point: Kenwood DDX4021BT spec page states 1A max) -- no universal spec found, genuinely
+  varies by brand/model.
+
+**Verdict: plausible, with a real risk to manage** -- sustained draw has real headroom even at
+a pessimistic 500mA floor. The actual risk is **power-up inrush** (both DevKits' LDOs/caps/
+bridge-chips charging simultaneously can spike well above steady-state for tens of ms), and
+cheap aftermarket ports commonly use polyfuses that trip on that transient rather than true
+average draw -- most likely failure mode is the port cutting off entirely at power-up, not
+gradual brownout/BT instability. Mitigations in order of effectiveness: (1) a local bulk
+capacitor (100-470µF low-ESR) across the shared 5V input to blunt the inrush spike -- cheapest,
+addresses the actual failure mode directly; (2) bare WROOM modules instead of DevKits (saves
+~30-60mA combined, worthwhile but not decisive); (3) if the radio's port still misbehaves, an
+independent 12V-to-5V buck converter off switched 12V instead of relying on the radio's own USB
+power. **This is research-based estimation, not a real measurement** -- still needs a real
+current-draw check (inline USB power meter or multimeter) once the physical S3 board is in
+hand, per CLAUDE.md's power-architecture section.

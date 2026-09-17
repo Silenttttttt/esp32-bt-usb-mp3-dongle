@@ -11,3 +11,4 @@ esp32-s3-msc/crosscheck/link_crosscheck
 esp32-s3-msc/crosscheck/realtime_concurrency_sim
 esp32-s3-msc/crosscheck/reader_stall_sim
 sim/s3_real_firmware_host
+sim/s3_real_firmware_host_fat16
