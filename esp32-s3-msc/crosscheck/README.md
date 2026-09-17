@@ -88,6 +88,31 @@ fixed version still had a bug at longer runs: it captured the "expected total wr
 between and describe a state later than what was actually read; fixed by capturing that value
 atomically inside the same locked section as the actual memcpy.
 
+## Adversarial reader-stall test (real backpressure engagement)
+
+```
+g++ -Wall -std=c++17 -O2 -pthread -o reader_stall_sim reader_stall_sim.cpp
+./reader_stall_sim 100 65   # total run seconds, stall seconds (must be > 2x ring duration to matter)
+```
+
+The concurrency sim above barely exercised `unread_protect` backpressure (the bursty reader
+stayed too well caught-up). This variant makes the reader do a genuine, real multi-second dead
+stall (simulating a crashed/stuck host) before resuming, forcing the writer to actually hit
+the protection path. **A stall must exceed *two* full ring durations to matter** — the ring's
+very first-ever wrap is always unprotected by design (matches `fat12_disk.py`'s own comment:
+nothing before the first full lap has been "consumed" in any meaningful sense yet), so the
+writer only re-approaches the stale `last_read_offset` on its *second* attempt to pass that
+position, one full lap later. (First tried a 40s stall on this 30s-capacity ring — 0 rejections,
+looked wrong until traced through: only 1.3 laps completed, never reached the second approach.)
+
+**Confirmed 2026-09-17** with a 65s stall (2.17 ring durations): real backpressure engaged
+exactly as designed — `write_protected_rejections=200` (one write exhausted the full
+`MAX_WRITE_RETRIES` budget), `forced_writes=1` (the retry-exhausted fallback fired once,
+matching `link_task()`'s real behavior) — and **zero corruption**, even through the forced
+fallback. This is the exact adversarial scenario ("the reader crashes/stalls for longer than
+the whole ring") the project has been designed to survive since early sessions — confirmed
+here to actually hold up.
+
 ## What this does NOT verify
 
 Everything hardware-dependent: real UART timing/framing over an actual

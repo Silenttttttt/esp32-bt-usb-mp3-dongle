@@ -2643,6 +2643,22 @@ self-caught false-positive bugs are worth remembering as a reminder that "the ch
 corruption" isn't the same as "there is corruption" — both got real, investigated, and fixed
 before being trusted, per this project's own established standard.
 
+**Follow-up: the realistic bursty-reader test above barely ever exercised `unread_protect`
+backpressure at all (0-2 rejections across 325 seconds)** — the reader stayed too well
+caught-up. Built a second, deliberately adversarial variant
+(`esp32-s3-msc/crosscheck/reader_stall_sim.cpp`): the reader does a genuine, real multi-second
+dead stall (no polling at all, simulating a crashed/stuck host) before resuming. First attempt
+(40s stall on the 30s-capacity ring) showed 0 rejections, which looked wrong at first — traced
+it through and found the ring's very first-ever wrap is always unprotected *by design* (matches
+`fat12_disk.py`'s own comment about nothing before the first full lap having been "consumed"
+yet), so a stall has to exceed *two* full ring durations before the writer even gets a second
+chance to approach the stale `last_read_offset`. Reran with a 65s stall (2.17 ring durations):
+**real backpressure engaged exactly as designed** — one write exhausted the full
+`MAX_WRITE_RETRIES=200` budget, the forced-fallback fired once (matching `link_task()`'s real
+retry-then-force behavior) — and zero corruption, even through the forced write. This directly
+validates the exact scenario ("reader crashes/stalls longer than the whole ring") this
+project has been designed to survive since early sessions.
+
 ## Real stress test: residual reconnect-crash rate + auto-reconnect isolation (2026-09-17)
 
 A WebSearch on the exact assert (`host_recv_pkt_cb hci_hal_h4.c`) turned up other reports of
