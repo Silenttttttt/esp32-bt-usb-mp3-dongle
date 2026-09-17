@@ -39,6 +39,18 @@ exactly. Confirmed identical 2026-09-17: `writes_done=3892 reads_done=2000
 straddle_hits=40 protected_rejections=0 final write_pos=75776
 total_written=1992704 last_read_offset=315392` on both sides.
 
+## UART framing / resync logic
+
+```
+g++ -Wall -std=c++17 -o link_crosscheck link_crosscheck.cpp && ./link_crosscheck
+python3 link_crosscheck.py
+```
+Both feed an identical synthetic byte stream (leading garbage, a valid `A` frame, a bad-type
+frame, a valid `C` frame, an oversized-length frame, a final valid `A` frame) through the same
+find-sync/header-validate/resync logic used in `link_task()`/`receive_from_esp32()`. Both must
+report parsing exactly 3 frames with identical type/length/payload, correctly skipping and
+resyncing past both malformed frames without getting stuck. Confirmed identical 2026-09-17.
+
 ## What this does NOT verify
 
 Everything hardware-dependent: real UART timing/framing over an actual

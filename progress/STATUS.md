@@ -2568,3 +2568,11 @@ count, all identical). This doesn't replace real hardware validation (UART timin
 TinyUSB callback behavior, PSRAM allocation are all still unverified), but it does mean the
 core algorithm port itself is verified correct against the trusted reference, not just
 eyeballed.
+
+Also cross-checked the UART frame-parsing/resync logic (`link_task()` vs
+`receive_from_esp32()`/`find_sync()`): fed both an identical synthetic byte stream (leading
+garbage, a valid frame, a bad-type frame, a valid frame, an oversized-length frame, a final
+valid frame) and confirmed both extract the exact same 3 frames, correctly skipping and
+resyncing past both malformed ones without getting stuck. Also swept both firmware files for
+the same class of bug just fixed (heap churn) — confirmed zero remaining dynamic
+allocation/String usage anywhere in either .ino outside the one-time PSRAM alloc at S3 boot.
