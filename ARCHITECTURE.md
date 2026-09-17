@@ -4,6 +4,30 @@ Diagrams of the real end-state hardware/data/power design, and of the current
 PC-based test setup used while the physical ESP32-S3 board is still in transit.
 GitHub renders the Mermaid blocks below natively.
 
+## ⚠️ FAQ: "Is the classic↔S3 link WiFi? Do I need a flag to enable the real wired transport?"
+
+**No, and no.** This comes up repeatedly enough to state it as plainly as possible:
+
+- **Both firmware images have exactly ONE data-transport mode each — real wired
+  UART, always, unconditionally.** There is no WiFi code path, no flag, no build
+  option to switch between "test mode" and "real mode" for this link, because
+  there is only one mode.
+- Classic ESP32 (`esp32-bt-mp3-test.ino`): sends every byte via plain
+  `Serial.write(...)` — that's real hardware UART0. Grep the file for `WiFi` and
+  the only hit is a comment recalling that WiFi was tried very early in this
+  project's history and abandoned (it starved Bluetooth's own init) — there is
+  no `#include <WiFi.h>`, no WiFi object, no WiFi code actually running anywhere.
+- S3 firmware (`esp32-s3-msc.ino` / the FAT16 fallback): receives via
+  `HardwareSerial LinkSerial(1)` on real GPIO pins (`UART_S3_RX_PIN`/
+  `UART_S3_TX_PIN`) — real UART1, unconditionally.
+- **The "PC-based test setup" is not a different transport** — it's the exact
+  same UART0 signal from the classic ESP32, currently tapped through its
+  onboard USB-serial bridge chip to reach a PC's `/dev/ttyACM*` port, instead of
+  running straight into a real S3's GPIO pin over a couple centimeters of wire.
+  When the real S3 board exists, the change is **wiring only**: connect the
+  classic ESP32's TX0 pin (GPIO1) directly to the S3's `UART_S3_RX_PIN`, plus
+  common ground. Zero firmware changes on either side.
+
 ## Real end-state (what actually ships)
 
 Two ESP32 boards, permanently, by hardware design — not a temporary test

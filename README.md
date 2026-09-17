@@ -9,6 +9,14 @@ from whatever's currently playing over Bluetooth.
 **See `ARCHITECTURE.md` for full diagrams** — the real end-state hardware/data/power
 design, the current PC-based test setup, and the FAT12-vs-FAT16 decision.
 
+> **The classic↔S3 link is real wired UART, not WiFi, with no flag to switch modes.**
+> Both firmware images have exactly one transport implementation each, used
+> unconditionally today and in the final install — see `ARCHITECTURE.md`'s FAQ section
+> for the exact source lines proving this. The only difference between the current
+> PC-based test setup and the real S3 board is which physical device sits on the other
+> end of that same UART signal: a PC's USB-serial port today, a direct wire to the S3's
+> RX pin once it arrives. No code changes either way.
+
 ## How it works
 
 ```
