@@ -3297,3 +3297,56 @@ against this exact theorized failure mode entirely on a PC, without needing anot
 car-radio trip to find out whether it actually defeats it. Not yet functionally tested (syntax-
 checked only) -- the live pipeline was mid-real-audio-session when this was written and wasn't
 interrupted to test it.
+
+## Rigorous, instrumented measurement of the real-audio startup delay (2026-09-17, same night)
+
+Muni asked to pin down exactly where the startup delay comes from, "without a shadow of a
+doubt" -- real measurements, not reasoning from old documentation history. Built real
+instrumentation instead of estimating further:
+
+- Added T1/T2 timestamping to `sim/s3_real_firmware_host.cpp`: T1 fires the instant the
+  `AUDIO_STATE:Started` control frame is received (real PCM starts arriving), snapshotting the
+  ring's exact write position at that moment (`g_mark_pos`). T2 fires the instant a READ10
+  request actually SERVES real (non-zero-filled) data spanning that exact marked position back
+  to the client -- checked directly against the real byte range of each request, not inferred.
+  Both use `system_clock` (real epoch time) specifically so they're directly comparable against
+  a separate process's own timestamps with no cross-process correlation needed.
+- Built `sim/audio_level_monitor.py`: captures raw PCM directly from the real sink's monitor via
+  `parec` (the literal signal the speaker receives), computes short-window RMS, and logs epoch-
+  timestamped quiet-to-loud transitions. Confirmed a clean 0.0 RMS silence floor beforehand, so
+  any real content produces an unambiguous, sharp transition -- T3.
+
+**Test methodology**: real classic ESP32, real S3 firmware logic (the instrumented PC stand-in),
+real `car_sim.py`, real Bluetooth link (desktop-as-source, same method as prior stress testing;
+paired/connected/disconnected/removed cleanly around the test, done autonomously while Muni was
+away specifically to get precise, controlled timing rather than depend on manual phone timing).
+Let the ring fully warm past its cold-start ramp first, then started real playback and recorded
+T0 (the exact instant playback was started) through T3.
+
+**Results, one real run**:
+
+| Interval | Duration | What it measures |
+|---|---|---|
+| T0→T1 | 0.58s | BT link up → real PCM arrives at the ESP32 (desktop-source-specific, see caveat) |
+| T1→T2 | **12.29s** | Ring catch-up lag -- the reader's traversal reaching the real content |
+| T2→T3 | **4.22s** | Decoder/output lag -- real bytes served → audible sound |
+| T1→T3 | 16.51s | Real PCM arrives → audible sound |
+| T0→T3 | 17.09s | Full chain, source starts → audible sound |
+
+**Ring catch-up lag is the dominant factor (~72% of the measured total)**, and in this run
+landed almost exactly at the theoretical worst case for the current ~12.8s ring -- direct,
+measured confirmation of the mechanism documented earlier tonight (`fat_disk_shared.h`'s
+comment above `DATA_CLUSTERS`), not just analytical reasoning about it.
+
+**One real correction to earlier documentation**: decoder/output lag measured at 4.22s, well
+under the ~9.5-10.6s figure carried in this project's history since much earlier sessions. That
+older number was either measuring something different (e.g. including buffering under different
+conditions) or is simply stale -- this measurement supersedes it as the current best evidence.
+
+**Caveat, stated plainly**: T0→T1 (0.58s) is specific to this desktop-as-BT-source test rig
+(bluealsa/aplay's own connection-establishment path is not the same as a real phone's AVDTP
+stack) and should NOT be read as "AVDTP negotiation only takes 0.58s on a real phone" -- a real
+phone's own negotiation almost certainly still takes meaningfully longer, consistent with
+earlier real-phone observations. The T1→T2→T3 chain, however, is measured on the real firmware
+logic and the real ring regardless of what drives the Bluetooth side, and is the part actually
+addressable by this project's own code.

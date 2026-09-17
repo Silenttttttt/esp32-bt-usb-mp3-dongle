@@ -71,6 +71,27 @@ static const double PORT_SETTLE_DELAY_SEC = 0.5;
 static const uint8_t OPCODE_READ10 = 0x01;
 static const uint8_t OPCODE_WATERMARK = 0x02;
 
+// ===================== Rigorous delay-chain measurement (2026-09-17) ===============
+//
+// All three timestamps below use system_clock (real wall-clock/epoch time,
+// not steady_clock's arbitrary per-process origin) specifically so they're
+// directly comparable against a SEPARATE process's own epoch timestamps
+// (the audio-level monitor script measuring T3, run independently). T1 is
+// captured the instant this program RECEIVES the AUDIO_STATE:Started
+// control frame (i.e. the moment real PCM starts being written into the
+// ring) -- g_mark_pos snapshots the ring's write position at that exact
+// moment. T2 is captured the instant a READ10 request actually SERVES
+// real (non-zero-filled) data spanning that exact marked position back to
+// the client -- i.e. the moment the reader's own traversal genuinely
+// reaches the real content, not "should have by now" reasoning.
+static std::atomic<bool> g_mark_active{false};
+static std::atomic<uint32_t> g_mark_pos{0};
+static std::atomic<bool> g_mark_found{false};
+
+static double epoch_now() {
+  return std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
 // ===================== Serial port resolution (mirrors s3_sim_serial.py) ===========
 
 static bool resolve_serial_port(const char *expected_serial, char *out_path, size_t out_len) {
@@ -226,6 +247,15 @@ static void receive_from_esp32(int fd) {
       memcpy(text, payload, length);
       text[length] = 0;
       fprintf(stderr, "[s3-host][CONTROL] %s\n", text);
+
+      if (strstr(text, "AUDIO_STATE:Started")) {
+        g_mark_pos.store(g_write_pos);
+        g_mark_found.store(false);
+        g_mark_active.store(true);
+        fprintf(stderr, "[s3-host][DELAY-MEASURE] T1 epoch=%.6f mark_pos=%u "
+                         "(real PCM starts arriving; ring write position snapshotted)\n",
+                epoch_now(), g_mark_pos.load());
+      }
     }
 
     auto now = std::chrono::steady_clock::now();
@@ -311,10 +341,30 @@ static void serve_radio(int conn) {
       uint32_t len = (uint32_t)count * SECTOR_SIZE;
       static uint8_t buf[65536];
       if (len > sizeof(buf)) len = sizeof(buf);
+      uint64_t abs_pos = (uint64_t)lba * SECTOR_SIZE;
       bool straddled = false, lock_missed = false;
-      disk_read_at((uint64_t)lba * SECTOR_SIZE, buf, len, &straddled, &lock_missed);
+      disk_read_at(abs_pos, buf, len, &straddled, &lock_missed);
       if (straddled) straddle_count++;
       if (lock_missed) lock_miss_count++;
+
+      // T2: the instant the reader's own traversal genuinely reaches the
+      // exact ring position marked at T1 -- checked directly against
+      // whether THIS request's byte range covers that position AND was
+      // actually served as real data (not zero-filled), not inferred.
+      if (g_mark_active.load() && !g_mark_found.load()) {
+        const uint32_t data_region_start = FIRST_DATA_LBA * SECTOR_SIZE;
+        if (abs_pos >= data_region_start) {
+          uint32_t data_off = (uint32_t)(abs_pos - data_region_start);
+          uint32_t mark = g_mark_pos.load();
+          if (data_off <= mark && mark < data_off + len && !straddled) {
+            g_mark_found.store(true);
+            fprintf(stderr, "[s3-host][DELAY-MEASURE] T2 epoch=%.6f "
+                             "(reader traversal reached the T1-marked real content)\n",
+                    epoch_now());
+          }
+        }
+      }
+
       if (!send_all(conn, buf, len)) break;
       read_count++;
     } else if (opcode == OPCODE_WATERMARK) {
