@@ -260,6 +260,27 @@ static inline uint32_t disk_valid_bytes() {
 // audible splice. This has NOT been validated on real hardware for
 // how often it actually triggers under real USB read timing -- may need
 // tuning (e.g. the margin below) once real behavior is observable.
+//
+// A theoretically better primitive exists and was already identified by
+// this project's own pre-porting research (progress/RESEARCH_BT_TO_USB_MSC.md
+// §2, written before any S3 code existed): real TinyUSB supports
+// TUD_MSC_RET_BUSY/TUD_MSC_RET_ASYNC + tud_msc_async_io_done(), letting a
+// read say "not ready, I'll signal you" instead of committing to
+// zero-fill immediately -- closer to the Python prototype's retry
+// behavior, without blocking. **Deliberately not used here**: checked
+// directly (2026-09-17) and the Arduino `USBMSC` class's own
+// `tud_msc_read10_cb` glue (core's USBMSC.cpp) is a plain synchronous
+// passthrough with no BUSY/ASYNC support at all -- using the real async
+// primitive would mean bypassing USBMSC entirely and hand-writing the
+// raw TinyUSB integration, a much bigger, harder-to-get-right, and
+// currently completely untestable (no hardware) undertaking. That
+// research also flagged a real maintainer-filed TinyUSB bug in this
+// exact BUSY/pending-read path (hathach/tinyusb#2035, open ~2 years,
+// closed Aug 2025) -- whether the bundled TinyUSB version here even has
+// that fix hasn't been checked. If real-hardware testing shows the
+// zero-fill gaps below are audibly bothersome, THIS is the documented
+// next lever to pull -- not a reason to have guessed at it blind
+// tonight.
 static const uint32_t READ_MARGIN_BYTES = 2 * CLUSTER_SIZE;  // ~0.5s headroom
 
 // Fills `buffer[0..len)` from the FAT12 volume starting at absolute byte
