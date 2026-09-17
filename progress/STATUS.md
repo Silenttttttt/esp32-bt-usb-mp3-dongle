@@ -2849,6 +2849,17 @@ a real, deliberate feature tradeoff, not a free lunch. Should be re-confirmed wi
 methodology caveat from earlier tonight (BlueZ's own AVDTP bug potentially inflating measured
 rates vs. a real phone) still applies here too.
 
+**One more real concern checked before trusting this, since the stress test used the desktop,
+not a real phone**: could disabling AVRCP make a real phone refuse to stream A2DP audio at all
+(if some phone OS treats AVRCP negotiation as a prerequisite)? Checked directly — A2DP and
+AVRCP are separate, independent Bluetooth profiles by spec, and this is extremely
+well-established in the real world, not just theoretical: countless cheap Bluetooth
+speakers/receivers have zero AVRCP support and phones (both Android and iOS) stream audio to
+them perfectly fine regardless — AVRCP only gates remote playback *control*, never whether
+audio streaming itself works. Confident this isn't a real risk, though the OTHER already-noted
+caveat (re-confirm with a real phone, not just BlueZ) still stands for the crash-rate number
+specifically.
+
 ## ⚠️ Real, unresolved architectural risk found via research: cheap car radios may reject FAT12 entirely (2026-09-17)
 
 Dedicated research into real car-radio/embedded USB-MSC host compatibility (since this project
