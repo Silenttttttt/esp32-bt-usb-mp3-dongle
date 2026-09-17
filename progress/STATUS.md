@@ -2576,3 +2576,43 @@ valid frame) and confirmed both extract the exact same 3 frames, correctly skipp
 resyncing past both malformed ones without getting stuck. Also swept both firmware files for
 the same class of bug just fixed (heap churn) — confirmed zero remaining dynamic
 allocation/String usage anywhere in either .ino outside the one-time PSRAM alloc at S3 boot.
+
+## Real stress test: residual reconnect-crash rate + auto-reconnect isolation (2026-09-17)
+
+A WebSearch on the exact assert (`host_recv_pkt_cb hci_hal_h4.c`) turned up other reports of
+this exact failure being caused by the HCI layer failing to allocate memory for an inbound
+buffer — which raised a real hypothesis: could tonight's heap-churn fix (eliminating the
+continuous String-concatenation fragmentation) also reduce the residual reconnect-crash rate,
+not just the AVDTP negotiation delay? Tested directly rather than assuming.
+
+Using the desktop's own existing BT pairing with the ESP32 (`sim/bt_connect_resilient.sh`,
+already built earlier this project specifically for this class of test) as a completely
+separate A2DP source from the phone — confirmed nothing was actively connected first, so this
+didn't disrupt anything real — ran a real 26-cycle disconnect/reconnect stress test, the same
+methodology already used earlier in this project for the original 35%->lower crash-rate
+finding.
+
+**Result: 4 crashes in 26 cycles (~15%), plus 2 more in a follow-up 6-cycle round.** The heap
+fix did NOT eliminate the residual reconnect-crash bug — worse than the historical "26/26
+clean" result, though that earlier test may simply have been a favorable sample (this bug has
+always been probabilistic, not deterministic). Honest conclusion: this is very likely a deeper
+ESP-IDF/Bluedroid HCI-layer bug (core-affinity/ISR-context class, matching the WebSearch
+results) that isn't fully fixable from application code — same category as the already-documented,
+provably-unfixable BlueZ AVDTP abort bug on the *desktop* side that `bt_connect_resilient.sh`
+already works around rather than tries to fix.
+
+**But the property that actually matters was cleanly isolated and confirmed working**: in the
+follow-up round, a crash at t=1713.668s was followed by a clean, isolated recovery — my own
+external connect-attempt script had already exited (confirmed via `ps aux`, no
+bluetoothctl/bt_connect_resilient process running) before `BT_CONNECTED` fired again on its own
+at t=1733.715s, ~20s later, with zero external help. **This is real, direct evidence the
+auto-reconnect fix works as intended**: the underlying crash bug isn't eliminated, but the
+system now demonstrably self-heals from it without any human action — which is the actual
+safety requirement that's mattered since session one ("I'll be driving, I won't be able to
+repair it, or power cycle").
+
+Net honest assessment: don't claim the reconnect-crash bug is "fixed" — it isn't, and may not
+be fixable without a deeper ESP-IDF-level investigation (real backtrace/core-dump analysis,
+beyond tonight's scope). Do claim the system recovers from it automatically now, which is a
+real, verified, meaningfully different (and more important) property than eliminating the
+crash outright.
