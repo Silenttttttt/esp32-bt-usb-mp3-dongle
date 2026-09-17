@@ -63,33 +63,55 @@ significant effort, since the answer changes what's worth building.
 
 ## Current status (see `progress/STATUS.md` for the full, detailed session-by-session log)
 
-Six real bugs found and fixed on the real ESP32 firmware + PC-side prototype so far:
+Real bugs found and fixed on the real ESP32 firmware + PC-side prototype so far:
 1. ~8.5s periodic audio stall — `car_sim.py` wasn't flushing its player's stdin pipe.
 2. Torn-read/margin-erosion glitches — `READ_SAFETY_MARGIN`/`MAX_READ_RETRIES` tuning.
 3. A PipeWire/WirePlumber audio-mute hazard on the PC test rig — fixed via a distinct
    ffmpeg client identity.
 4. ESP32 encoder CPU overload (~1/sec dropped PCM chunks) — fixed via mono downmixing
-   before Shine encoding.
-5. ESP32 reboots on real Bluetooth reconnect (~35% rate) — root-caused to a core-affinity
-   change (`set_task_core(0)`) violating a Bluedroid/HCI assumption; reverted, verified via
-   26/26 clean real reconnect cycles. **Residual, smaller crash rate confirmed still present**
-   — not fully solved.
+   before Shine encoding. **Flashed and active** (declared mono in `AudioInfo`, downmix called
+   in the live `DIAG_LOOP_DRAIN` path) — an earlier version of this doc incorrectly said this
+   was "written but unflashed"; don't trust that note if you see it copied anywhere else.
+5. ESP32 reboots on real Bluetooth reconnect (~35% rate originally) — root-caused to a
+   core-affinity change (`set_task_core(0)`) violating a Bluedroid/HCI assumption; reverted.
+   **Residual, real, measured crash rate (~15% per reconnect attempt as of 2026-09-17, likely
+   a deeper ESP-IDF/Bluedroid HCI-layer bug, not fixable from application code) — NOT
+   eliminated.** What IS fixed and verified (see item 8 below): the system now self-heals from
+   this crash automatically, with zero human action, which is the property that actually
+   matters for unattended driving use.
 6. Ring-wrap MP3 splice + "stale audio replay" on pause/disconnect — fixed via (a) an
    ESP32-side silence injector (`feed_silence_if_no_real_audio()`) that keeps the ring "live"
    through any gap instead of freezing, and (b) real write-side backpressure
    (`GrowingFat12Disk.append(..., unread_protect=True)`) that makes it structurally impossible
-   for the writer to ever overwrite content the reader hasn't consumed yet — this was already
-   independently identified as the right fix in `progress/RESEARCH_BT_TO_USB_MSC.md` §5 and
-   `progress/DEEP_AUDIT_2026-09-15.md` before being implemented.
+   for the writer to ever overwrite content the reader hasn't consumed yet.
+7. Growing press-play-to-real-audio delay over a long session (traced to real AVDTP
+   negotiation getting slower over time, via new `AUDIO_STATE` instrumentation) — root-caused
+   to continuous Arduino `String`-concatenation heap churn in `send_control()` and nearly every
+   call site (especially the once-per-second `ENCODE_US` heartbeat); eliminated via `snprintf`
+   into fixed stack buffers. Confirmed this did NOT also fix item 5's crash rate (tested
+   directly, see `progress/STATUS.md` 2026-09-17).
+8. ESP32 wouldn't reconnect after ANY reset (crash, power blip, or a human touching the serial
+   port) without a manual phone-side unpair/re-pair — root-caused to `auto_reconnect=false` in
+   `a2dp_sink.start()`; fixed by enabling it. **Verified working in isolation**: a real crash
+   followed by zero external connect attempts still recovered (`BT_CONNECTED` fired on its own
+   ~20s later). This is the fix for the project's original, standing safety requirement
+   ("I'll be driving, I won't be able to repair it, or power cycle").
+9. A tried-and-abandoned latency fix: priming the ring with pre-encoded silence at mount time
+   (targeting a suspected MP3-decoder startup floor) had **zero measured effect** — the real
+   delay turned out to live in AVDTP negotiation (see item 7), a completely different layer.
+   Left in place since it's harmless, just not doing anything useful.
 
-**Known still-open items**: the residual reconnect-crash rate (item 5 above, not zero);
-`/dev/ttyACMx` path instability + a recurring USB-permission-settle race after re-enumeration
-(the real ESP32 firmware self-heals its own reboots automatically, but if a PC/laptop is
-in the loop as an S3 stand-in, that PC-side script needs to auto-recover too — see
+**Known still-open items**: the residual reconnect-crash rate (item 5, ~15%, likely not
+fixable from application code — see `progress/STATUS.md` for the full stress-test writeup and
+an important methodology caveat about how that rate was measured); `/dev/ttyACMx` path
+instability + a recurring USB-permission-settle race after re-enumeration (the real ESP32
+firmware self-heals its own reboots automatically now — item 8 — but if a PC/laptop is in the
+loop as an S3 stand-in, that PC-side script needs to auto-recover too — see
 `sim/s3_sim_serial.py`'s `run_serial_bridge()`); an unexplained encode-time/PCM_DROPS
-discrepancy between some sessions (low priority); a mono-downmix ESP32 firmware fix for
-residual CPU-budget issues is written but unflashed, blocked on an unrelated toolchain/
-library compile incompatibility that needs a deliberate decision, not a silent fix.
+discrepancy between some sessions (low priority); the real ESP32-S3 firmware
+(`esp32-s3-msc/esp32-s3-msc.ino`, written 2026-09-17) has never run on real hardware — see its
+own file header and `progress/STATUS.md`'s bring-up checklist for what needs verification once
+the physical board exists.
 
 ## Working conventions established this session
 
