@@ -138,6 +138,27 @@ boundary (boot→FAT, FAT copy 1→copy 2, root-dir→data, and one read spannin
 in a single call) — confirmed 2026-09-17: all four cases produce exactly the right bytes on
 both sides of every boundary, zero corruption.
 
+## Real disk-image mount test (Linux's own vfat kernel driver, not just our own logic)
+
+```
+g++ -Wall -o gen_fat12_image gen_fat12_image.cpp && ./gen_fat12_image /tmp/fat12_image.bin ../../sim/silence_primer.mp3
+sudo losetup -fP --show /tmp/fat12_image.bin   # note the /dev/loopN it prints
+mkdir -p /tmp/mnt && sudo mount -t vfat -o ro,uid=$(id -u),gid=$(id -g) /dev/loopN /tmp/mnt
+ls -la /tmp/mnt/ && file /tmp/mnt/STREAM.MP3 && mpg123 -q -t /tmp/mnt/STREAM.MP3
+sudo umount /tmp/mnt && sudo losetup -d /dev/loopN
+```
+
+Everything above cross-checks this project's own from-scratch logic against a from-scratch
+Python reference — real, but both sides share the same author and the same potential blind
+spots. This test is different: it generates a full, real disk image byte-for-byte matching
+what `esp32-s3-msc.ino`'s `build_boot_sector()`/`build_fat()`/`build_root_dir()` produce, and
+mounts it with **Linux's own real, independent, standards-compliant vfat kernel driver** —
+completely outside this project's own code. Confirmed 2026-09-17: mounts cleanly, the file
+appears as `STREAM.MP3` with the exact declared size, content bytes match exactly, and a real,
+independent MP3 decoder (`mpg123`) decodes it without error. `gen_fat16_image.cpp` does the
+same for the FAT16 fallback variant (see `../esp32-s3-msc-fat16-fallback/`) — also confirmed
+clean.
+
 ## What this does NOT verify
 
 Everything hardware-dependent: real UART timing/framing over an actual

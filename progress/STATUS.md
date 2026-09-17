@@ -2879,3 +2879,43 @@ only come from trying the real radio. **First real test with the physical board 
 checking whether the OS/radio mounts the FAT12 volume at all** — if it doesn't, this is the
 first thing to revisit, and it's a real decision for Muni to weigh in on (bigger lag bound is a
 real UX cost), not something to silently pick a workaround for.
+
+## Built and verified a ready FAT16 fallback (2026-09-17, not the primary implementation)
+
+Given the FAT12-rejection risk above is real but only resolvable with the actual radio, built
+a genuine, tested, ready-to-flash option rather than leaving it as pure discussion — so if
+tomorrow's testing shows the radio won't mount FAT12, there's an actual fallback to reach for
+immediately instead of designing one from scratch under time pressure. **This is NOT applied
+or recommended by default — the primary firmware is still `esp32-s3-msc/esp32-s3-msc.ino`
+(FAT12). Use the fallback ONLY if FAT12 is confirmed rejected.**
+
+New sketch: `esp32-s3-msc-fat16-fallback/esp32-s3-msc-fat16-fallback.ino` — identical to the
+primary in every respect (ring buffer, backpressure, UART protocol, USBMSC wiring) except the
+filesystem is FAT16. Real design choice made explicit: FAT16 needs ≥4085 clusters; using
+1-sector (512B) clusters instead of FAT12's 8-sector (4096B) clusters minimizes the resulting
+size penalty — 4096 clusters × 512B = 2MB (~131s/~2.2min of audio), vs. ~16.7MB (~17.4min) if
+keeping FAT12's cluster size. Still a real, meaningful UX tradeoff (2.2min worst-case
+catch-up-lag vs. the primary's 30s) — a genuine decision, not something to spring on Muni
+silently if this path is ever actually needed.
+
+**Also did something stronger than any FAT12 verification so far tonight**: generated a
+complete, real disk image (boot sector + FAT table + root directory + data region with actual
+MP3 content) and mounted it with **Linux's own real, independent, standards-compliant vfat
+kernel driver** via a loopback device — not just this project's own from-scratch logic checked
+against its own from-scratch Python reference. Confirmed for BOTH the primary FAT12 structure
+and the new FAT16 fallback: mounts cleanly, file appears as `STREAM.MP3` with the exact
+declared size, content bytes match exactly, and a real independent MP3 decoder (`mpg123`)
+decodes the mounted file without error. This is meaningfully stronger evidence than anything
+else produced tonight, since it's the first check that doesn't share this project's own
+authorship on both sides of the comparison. Tools: `esp32-s3-msc/crosscheck/gen_fat12_image.cpp`
+and `gen_fat16_image.cpp`.
+
+Also re-verified the ring/backpressure/concurrency logic specifically at the FAT16 fallback's
+much larger `DECLARED_FILE_SIZE` (2097152 vs. FAT12's 479232) using the same real-time
+concurrent simulation methodology, rather than assuming size-agnostic logic "should" still
+work: ran 60s and 150s (1.14 real-time laps), zero corruption both times, confirming the ring
+logic genuinely doesn't care about the specific size plugged in.
+
+**Compiles clean** (`arduino-cli compile --fqbn "esp32:esp32:esp32s3:USBMode=default,PSRAM=opi"`
+from within `esp32-s3-msc-fat16-fallback/`) but, like the primary firmware, has never run on
+real hardware.
