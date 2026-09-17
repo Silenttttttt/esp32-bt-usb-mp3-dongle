@@ -2554,3 +2554,17 @@ before trusting it the way the rest of this project's fixes have been trusted.
 4. Try actually playing that "file" in a normal OS media player plugged in via USB, with the
    classic ESP32 streaming real BT audio, before ever connecting it to the real car radio.
 5. Only once that works, connect to the real radio and validate end-to-end.
+
+**Real cross-check done overnight, not just "looks right"**: wrote host-only (no
+Arduino/hardware dependency) C++ programs that exercise the exact same `build_boot_sector()`/
+`build_fat()`/`build_root_dir()`/`disk_append()`/`disk_read_at()` logic copy-pasted verbatim
+from the .ino, and compared their output byte-for-byte / step-for-step against
+`fat12_disk.py`'s real implementation for identical inputs (see `esp32-s3-msc/crosscheck/`).
+**Boot sector, FAT table, and root directory: byte-for-byte identical.** Ring-buffer logic: ran
+an identical scripted sequence (2 ring laps of writes, then 2000 interleaved read/write steps
+with periodic forced-straddle reads) on both sides — every tracked value matched exactly
+(`write_pos`, `total_written`, `last_read_offset`, straddle-hit count, backpressure-rejection
+count, all identical). This doesn't replace real hardware validation (UART timing, actual
+TinyUSB callback behavior, PSRAM allocation are all still unverified), but it does mean the
+core algorithm port itself is verified correct against the trusted reference, not just
+eyeballed.
