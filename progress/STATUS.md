@@ -2373,6 +2373,45 @@ real radio/phone yet — only verified at the code level (primer loads, ring is 
 byte 0, py_compile clean). **Needs a real live test to confirm it actually helps**; if it
 doesn't, revert is trivial (it's a self-contained ~15 line addition, easy to back out).
 
+## Real self-inflicted regression + a genuinely major firmware bug found (2026-09-17)
+
+While Muni was mid real-phone test, I restarted `bluetoothd`/`bluealsad` (via `preflight_clean.sh`,
+to properly authenticate sudo after initially — wrongly — saying I couldn't) and repeatedly
+reopened `/dev/ttyACM2` while cleaning up a duplicate-supervisor-tree mess I'd caused (two
+`run_resilient.sh` instances ended up racing for the same serial port and TCP port after
+`preflight_clean.sh`'s kill step only matched the python processes, not the bash supervisor
+loops respawning them — had to `pkill -9 -f run_resilient.sh` plus manually kill orphaned
+children to actually get back to one clean instance). Opening a USB-serial port is a real
+DTR/RTS transition on most ESP32 dev boards' auto-reset circuits — the log confirms a fresh
+`RESET_REASON:POWERON` right after one of these reopens. That reset dropped Muni's live phone
+connection, and the phone then refused to reconnect — needing the exact "unpair, power-cycle,
+re-pair" workaround this whole project has been trying to eliminate since session one.
+
+Muni's reaction, correctly: a system that needs manual phone intervention after ANY ESP32
+reset is unusable while driving, full stop — this needed a real fix, not another apology.
+Investigated instead of guessing: `a2dp_sink.start("ESP32-MP3-Test", false)` at
+`esp32-bt-mp3-test.ino:516` — **that `false` is `auto_reconnect`, and it's been off this whole
+project.** Confirmed via the actual library source
+(`~/Arduino/libraries/ESP32-A2DP/src/BluetoothA2DPCommon.cpp`): with auto_reconnect enabled,
+the library persists the last-connected device address to NVS flash (survives reboots) and
+`start()` automatically retries connecting to it up to 1000 times, 1s apart, with zero
+phone-side action needed — `BluetoothA2DPCommon.cpp:281-283`, "update nvs only when
+autoreconnect is enabled". With it off (as shipped this whole time), the ESP32 never even
+tried to reconnect after any reset — it just sat passively waiting for an inbound connection,
+which is exactly the "stuck, needs manual re-pair" failure mode hit repeatedly all project
+long, including the very first message of the whole engagement ("i had to unpair, then power
+cycle the esp").
+
+**Fix**: flipped that one flag (`a2dp_sink.start("ESP32-MP3-Test", true)`), recompiled with the
+exact same flags as the last proven-good build (`arduino-cli compile --fqbn esp32:esp32:esp32`
+with `-DINT2IDX_SIZE=4000 -DDIAG_LOOP_DRAIN -DDIAG_FRAG_TRACE`), confirmed target board serial
+`5B52096812` before flashing (never touched `5B07008126`/Fin-ESP), flashed and hash-verified
+clean. **Needs one fresh manual pair right now** (to seed NVS with a last-connected address,
+since auto_reconnect was never on before so nothing was ever persisted) — but from that point
+forward, ANY reset (a crash, a power blip in the car, anything) should make the ESP32
+proactively reconnect on its own, with zero phone-side action. This directly targets the
+project's most safety-critical standing requirement. **Live-testing now to confirm.**
+
 **Where things stand**: this is genuinely the best real-world result of the whole session —
 clean audio, working pause/resume, explained (if non-ideal) latency. Still explicitly open,
 not swept aside: the residual ESP32 reconnect-crash rate (item 5, not zero), the general

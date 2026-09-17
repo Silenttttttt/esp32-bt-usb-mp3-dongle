@@ -511,9 +511,24 @@ void setup() {
   // A higher rate of the former is a clear net win over any rate of the
   // latter for real-world use.
   // a2dp_sink.set_task_core(0);
+  // REAL BUG FOUND: auto_reconnect was false, meaning after ANY reset (a
+  // crash, a power blip, or literally anyone re-opening the USB-serial
+  // port -- ESP32 dev boards commonly auto-reset on DTR/RTS transitions
+  // during serial open) the ESP32 just sat there waiting passively for an
+  // inbound connection instead of trying to reconnect to the last-paired
+  // phone. Combined with phones that don't proactively reconnect to an
+  // A2DP peripheral that "disappeared" ungracefully, this produced exactly
+  // the "have to unpair, then re-pair" symptom hit repeatedly tonight --
+  // completely unacceptable for a device meant to run unattended while
+  // driving. The library already supports this properly: passing true
+  // here enables set_auto_reconnect(true, AUTOCONNECT_TRY_NUM=1000), which
+  // persists the last-connected address to NVS (survives reboots) and
+  // retries connecting to it automatically (1s between attempts, per
+  // BluetoothA2DPSink.h) without any phone-side action needed. NOT YET
+  // VERIFIED on real hardware -- needs one real reconnect-after-reset test.
   a2dp_sink.set_on_connection_state_changed(connection_state_changed);
   a2dp_sink.set_stream_reader(audio_data_callback, false);
-  a2dp_sink.start("ESP32-MP3-Test", false);
+  a2dp_sink.start("ESP32-MP3-Test", true);
   a2dp_sink.set_discoverability(ESP_BT_GENERAL_DISCOVERABLE);
 
 #ifdef HEAP_TRACE
