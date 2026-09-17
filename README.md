@@ -44,9 +44,15 @@ throwaway prototype.
   A2DP sink + real-time Shine MP3 encoding).
 - `esp32-s3-msc/` — real firmware for the ESP32-S3 (USB-MSC device role), written
   before the physical board arrived. `crosscheck/` holds host-only tests proving
-  its core logic matches the Python reference and holds up under real concurrent
-  load — see its own README for what's been verified and what still needs the
-  real board.
+  its core logic matches the Python reference, holds up under real concurrent
+  load, and — mounted with Linux's own real vfat kernel driver via a loopback
+  device — produces a genuinely valid FAT12 volume a real independent MP3
+  decoder can play. See its own README for what's been verified and what still
+  needs the real board.
+- `esp32-s3-msc-fat16-fallback/` — a ready, tested fallback using FAT16 instead
+  of FAT12, only for if the real car radio turns out to reject FAT12 (a real,
+  researched risk with cheap embedded USB-MSC hosts, not confirmed either way
+  yet). Not the default — see `CLAUDE.md` for when to actually use it.
 - `sim/` — PC-side prototypes: `fat12_disk.py` (the core ring-buffer/FAT12 disk
   algorithm the S3 firmware above is ported from), `s3_sim_serial.py` (desktop
   stand-in for the S3 during PC-only testing), `car_sim.py` (desktop stand-in for
@@ -63,7 +69,12 @@ throwaway prototype.
 
 Real end-to-end audio has been streamed from a phone, over Bluetooth, through
 the ring-buffer/FAT12 simulation, with clean quality (no audible cutout, jaggedness,
-or clipping) and working pause/resume. See `progress/STATUS.md` for the full,
-detailed history — bugs found and fixed, what's still open (a residual ESP32
-Bluetooth-reconnect crash, plus general further real-world hardening as the S3
-side gets built).
+or clipping) and working pause/resume, plus auto-reconnect after any crash with
+zero human action. The Bluetooth-reconnect crash that plagued this project since
+its first session now appears solved (0 crashes across 52 real stress-test cycles,
+plus 8+ hours of continuous unattended uptime) — root-caused to a heap-allocation
+failure during AVRCP-related traffic, fixed by disabling AVRCP entirely (the phone
+already owns playback state, so nothing is lost). See `progress/STATUS.md` for the
+full, detailed history and what's still open — a real, unconfirmed FAT12-vs-FAT16
+car-radio compatibility question chief among them (a tested fallback exists if
+needed), plus final real-hardware validation once the ESP32-S3 board arrives.

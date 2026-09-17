@@ -2919,3 +2919,12 @@ logic genuinely doesn't care about the specific size plugged in.
 **Compiles clean** (`arduino-cli compile --fqbn "esp32:esp32:esp32s3:USBMode=default,PSRAM=opi"`
 from within `esp32-s3-msc-fat16-fallback/`) but, like the primary firmware, has never run on
 real hardware.
+
+## Additional real confirmation: 8+ hours continuous uptime, zero crashes (2026-09-17)
+
+Checked the classic ESP32's actual live uptime since the AVRC-disable fix was flashed: still
+running continuously with zero `RESET_REASON` events beyond the original post-flash boot,
+`esp32_ms` past 30,347,000 (~8.4 hours). This is idle/silence-heartbeat uptime for most of that
+window, not specifically a reconnect-stress scenario, but it's still a real additional data
+point on top of the 0/52 stress-test result — no spontaneous crash of any kind over a genuinely
+long real duration.
