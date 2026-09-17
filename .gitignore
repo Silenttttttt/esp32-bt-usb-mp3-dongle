@@ -4,3 +4,4 @@ __pycache__/
 *.hex
 *.elf
 .DS_Store
+progress/run_resilient*.log*

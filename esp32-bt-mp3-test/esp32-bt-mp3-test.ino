@@ -72,9 +72,28 @@ bool send_framed(char type, const uint8_t *data, size_t len,
   return true;
 }
 
-void send_control(const String &msg, TickType_t wait_ticks = portMAX_DELAY) {
-  String withTime = String(millis()) + "|" + msg;
-  send_framed('C', (const uint8_t *)withTime.c_str(), withTime.length(), wait_ticks);
+// REAL BUG FOUND (long-uptime negotiation slowdown investigation,
+// 2026-09-17): this used to take a `const String&` and build "millis()|msg"
+// via String concatenation -- and every single call site concatenated
+// Strings too (e.g. "ENCODE_US:avg=" + String(avg_us) + ",max=" + ...).
+// Arduino's String does a fresh heap alloc+free per concatenation, and
+// ENCODE_US alone fires every ~1s for the ENTIRE session lifetime (plus
+// PCM_DROPS, AVRC metadata, RESET_REASON, AUDIO_STATE on top) -- that's
+// thousands of variable-sized alloc/free cycles per hour, a textbook
+// heap-fragmentation generator. Measured tonight: `largest_block` capped
+// well below `total_free` (13300 vs 19892 bytes) even at rest, consistent
+// with fragmented heap from exactly this pattern. AVDTP stream negotiation
+// (which allocates buffers) got measurably slower on a long-uptime session
+// than right after a fresh boot -- this is the most likely real cause.
+// Fix: no more String, anywhere in this path. Every call site now formats
+// into its own local fixed-size char buffer via snprintf (stack, not
+// heap), and send_control() takes const char* -- zero heap churn per
+// control message, no matter how long the session runs.
+void send_control(const char *msg, TickType_t wait_ticks = portMAX_DELAY) {
+  char withTime[200];
+  int n = snprintf(withTime, sizeof(withTime), "%lu|%s", millis(), msg);
+  if (n > (int)sizeof(withTime) - 1) n = sizeof(withTime) - 1;
+  send_framed('C', (const uint8_t *)withTime, n, wait_ticks);
 }
 
 class SerialPrintSink : public Print {
@@ -335,6 +354,20 @@ void connection_state_changed(esp_a2d_connection_state_t state, void *) {
                pdMS_TO_TICKS(20));
 }
 
+// Distinct from connection_state_changed() above: link-level "connected" can
+// be true for a long time before the phone ever opens the actual AVDTP
+// audio STREAM (started specifically when a track plays). This fires
+// exactly on that stream-level transition, timestamped independently of
+// whether real PCM has reached audio_data_callback yet -- added to find
+// out whether a ~15s press-play-to-real-audio gap is a phone/AVDTP
+// negotiation delay (this fires late too) or a delay inside our own
+// pipeline after the stream is already open (this fires fast, PCM doesn't).
+void audio_state_changed(esp_a2d_audio_state_t state, void *) {
+  char buf[48];
+  snprintf(buf, sizeof(buf), "AUDIO_STATE:%s", a2dp_sink.to_str(state));
+  send_control(buf, pdMS_TO_TICKS(20));
+}
+
 void avrc_playstatus_callback(esp_avrc_playback_stat_t playback) {
   switch (playback) {
     case ESP_AVRC_PLAYBACK_PLAYING: send_control("PLAY"); break;
@@ -342,19 +375,30 @@ void avrc_playstatus_callback(esp_avrc_playback_stat_t playback) {
     case ESP_AVRC_PLAYBACK_STOPPED: send_control("STOP"); break;
     case ESP_AVRC_PLAYBACK_FWD_SEEK: send_control("SEEK_FWD"); break;
     case ESP_AVRC_PLAYBACK_REV_SEEK: send_control("SEEK_REV"); break;
-    default: send_control("PLAYSTATUS_" + String((int)playback)); break;
+    default: {
+      char buf[24];
+      snprintf(buf, sizeof(buf), "PLAYSTATUS_%d", (int)playback);
+      send_control(buf);
+      break;
+    }
   }
 }
 
 void avrc_metadata_callback(uint8_t id, const uint8_t *text) {
-  String label;
+  const char *label;
+  char label_buf[16];
   switch (id) {
     case ESP_AVRC_MD_ATTR_TITLE:  label = "TITLE:"; break;
     case ESP_AVRC_MD_ATTR_ARTIST: label = "ARTIST:"; break;
     case ESP_AVRC_MD_ATTR_ALBUM:  label = "ALBUM:"; break;
-    default: label = "META" + String(id) + ":"; break;
+    default:
+      snprintf(label_buf, sizeof(label_buf), "META%u:", id);
+      label = label_buf;
+      break;
   }
-  send_control(label + String((const char *)text));
+  char buf[160];
+  snprintf(buf, sizeof(buf), "%s%s", label, (const char *)text);
+  send_control(buf);
 }
 
 void setup() {
@@ -401,7 +445,9 @@ void setup() {
       case ESP_RST_JTAG:       reason = "JTAG"; break;
       default:                 reason = "OTHER"; break;
     }
-    send_control(String("RESET_REASON:") + reason);
+    char buf[32];
+    snprintf(buf, sizeof(buf), "RESET_REASON:%s", reason);
+    send_control(buf);
   }
 
   // Slot pool is static (see pcm_slots above); these two queues just pass
@@ -527,6 +573,7 @@ void setup() {
   // BluetoothA2DPSink.h) without any phone-side action needed. NOT YET
   // VERIFIED on real hardware -- needs one real reconnect-after-reset test.
   a2dp_sink.set_on_connection_state_changed(connection_state_changed);
+  a2dp_sink.set_on_audio_state_changed(audio_state_changed);
   a2dp_sink.set_stream_reader(audio_data_callback, false);
   a2dp_sink.start("ESP32-MP3-Test", true);
   a2dp_sink.set_discoverability(ESP_BT_GENERAL_DISCOVERABLE);
@@ -548,7 +595,9 @@ void loop() {
   static uint32_t last_drop_report_ms = 0;
   uint32_t now_ms = millis();
   if (pcm_drops != last_reported_drops && now_ms - last_drop_report_ms >= 1000) {
-    send_control("PCM_DROPS:" + String(pcm_drops));
+    char buf[32];
+    snprintf(buf, sizeof(buf), "PCM_DROPS:%lu", (unsigned long)pcm_drops);
+    send_control(buf);
     last_reported_drops = pcm_drops;
     last_drop_report_ms = now_ms;
   }
@@ -567,8 +616,11 @@ void loop() {
     encode_us_sum = 0;
     if (count > 0) {
       uint32_t avg_us = sum_us / count;
-      send_control("ENCODE_US:avg=" + String(avg_us) + ",max=" + String(max_us) +
-                    ",n=" + String(count) + ",core=" + String(xPortGetCoreID()));
+      char buf[80];
+      snprintf(buf, sizeof(buf), "ENCODE_US:avg=%lu,max=%lu,n=%lu,core=%d",
+               (unsigned long)avg_us, (unsigned long)max_us, (unsigned long)count,
+               xPortGetCoreID());
+      send_control(buf);
     }
   }
 

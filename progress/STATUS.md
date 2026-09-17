@@ -2412,6 +2412,23 @@ forward, ANY reset (a crash, a power blip in the car, anything) should make the 
 proactively reconnect on its own, with zero phone-side action. This directly targets the
 project's most safety-critical standing requirement. **Live-testing now to confirm.**
 
+**Live test found a second, smaller, real bug while confirming the first fix**: Muni paired
+fresh and the phone showed connected, but `s3_sim_serial.py` never logged `BT_CONNECTED` —
+looked at first like a regression from the auto-reconnect change. Checked the one signal that
+doesn't depend on serial at all: the onboard LED (GPIO2), which `connection_state_changed()`
+drives directly (`digitalWrite`) before ever touching serial. **LED was lit** — the ESP32's own
+BT stack genuinely registered the connection; the auto-reconnect fix is not implicated. Real
+root cause is a separate, pre-existing, already-documented tradeoff: `connection_state_changed()`
+sends `BT_CONNECTED`/`BT_DISCONNECTED` with only a 20ms mutex-acquire timeout
+(`send_control(..., pdMS_TO_TICKS(20))`, line ~334) specifically so the BT callback never
+blocks on the same mutex the high-rate audio-frame serial writes use — intentional, to avoid
+crashing the board, at the cost of that one control message occasionally being silently
+dropped if the mutex is busy at that exact instant. Purely cosmetic: nothing in the actual
+audio pipeline branches on having seen `BT_CONNECTED` (confirmed by checking — real audio
+frames flow independent of it), so playback itself is unaffected. Not fixed (low priority,
+cosmetic) — but flag it if anything ever needs `BT_CONNECTED` as a trustworthy source of truth
+(e.g. reconnect-crash-rate counting); corroborate via the `ENCODE_US` signature instead.
+
 **Where things stand**: this is genuinely the best real-world result of the whole session —
 clean audio, working pause/resume, explained (if non-ideal) latency. Still explicitly open,
 not swept aside: the residual ESP32 reconnect-crash rate (item 5, not zero), the general
@@ -2420,3 +2437,120 @@ will surface with further real-world use, and the CLAUDE.md-documented distincti
 `s3_sim_serial.py`/`car_sim.py` remain PC-side prototypes standing in for hardware
 (the ESP32-S3) that hasn't been built yet — tonight's fixes validate the *algorithm*, not a
 final shipped artifact.
+
+## Heap-churn fix for the "String" anti-pattern (2026-09-17, later)
+
+Muni pushed back hard, correctly, on "just power-cycle it if it gets slow" as a mitigation for
+a delay that crept from ~5-6s up toward ~15s over a long-running session — not viable while
+driving, full stop. Investigated the real cause instead of accepting the workaround.
+
+New instrumentation added first (`set_on_audio_state_changed`, a real ESP32-A2DP library event
+distinct from link-level `connection_state_changed` — fires specifically when the AVDTP audio
+*stream* opens, not just when the BT link connects) proved the ~2.8s from stream-open to real
+audio flowing is NOT where the delay lives — that part is fast and constant. The delay is
+between `BT_CONNECTED` and `AUDIO_STATE:Started`: a real AVDTP negotiation between the two
+Bluetooth stacks. That gap grew across a single long session (fast right after a fresh reboot,
+slow ~19 minutes in).
+
+**Real root cause found and fixed**: `send_control()` and nearly every call site (AVRC
+metadata, `PLAYSTATUS_`, `RESET_REASON`, and critically `ENCODE_US` — which fires every ~1s for
+the ENTIRE session lifetime) built their message via Arduino `String` concatenation. Every
+concatenation is a fresh heap alloc+free of a different size — a textbook continuous
+heap-fragmentation generator, not just a per-reconnect cost. Measured evidence: `largest_block`
+capped well below `total_free` (13300 vs 19892 bytes) even after the heap had "settled." If
+AVDTP stream negotiation needs to allocate a contiguous buffer for the new stream, a
+fragmented heap could plausibly make that allocation (and thus negotiation) progressively
+slower or need more retries the longer the session runs — consistent with the observed
+fast-after-reboot / slow-after-19-minutes pattern (not proven with a controlled fragmentation
+comparison, since I'd overwritten the earlier bad session's own frag numbers by relaunching
+with a truncating redirect — a real methodology mistake, noted so it isn't repeated: back up
+logs before any relaunch that could need before/after comparison later).
+
+**Fix**: rewrote `send_control()` to take `const char*` instead of `const String&`, and every
+call site to format into a local fixed-size stack buffer via `snprintf` instead of `String`
+concatenation. Zero heap churn now, no matter how long the session runs. Compiled clean
+(program size actually dropped slightly), flashed to `5B52096812` (confirmed by serial before
+flashing, per the safety rule), verified booting and streaming correctly. A passive background
+watcher (correlating each delay against ESP32 heap state automatically, no synthetic tests)
+was running to build real before/after evidence overnight — see its own note below for one
+measurement artifact to disregard.
+
+**Correlation-watcher caveat, for whoever reads this data later**: the passive watcher recorded
+some absurd `audio_state_to_real_audio_s` values (216s, 234s) — these are NOT real delays, they're
+a watcher bug: `AUDIO_STATE:Started` doesn't refire on every simple play/pause within an
+already-open AVDTP stream (only a full stream teardown/reopen retriggers it), so the watcher's
+`last_audio_state_t` went stale across multiple plays and got paired with the wrong transition.
+Only trust an `audio_state_to_real_audio_s` value that's small (a few seconds) and immediately
+follows a genuinely fresh `AUDIO_STATE:Started` in the raw log — don't trust the correlation
+file blindly without checking that.
+
+## Real ESP32-S3 firmware written (2026-09-17, overnight autonomous session)
+
+Muni's going to bed, the physical ESP32-S3 board (WROOM-1 N16R8, 16MB flash/8MB PSRAM) arrives
+tomorrow, and asked for this to be "100% and working" by then, working fully autonomously
+overnight. Wrote the real firmware — `esp32-s3-msc/esp32-s3-msc.ino` — since until now only the
+Python simulators (`fat12_disk.py`/`s3_sim_serial.py`) existed; the actual USB-MSC device code
+never did.
+
+**What it is**: a careful, line-by-line port of `GrowingFat12Disk` (boot sector, FAT12 table,
+root directory, ring-buffer data region, `unread_protect` write backpressure, the silence
+primer) from Python into C++, using the ESP32 Arduino core's real `USBMSC` class (backed by
+TinyUSB) for the actual USB Mass Storage device role, plus a UART receiver implementing the
+exact same wire framing the classic ESP32 already sends (`FRAME_MAGIC=0xAA`, type byte,
+4-byte big-endian length, payload — see `esp32-bt-mp3-test.ino`'s `send_framed()`). The
+classic-ESP32 firmware needs **no changes** for this: its `Serial` (UART0) output is already
+this exact protocol: today it goes out a USB-serial chip to a PC; in the real deployment the
+same UART0 pins get wired directly to the S3's UART RX pin instead.
+
+**Real, hardware-forced design decisions made (documented in the file's own comments)**:
+1. **PSRAM required for the ring buffer.** The 468KB ring (matching the already-proven
+   0.4578MB/~30s capacity) does not fit in the S3's internal DRAM alongside FreeRTOS/USB/heap
+   needs — confirmed directly, a static array overflowed `dram0_0_seg` by ~250KB on first
+   compile attempt. Fixed via `heap_caps_malloc(..., MALLOC_CAP_SPIRAM)` at setup(), which
+   requires **PSRAM enabled in board settings** (`PSRAM=opi` for the N16R8 module specifically
+   — confirmed this compiles; if the real board's PSRAM type differs, this build flag needs to
+   match it or the firmware will print a fatal error and halt at boot rather than silently
+   corrupt anything).
+2. **No blocking/retrying inside the USB read callback**, unlike the Python prototype's
+   `read_sectors()` (which safely blocks/retries when a read would straddle the live write
+   edge). TinyUSB's `onRead` runs on its own task, and blocking it risks a USB host-side
+   timeout — there's no safe unbounded wait here. Real design tradeoff, not yet
+   hardware-validated: take the ring mutex with only a 2ms bounded wait; if straddling (same
+   margin check as the Python original) or the lock isn't free, serve zero-fill for those
+   bytes instead of blocking — audibly a brief gap at worst, never a torn/spliced splice. How
+   often this actually triggers under real USB read timing is unknown until there's a board to
+   observe it on; `READ_MARGIN_BYTES` (currently 2 clusters, ~0.5s) is the first knob to tune
+   if gaps turn out to be audible in practice.
+3. **UART pin assignment is a placeholder** (`UART_S3_RX_PIN 18`) — not based on any real
+   wiring decision, just a commonly-free GPIO on typical S3 DevKitC-1 boards. Must be set to
+   whatever pin actually gets wired to the classic ESP32's TX0 once that decision is made.
+4. **8KB UART RX buffer** (default is 256B) — sized for two full `MAX_FRAME_LEN` frames of
+   headroom at 921600 baud against `link_task` briefly falling behind during a
+   `disk_append()` retry stall.
+5. Verified the exact same FAT12 volume geometry as the already-proven Python prototype:
+   940 total sectors, first data LBA 4, 479232-byte declared file size — matches
+   `s3_sim_serial.py`'s own boot log from earlier tonight exactly, giving real confidence the
+   port is faithful, not just "looks right."
+
+**Compiles clean** (`arduino-cli compile --fqbn "esp32:esp32:esp32s3:USBMode=default,PSRAM=opi"`,
+zero warnings with `--warnings all`, 417700 bytes / 31% program storage). **Has never run on
+real hardware** — there was no board to test on while writing this. Do not treat this as
+"done" the way the classic ESP32 firmware's fixes are — treat it as a well-reasoned first draft
+that needs real bring-up: UART wiring decided and pin constant updated, actual TinyUSB read
+chunking behavior observed (does it call `onRead` per-sector, or with arbitrary byte ranges?
+`disk_read_at()` was written to handle either, but hasn't been able to confirm which actually
+happens), and a real end-to-end test (classic ESP32 -> wired UART -> S3 -> real car radio)
+before trusting it the way the rest of this project's fixes have been trusted.
+
+**Checklist for tomorrow, once the board exists**:
+1. Flash `esp32-s3-msc.ino` (`arduino-cli upload --fqbn esp32:esp32:esp32s3:USBMode=default,PSRAM=opi`
+   after confirming board settings match — verify PSRAM type against the actual module's
+   datasheet, not just assumed from "N16R8").
+2. Wire classic ESP32's UART0 TX -> S3's `UART_S3_RX_PIN` (update the constant to match
+   whatever pin is actually used), common ground between both boards.
+3. Plug the S3's USB port into a PC first (not the car radio) and confirm it enumerates as a
+   USB mass storage device with one `STREAM.MP3` file of the expected declared size — this
+   alone validates the FAT12/USBMSC side without risking the real radio.
+4. Try actually playing that "file" in a normal OS media player plugged in via USB, with the
+   classic ESP32 streaming real BT audio, before ever connecting it to the real car radio.
+5. Only once that works, connect to the real radio and validate end-to-end.
