@@ -2616,3 +2616,36 @@ be fixable without a deeper ESP-IDF-level investigation (real backtrace/core-dum
 beyond tonight's scope). Do claim the system recovers from it automatically now, which is a
 real, verified, meaningfully different (and more important) property than eliminating the
 crash outright.
+
+**Important methodology caveat, worth flagging explicitly**: this stress test (and every
+historical crash-rate number this project has ever measured, including the original
+35%-\>lower finding) used the *desktop's own BlueZ Bluetooth stack* as the A2DP source, via
+`bt_connect_resilient.sh` — which exists specifically because BlueZ itself has a separate,
+genuine, confirmed-unfixable-from-our-side bug (a real use-after-free in its own AVDTP
+abort/reconfig path, see that script's own header comment). It's plausible the ESP32-side
+crashes are partly *triggered* by whatever malformed/edge-case AVDTP traffic BlueZ's own buggy
+abort handling produces — meaning the real-world crash rate against a phone's (Android/iOS,
+completely different BT stack, no relation to BlueZ) AVDTP implementation could be different
+from 15%, possibly notably lower. The comparison to historical numbers is still apples-to-apples
+(same test methodology both times), so "the heap fix didn't change the rate" is a solid
+conclusion — but the *absolute* ~15% figure should not be assumed to transfer directly to
+real-phone behavior without also measuring it there.
+
+**One more real nuance found via the library's own wiki** (confirmed already on the latest
+release, 1.8.11 — no newer version exists with additional crash fixes): the ESP32-A2DP author's
+own docs warn that "when you just restart the ESP32, you might end up in a situation where you
+can't reconnect... because it did not notice that the connection got lost" — an unexpected
+reboot doesn't send the peer a clean disconnect signal, so the *other side* can be left in a
+stale "still connected" state that won't accept a fresh incoming connection. Important
+distinction: this is a *different* scenario from what tonight's isolated test actually
+exercised — every crash observed tonight happened essentially immediately during/after a fresh
+connection attempt (matching this project's own established history: "once a connection is up
+and streaming, it has run stable for 500+ seconds... with zero further issue" — crashes cluster
+at reconnect/negotiation time, not mid-session). A genuinely mid-drive, mid-playback crash with
+zero warning is a rarer case this hasn't specifically tested. Since the crash rate at each
+attempt is ~15% and auto-reconnect retries up to 1000 times a few seconds apart, the overall
+probability of eventually reconnecting approaches certainty even if a few individual attempts
+fail — but the "phone stuck thinking it's connected" failure mode specifically depends on the
+*phone's* own BT stack behavior after a silent link loss, which is outside anything this
+project's code controls, and hasn't been tested against a real phone's real behavior in that
+exact scenario.
