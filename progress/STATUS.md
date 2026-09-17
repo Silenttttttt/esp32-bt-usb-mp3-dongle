@@ -2346,6 +2346,33 @@ already-buffered content for a beat before the injected silence reaches it, so t
 pause can lag or outlast the real one. Same phenomenon as the delay on a muted live TV feed;
 inherent to buffering this far ahead, not something to fix.
 
+## Silence-primer fix for first-mount latency (2026-09-17)
+
+Muni asked directly: can we fake the decoder-side wait? Rather than more isolated PC-only
+benchmarking (which the digital-only ffmpeg-stdout test showed doesn't even reproduce a delay
+at all — onset ~0.5s either way — implying the previously-measured ~9.5-10.6s figure lives
+somewhere in the real audio *output* stage, not decode itself, though this wasn't conclusively
+pinned down before being told, correctly, to stop running synthetic tests and just ship
+something real to test live), implemented the direct fix: `GrowingFat12Disk.__init__`
+(`sim/fat12_disk.py`) now writes 3 seconds of pre-encoded silent MP3 (`sim/silence_primer.mp3`,
+mono/44100Hz/128kbps — matching the ESP32's actual Shine encoder config, `AudioInfo(44100, 1,
+16)`) straight into the ring the instant the disk object is created, before any real audio has
+arrived. Verified directly: `write_pos`/`total_written` are already 48945 (the primer's byte
+size) right after construction, and the very first data cluster read back is real non-zero MP3
+bytes instead of the previous all-zero "not encoded yet" placeholder.
+
+**What this does and doesn't fix**: this only addresses the *first-ever mount* cost — the one
+time the radio starts reading the file from byte 0 with nothing in the ring yet. It does NOT
+touch the ~7s real Bluetooth AVRCP session-negotiation delay (that's a genuine one-time
+protocol cost on the phone/OS side, not fakeable). If the previously-measured decoder-side
+floor really was mostly a "needs some initial valid bytes before it'll start" behavior (not
+literally "needs 9.5s of real audio"), this should let the radio's decoder engage immediately
+on mount instead of waiting for real content to physically accumulate — cutting perceived
+startup latency down toward just the AVRCP handshake cost. This has NOT been validated on the
+real radio/phone yet — only verified at the code level (primer loads, ring is non-zero from
+byte 0, py_compile clean). **Needs a real live test to confirm it actually helps**; if it
+doesn't, revert is trivial (it's a self-contained ~15 line addition, easy to back out).
+
 **Where things stand**: this is genuinely the best real-world result of the whole session —
 clean audio, working pause/resume, explained (if non-ideal) latency. Still explicitly open,
 not swept aside: the residual ESP32 reconnect-crash rate (item 5, not zero), the general

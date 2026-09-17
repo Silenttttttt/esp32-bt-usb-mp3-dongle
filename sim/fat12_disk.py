@@ -10,12 +10,26 @@ firmware's onRead()/onWrite() callbacks (see ../firmware/ for the Digispark
 C version this was originally validated against).
 """
 
+import os
+
 SECTOR_SIZE = 512
 SECTORS_PER_CLUSTER = 8  # 4KB clusters
 RESERVED_SECTORS = 1
 NUM_FATS = 2
 ROOT_ENTRIES = 16
 FILE_NAME = "STREAM  MP3"  # 8.3, space-padded: "STREAM" + "MP3"
+
+# A few seconds of pre-encoded silence (mono/44100Hz/128kbps, matching the
+# ESP32's Shine encoder config), written into the ring the instant the disk
+# is created -- before any real audio has arrived. Without this, the very
+# first mount ever sees pure zero bytes at the start of the file (nothing
+# "not encoded yet"), and real audio only starts filling the ring once the
+# phone actually starts sending it, ~7s after BT connects at the earliest.
+# Priming with real (if silent) MP3 frames up front means the radio's own
+# decoder has valid bytes to engage with immediately on mount, instead of
+# sitting through however long real content takes to physically arrive
+# before it ever gets ANYTHING to decode.
+SILENCE_PRIMER_PATH = os.path.join(os.path.dirname(__file__), "silence_primer.mp3")
 
 
 def _pack_fat12(entries):
@@ -83,6 +97,12 @@ class GrowingFat12Disk:
         self._boot_sector = self._build_boot_sector()
         self._fat_sector_cache = self._build_fat()
         self._root_dir_sector = self._build_root_dir()
+
+        try:
+            with open(SILENCE_PRIMER_PATH, "rb") as f:
+                self.append(f.read())
+        except FileNotFoundError:
+            pass  # priming is a latency nicety, not a correctness requirement
 
     def append(self, data, unread_protect=False):
         """Write new audio bytes into the ring, overwriting the oldest
