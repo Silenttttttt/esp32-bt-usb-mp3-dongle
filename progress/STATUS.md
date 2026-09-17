@@ -3028,8 +3028,35 @@ measured real Bluetooth-encoding timing — cold-start-only glitching, not a rec
 Worth re-confirming once the real board is in (a PC's read/scheduling timing isn't identical to
 TinyUSB's), but this is a genuinely reassuring result, not a gap.
 
-Not yet done: a real Bluetooth pause/resume or reconnect exercised specifically against this
-new pipeline (only continuous playback was tested tonight); `run_resilient_real_firmware.sh`
-itself hasn't been stress-tested for its own crash-recovery paths the way `run_resilient.sh`
-was. This program is a stand-in, not a substitute for real-hardware testing once the S3 board
-arrives — see `progress/MORNING_RUNBOOK.md`.
+Not yet done: `run_resilient_real_firmware.sh` itself hasn't been stress-tested for its own
+crash-recovery paths the way `run_resilient.sh` was. This program is a stand-in, not a
+substitute for real-hardware testing once the S3 board arrives — see
+`progress/MORNING_RUNBOOK.md`.
+
+### Real BT disconnect/reconnect exercised against the new pipeline (2026-09-17, same night)
+
+Closed the one gap flagged above: used the same desktop-as-BlueZ-source method as the earlier
+0/52 overnight reconnect-crash stress test (`bluetoothctl connect/disconnect` against the paired
+device `30:76:F5:90:BA:A6`, real A2DP audio via `aplay -D bluealsa:...` — a synthesized 440Hz
+tone, not SIGSTOP, which was already confirmed not to actually pause BT-level delivery) against
+the new `s3_real_firmware_host` pipeline specifically (not just the old `s3_sim_serial.py` one
+this method validated previously).
+
+Sequence and result, all confirmed via the classic ESP32's own real `CONTROL` frames arriving
+over the real UART link (not inferred): connect → `BT_CONNECTED`, real audio confirmed flowing
+(encode time rose from the ~9.5ms silence baseline to ~11ms for real tone content, `audio_received`
+climbing at the real rate) → disconnect → `AUDIO_STATE:Suspended`/`BT_DISCONNECTED` → encode time
+fell straight back to the silence baseline (silence-injection engaged instantly, `audio_received`
+never stalled) → reconnect → `BT_CONNECTED`/`AUDIO_STATE:Started` → encode time rose back to
+real-audio levels within 1 frame, resumed cleanly. Throughout the entire cycle: zero new
+straddle-triggered zero-fill events (stayed at the same 26 from the earlier cold-start, tracked
+via the diagnostic out-params added to `disk_read_at()`), zero UART protocol desync, and the
+classic ESP32's own `esp32_ms` timestamp climbed strictly monotonically the whole time — no
+reset, no crash. A brief BT_DISCONNECTED/BT_CONNECTED flap during each `bluetoothctl connect`
+call's own ACL negotiation (also seen on the very first connect of the session) is normal BlueZ
+handshake noise, not a fault.
+
+This directly extends the reconnect-crash-fix confidence (CLAUDE.md item 5, previously 0/52 via
+this same method but never against this new pipeline) to the new real-firmware-logic path, and
+confirms the pipeline swap didn't introduce any new fragility around connection-state
+transitions.
