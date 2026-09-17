@@ -1973,6 +1973,22 @@ to ESP32-S3 begins, not discovered mid-integration** — flagging clearly for wh
 the project starts. Also confirmed only ESP32-S2/S3 (not the classic ESP32 currently used for
 BT+encode) have the USB-OTG peripheral required for a custom USB-MSC device class.
 
+**RESOLVED 2026-09-17, when that porting phase actually started**: went with a refinement of
+option 2 above, not option 1 (blocking) or 3 (DLL rate discipline, more complex than needed).
+`esp32-s3-msc.ino`'s `disk_read_at()` takes the ring mutex with only a 2ms bounded timeout; if
+that fails, or the requested range would straddle the live write edge (the exact same margin
+check as the Python prototype), it serves clean zero-fill instead of blocking OR serving a
+torn/spliced splice — strictly better than "accept occasional torn sectors" since a torn splice
+is an audible artifact and zero-fill is just briefly-early silence, functionally identical to
+the already-designed "not encoded yet" case. `read10_cb` never blocks, matching the hard
+constraint this research identified. Confirmed from TinyUSB's own public source (not just
+assumed) that `onRead`'s `bufsize` is a fixed constant per call anyway (TinyUSB itself chunks
+larger transfers), so `disk_read_at()` was written to handle an arbitrary byte range generically
+regardless. See `esp32-s3-msc/esp32-s3-msc.ino`'s own header and this file's 2026-09-17
+S3-firmware entries for the full writeup — this open question from earlier in the project is
+no longer open, though still unverified on real hardware (no board existed when it was
+written).
+
 ## BlueZ `bluetoothd` crash (~1:19pm today) — confirmed a known, long-standing, unfixed
 ## upstream bug, not a regression in this dev environment
 

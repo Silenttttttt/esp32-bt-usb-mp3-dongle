@@ -20,14 +20,21 @@
 // table, root directory, ring-buffer/backpressure logic, and UART
 // framing/resync all confirmed byte-for-byte or step-for-step identical
 // to the proven reference), but **it has NEVER run on real ESP32-S3
-// hardware** -- there was no board to test on yet. Two things still
-// specifically need real-hardware verification before trusting this:
-// (1) UART_S3_RX_PIN below (the actual wiring isn't known yet), and
-// (2) whether TinyUSB's msc_read_cb granularity assumptions here
-// (arbitrary byte-range reads, looped internally -- see read_at()) match
-// real host behavior. Treat every "should work" comment below as
-// "reasoned from the working Python prototype, the TinyUSB API docs, and
-// the real board's own datasheet -- not yet hardware-confirmed."
+// hardware** -- there was no board to test on yet. One thing still
+// specifically needs real-hardware verification: UART_S3_RX_PIN below
+// (the actual wiring isn't known yet). The other original open question
+// -- TinyUSB's onRead call granularity -- is now resolved from TinyUSB's
+// own public source/docs (github.com/hathach/tinyusb, msc_device.c),
+// not just assumed: `bufsize` is a fixed compile-time constant
+// (CFG_TUD_MSC_EP_BUFSIZE, commonly 512B on this platform) every call,
+// and TinyUSB itself splits a larger SCSI transfer into multiple calls
+// at that fixed size, advancing `offset` each time -- disk_read_at()
+// below was already written to handle an arbitrary byte range generically,
+// so this changes nothing about the implementation, just upgrades this
+// from "reasoned assumption" to "confirmed from the actual library
+// source." Treat every other "should work" comment below as "reasoned
+// from the working Python prototype and the real board's own datasheet
+// -- not yet hardware-confirmed."
 //
 // To regenerate silence_primer.h after changing sim/silence_primer.mp3:
 //   python3 -c "
