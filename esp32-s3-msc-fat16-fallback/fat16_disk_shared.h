@@ -25,14 +25,23 @@
   #define FATDISK_MUTEX_TAKE_BLOCKING(m) xSemaphoreTake(m, portMAX_DELAY)
   #define FATDISK_MUTEX_TRY_TAKE_MS(m, ms) (xSemaphoreTake((m), pdMS_TO_TICKS(ms)) == pdTRUE)
   #define FATDISK_MUTEX_GIVE(m) xSemaphoreGive(m)
+  #define FATDISK_RANDOM32() esp_random()
 #else
   #include <mutex>
   #include <chrono>
   #include <algorithm>
+  #include <random>
   using std::min;
   #define FATDISK_MUTEX_T std::timed_mutex*
   #define FATDISK_MUTEX_CREATE() (new std::timed_mutex())
   #define FATDISK_MUTEX_TAKE_BLOCKING(m) (m)->lock()
+  static inline uint32_t fatdisk_random32_host() {
+    static std::random_device rd;
+    static std::mt19937 gen(rd());
+    static std::uniform_int_distribution<uint32_t> dist;
+    return dist(gen);
+  }
+  #define FATDISK_RANDOM32() fatdisk_random32_host()
   #define FATDISK_MUTEX_TRY_TAKE_MS(m, ms) (m)->try_lock_for(std::chrono::milliseconds(ms))
   #define FATDISK_MUTEX_GIVE(m) (m)->unlock()
 #endif
@@ -107,7 +116,11 @@ static void build_boot_sector() {
   bs[34] = (total32 >> 16) & 0xFF; bs[35] = (total32 >> 24) & 0xFF;
   bs[36] = 0x80;
   bs[38] = 0x29;
-  uint32_t serial = 0xC0FFEE00;
+  // Random per boot -- see fat_disk_shared.h's identical fix (2026-09-17)
+  // for the full rationale: a fixed serial risks a real car radio
+  // resuming into a stale mid-file position across boots, confirmed as a
+  // real symptom in live testing before other factors were also changed.
+  uint32_t serial = FATDISK_RANDOM32();
   bs[39] = serial & 0xFF; bs[40] = (serial >> 8) & 0xFF;
   bs[41] = (serial >> 16) & 0xFF; bs[42] = (serial >> 24) & 0xFF;
   memcpy(bs + 43, "BOARDSIM   ", 11);

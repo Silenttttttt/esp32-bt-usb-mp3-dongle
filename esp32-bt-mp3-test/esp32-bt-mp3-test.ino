@@ -595,25 +595,6 @@ void setup() {
   a2dp_sink.start("ESP32-MP3-Test", true);
   a2dp_sink.set_discoverability(ESP_BT_GENERAL_DISCOVERABLE);
 
-  // ONE-TIME FIX (2026-09-17): auto_reconnect's NVS-persisted "last
-  // connected device" was still the desktop from tonight's stress
-  // testing, so the ESP32 was spending its single BT radio's time
-  // dialing out to a since-unbonded test device instead of accepting a
-  // real phone's incoming pairing -- this is what caused the phone's
-  // "couldn't connect" error. Confirmed by reading BluetoothA2DPSink.cpp
-  // directly: on disconnect it retries the stored address up to
-  // AUTOCONNECT_TRY_NUM (1000) times before ever clearing it on its own.
-  // clean_last_connection() wipes the stale entry once; the next
-  // successful connection (the real phone) becomes the new remembered
-  // device via the library's own normal set_last_connection() path, so
-  // the crash-recovery auto-reconnect safety property (item 8) is
-  // preserved going forward, just correctly retargeted.
-  // REMOVE THIS LINE on the next flash after the phone connects
-  // successfully -- leaving it in permanently would wipe the phone's own
-  // remembered address on every future reboot/crash, defeating that
-  // safety property.
-  a2dp_sink.clean_last_connection();
-
 #ifdef HEAP_TRACE
   Serial.printf("[trace] free heap after a2dp start: %u\n", ESP.getFreeHeap());
 #endif
