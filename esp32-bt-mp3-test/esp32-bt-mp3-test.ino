@@ -271,8 +271,12 @@ void feed_silence_if_no_real_audio() {
 // (FAT12 disk margin, car_sim.py's read cadence) is built around -- only
 // the ESP32-side CPU cost changes, not the wire format or byte rate.
 // A simple (L+R)/2 average, done in native int32_t to avoid int16 overflow
-// on the sum before dividing. NOT YET FLASHED -- needs the mono downmix
-// path verified against a real BT source before flashing to hardware.
+// on the sum before dividing. Flashed and active (confirmed live many
+// times over -- AudioInfo below is declared mono, and this function is
+// called from the currently-flashed DIAG_LOOP_DRAIN path). An earlier
+// version of this comment said "NOT YET FLASHED" -- stale, don't trust
+// that if you see it copied anywhere else (same class of doc-drift
+// CLAUDE.md warns about elsewhere).
 void downmix_stereo_to_mono(const uint8_t *stereo, uint32_t stereo_len,
                              uint8_t *mono_out, uint32_t *mono_len) {
   const int16_t *in = (const int16_t *)stereo;

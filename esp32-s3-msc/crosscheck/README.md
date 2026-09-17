@@ -122,6 +122,22 @@ fallback. This is the exact adversarial scenario ("the reader crashes/stalls for
 the whole ring") the project has been designed to survive since early sessions — confirmed
 here to actually hold up.
 
+## Region-boundary-crossing reads
+
+```
+g++ -Wall -std=c++17 -o region_boundary_test region_boundary_test.cpp && ./region_boundary_test
+```
+
+All the other tests above exercise each FAT12 region (boot/FAT/root-dir/data) mostly in
+isolation. In practice, real TinyUSB calls `onRead` with a fixed, sector-aligned `bufsize`
+(confirmed from TinyUSB's own source), so a single call spanning two regions likely never
+actually happens on real hardware — but `disk_read_at()` was written to handle an arbitrary
+byte range generically anyway, in case that assumption turns out wrong. This test fills each
+region with a distinct byte pattern and issues reads deliberately straddling every region
+boundary (boot→FAT, FAT copy 1→copy 2, root-dir→data, and one read spanning all four regions
+in a single call) — confirmed 2026-09-17: all four cases produce exactly the right bytes on
+both sides of every boundary, zero corruption.
+
 ## What this does NOT verify
 
 Everything hardware-dependent: real UART timing/framing over an actual

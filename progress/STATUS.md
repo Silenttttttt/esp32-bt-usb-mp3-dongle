@@ -2848,3 +2848,34 @@ a real, deliberate feature tradeoff, not a free lunch. Should be re-confirmed wi
 (not just the desktop-as-BlueZ-source stress test) at the next opportunity, and the crash-rate
 methodology caveat from earlier tonight (BlueZ's own AVDTP bug potentially inflating measured
 rates vs. a real phone) still applies here too.
+
+## ⚠️ Real, unresolved architectural risk found via research: cheap car radios may reject FAT12 entirely (2026-09-17)
+
+Dedicated research into real car-radio/embedded USB-MSC host compatibility (since this project
+has never actually tried the real radio) found something worth flagging prominently, not
+quietly noting: **many embedded/consumer FAT filesystem implementations only fully support
+FAT16/FAT32 and treat FAT12 as legacy/floppy-only**, sometimes omitting it entirely to save
+code size. Cheap aftermarket car-radio USB-MSC firmware is exactly the class of implementation
+likely to take this shortcut. **This project's whole volume is FAT12** — chosen specifically
+because the declared file is deliberately kept small (~470KB / ~30s of audio, to bound
+worst-case catch-up lag — see `fat12_disk.py`'s own docstring), and FAT16 requires a minimum
+of 4085 clusters, which at any reasonable cluster size needs a volume of several MB, not
+hundreds of KB.
+
+**This is independent of the whole "live-generated content" trick** — a real radio could
+reject this volume purely because it's FAT12, before ever reading a byte of the file, which
+would mean the entire pipeline plays nothing at all rather than glitching. Not confirmed as an
+actual problem — genuinely can't be, until there's a real radio to test against — but a real,
+sourced risk worth being mentally prepared for, not a surprise if it happens.
+
+**If this turns out to be real**, the mitigation is switching to FAT16, which needs a bigger
+declared volume (≥4085 clusters — at 512-byte clusters that's a minimum ~2MB / ~2 minutes of
+audio, a much bigger worst-case-catch-up-lag bound than the current 30s design). This is a
+real, significant architectural tradeoff (bigger catch-up lag vs. radio compatibility), not a
+quick fix — **deliberately NOT implemented preemptively tonight**, since it's speculative
+(FAT12 might work fine), would mean reworking and re-verifying a lot of already-tested code
+(the crosscheck suite, the concurrency sims, the ring-capacity math), and the actual answer can
+only come from trying the real radio. **First real test with the physical board should include
+checking whether the OS/radio mounts the FAT12 volume at all** — if it doesn't, this is the
+first thing to revisit, and it's a real decision for Muni to weigh in on (bigger lag bound is a
+real UX cost), not something to silently pick a workaround for.

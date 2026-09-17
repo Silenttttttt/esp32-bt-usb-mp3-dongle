@@ -131,7 +131,14 @@ Real bugs found and fixed on the real ESP32 firmware + PC-side prototype so far:
 testing) as of 2026-09-17 night, but 52 cycles isn't infinite and this was tested via the
 desktop as a BlueZ-based BT source, not a real phone yet (see `progress/STATUS.md` for the
 full writeup and methodology caveats) — worth re-confirming with real-phone use before fully
-trusting it's gone; `/dev/ttyACMx` path
+trusting it's gone; **⚠️ a real, unconfirmed risk found via research (2026-09-17): many cheap
+embedded USB-MSC host stacks (exactly the class of thing in a cheap car radio) only fully
+support FAT16/FAT32 and may reject FAT12 entirely** — this project's whole volume is FAT12
+(chosen for the small ~470KB/~30s declared size, which FAT16 can't do at any reasonable
+cluster size — FAT16 needs ≥4085 clusters). Not confirmed as an actual problem (can only be
+tested with the real radio), but if the radio doesn't mount the drive at all, THIS is the
+first thing to check — see `progress/STATUS.md`'s dedicated entry for the real tradeoff
+(FAT16 would need a much bigger, ~2-minute-catch-up-lag volume) before picking a fix; `/dev/ttyACMx` path
 instability + a recurring USB-permission-settle race after re-enumeration (the real ESP32
 firmware self-heals its own reboots automatically now — item 8 — but if a PC/laptop is in the
 loop as an S3 stand-in, that PC-side script needs to auto-recover too — see
@@ -160,6 +167,18 @@ it's easy to silently drop when recompiling by hand — **this already happened 
 never made it into any of this session's actual build commands until it was rediscovered and
 restored late on 2026-09-17). If you ever compile this firmware without copy-pasting the exact
 command above, double-check this flag is still there.
+
+**A required local library patch lives OUTSIDE this repo and can be silently lost.** The
+classic ESP32 firmware will not compile at all without a 2-line patch in
+`~/Arduino/libraries/audio-tools/src/AudioTools/CoreAudio/BaseConverter.h` (around line
+148-172): `(T)(int)(...)` is ambiguous under this toolchain (esp32:esp32 core 3.3.11 +
+audio-tools 1.2.6) when `T` is a class type with multiple integer constructors — fixed by
+disambiguating to `(T)(int32_t)(...)`, semantically identical, already applied and documented
+inline in that file. **If `arduino-cli compile` for the classic ESP32 ever fails with an
+ambiguous-constructor/conversion error mentioning `int24_4bytes_t`, this is why** — the
+library was reinstalled/updated and the patch was lost. Reapply it (the exact change is
+commented in the file itself, or see `progress/STATUS.md`'s original entry for this fix) before
+assuming anything else is wrong.
 
 ESP32-S3 (never flashed yet — this is the actual first real upload):
 ```
