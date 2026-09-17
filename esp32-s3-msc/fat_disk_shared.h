@@ -55,6 +55,25 @@ static const uint32_t MAX_WRITE_RETRIES = 200;  // ~1s total
 // ===================== FAT12 ring-buffer disk (port of fat12_disk.py) ======
 
 static const uint32_t SECTOR_SIZE = 512;
+
+// OPEN TUNING QUESTION, deliberately left as-is pending real S3 hardware
+// (2026-09-17): a real car-radio test found FAT12 initially failed
+// (garbled playback) on a physical test drive using this same 8-sector
+// (4KB) cluster size, and succeeded once switched to 64-sector (32KB)
+// clusters -- among several other simultaneously-changed variables (see
+// progress/STATUS.md's "MAJOR: FAT12 confirmed compatible" entry), so
+// root cause isn't isolated. Deliberately NOT copying the 32KB value
+// here: at this ring's tiny size (~200KB), 32KB clusters would mean only
+// ~6-7 total data clusters, ballooning READ_MARGIN_BYTES (2 clusters)
+// from ~4% of the ring to ~29% -- a real, known-bad ratio matching this
+// project's own earlier Python-prototype history of frequent glitches
+// from an oversized margin-to-ring fraction. Trading a real, understood
+// glitch risk for an unproven compatibility fix isn't worth it blind.
+// TEST ONCE THE REAL S3 BOARD EXISTS: if FAT12 still misbehaves on the
+// real radio with the real firmware at this cluster size, that's the
+// moment to try increasing it here (and re-tuning READ_MARGIN_BYTES
+// alongside it, not independently) -- not before, since only the real
+// hardware can show whether cluster count was ever actually the cause.
 static const uint32_t SECTORS_PER_CLUSTER = 8;  // 4KB clusters
 static const uint32_t RESERVED_SECTORS = 1;
 static const uint32_t NUM_FATS = 2;

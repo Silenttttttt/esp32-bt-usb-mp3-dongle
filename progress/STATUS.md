@@ -3255,3 +3255,31 @@ the original failure, even though it uses smaller 4096B/8-sector clusters rather
 32KB clusters used in this diagnostic test -- cluster COUNT, not byte size, is what plausibly
 matters if the failure mode is chain-walk-length-related. Still not a substitute for testing
 the real firmware's actual ring once the S3 board exists.
+
+## Firmware updated from tonight's findings; cluster-size question deliberately deferred (2026-09-17, same night)
+
+Applied the clear, no-downside win from the real-radio testing to production firmware: the
+volume serial number was a hardcoded constant (`0xC0FFEE00`) on every boot. If the real radio
+caches "resume playback position" by volume serial + filename -- a real, plausible mechanism for
+the "started mid-file" symptom seen in the first real-radio test -- a fixed serial means every
+boot looks identical to the radio forever, regardless of the ring's actual (different) content.
+Now randomized per boot (`esp_random()` on real hardware, `std::mt19937` seeded from
+`std::random_device` on the PC host stand-ins) via a new `FATDISK_RANDOM32()` platform-abstraction
+macro in both `fat_disk_shared.h` and `fat16_disk_shared.h`. All four affected builds (S3 FAT12
+primary, S3 FAT16 fallback, both PC host stand-ins) re-verified compiling clean.
+
+Also removed the classic ESP32's one-time `clean_last_connection()` fix from earlier tonight,
+now that the phone has connected successfully multiple times since -- reflashed (confirmed
+target serial `5B52096812`) and verified clean boot with the real host program, no reconnect
+spam. This restores the permanent crash-recovery auto-reconnect safety property (item 8),
+correctly primed to remember the phone rather than a stale test device.
+
+**Deliberately NOT changed**: the production ring's cluster size (still 8 sectors/4KB, not the
+32KB used in the successful real-radio test). Explicitly discussed with Muni: increasing cluster
+size at this ring's tiny scale (~200KB) would shrink it to only ~6-7 total clusters, ballooning
+`READ_MARGIN_BYTES` from ~4% of the ring to ~29% -- a real, known-bad ratio matching this
+project's own earlier Python-prototype history of frequent glitches from an oversized
+margin-to-ring fraction. Decision: leave it parameterized and documented (see the new comment
+block directly above `SECTORS_PER_CLUSTER` in `fat_disk_shared.h`), and test the real tradeoff
+once the physical S3 board and real car radio are both available together -- no point guessing
+the right number without the hardware that would actually validate it.
