@@ -18,8 +18,24 @@
 set -u
 cd "$(dirname "$0")"
 
+# REAL BUG FOUND AND CONFIRMED (adversarial review + isolated repro,
+# 2026-09-17): registering the same trap for EXIT/INT/TERM while the
+# handler itself sends a signal to the whole process group (`kill 0`,
+# which includes this script's own PID) is self-re-triggering -- bash
+# re-checks for the still-trapped signal once the handler returns,
+# invokes cleanup() again, which sends the signal again, forever.
+# Reproduced directly in isolation: an un-fixed copy of this exact
+# pattern looped indefinitely printing "cleanup fired" until forcibly
+# SIGKILLed; in practice this means Ctrl-C (or any external SIGTERM,
+# e.g. from a process manager or from a future preflight script trying
+# to stop this cleanly) would NOT stop this script -- it would just
+# spin printing the stop message until something sends SIGKILL. Fix:
+# untrap before self-signaling, the standard idiom for exactly this
+# "kill my own group from inside a trap for that same signal" pattern --
+# verified fixed in isolation (fires exactly once, clean exit).
 cleanup() {
   echo "[run_resilient] stopping..." >&2
+  trap - EXIT INT TERM
   kill 0 2>/dev/null
 }
 trap cleanup EXIT INT TERM
