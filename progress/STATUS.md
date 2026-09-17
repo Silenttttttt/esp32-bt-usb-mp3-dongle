@@ -2790,3 +2790,61 @@ through t=46min, `total_free` has sat at a perfectly flat 19964 bytes and `large
 observation window available tonight and it's genuinely flat, not just "looked flat in a short
 sample" — solid closing evidence that eliminating the String-concatenation churn actually
 stopped the fragmentation growth, not just reduced its rate.
+
+## MAJOR: the residual reconnect-crash bug appears actually solved (2026-09-17)
+
+Ran three parallel fresh-review agents overnight (classic ESP32 firmware, S3 firmware, Python
+simulators) plus a dedicated research agent specifically chasing the residual ~15%
+`host_recv_pkt_cb` crash. Two real findings converged into what looks like an actual fix for
+the single longest-standing "not fully solved" item in this whole project.
+
+**Research agent pulled the ACTUAL ESP-IDF v5.5.5 source** (the exact version this project's
+`arduino-esp32` core 3.3.11 bundles) at `components/bt/host/bluedroid/hci/hci_hal_h4.c:662`:
+it's a plain `assert(0)` fired when `osi_calloc()` fails to allocate a buffer for an inbound
+HCI packet. **Definitive root cause: heap allocation failure during a burst of HCI packets**,
+not an ISR-context violation (issue #1322, long fixed, pre-dates this ESP-IDF version) or the
+`ld_acl.c` controller-blob bug (issue #17864, fixed in v5.5.2, already inherited here). No
+further Espressif-side fix exists — the lever is on this project's own side: reduce what
+triggers a big HCI packet burst during reconnect.
+
+**Classic-ESP32 review agent found a real gap**: `connection_state_changed()` was fixed earlier
+tonight to use a bounded `pdMS_TO_TICKS(20)` instead of unbounded `portMAX_DELAY` on
+`send_control()`, specifically because blocking a Bluedroid-owned callback task on
+`serial_mutex` is the exact class of violation behind this crash — but that fix was never
+propagated to `avrc_playstatus_callback()`/`avrc_metadata_callback()`, which run on the same
+task class. Fixed (all six `send_control()` calls in those two functions now use the same
+bounded timeout) and flashed.
+
+**Then found something bigger while cross-checking a much older note**: an existing
+2026-09-15 STATUS.md entry documented that AVRCP was previously identified, with explicit user
+approval ("AVRCP is irrelevant to the actual product — the phone owns playback state entirely,
+the ESP32 is a pure pass-through"), as "the class of traffic that correlated with every crash
+observed" — and a library patch (`~/Arduino/libraries/ESP32-A2DP/src/BluetoothA2DPSink.cpp`,
+guarding `esp_avrc_ct_init()`/`esp_avrc_tg_init()` behind `#ifndef A2DP_DISABLE_AVRC`) was
+already made to support disabling it. **That flag was never actually included in any of
+tonight's build commands** — a real gap between an already-approved decision and what was
+actually being built. Verified safe to restore: every `set_avrc_*` call in the .ino
+(`set_avrc_metadata_attribute_mask`, `set_avrc_connection_state_callback`, etc.) just stores a
+value/callback pointer, never calls an ESP-IDF AVRC API directly — so disabling AVRC init
+can't break anything at the .ino level, confirmed by reading the actual library header.
+
+**Restored `-DA2DP_DISABLE_AVRC`, recompiled, flashed, and ran the exact same 26-cycle real
+bluetoothctl disconnect/reconnect stress test methodology used earlier tonight (which measured
+~15%, 4/26+2/6). Result: zero crashes in 26 cycles. Ran a second independent 26-cycle round to
+guard against a lucky sample: zero crashes again — 0/52 total.** Against a ~15-19% prior
+baseline, the probability of 0/52 happening by chance if the true rate were unchanged is
+roughly 0.02% — statistically decisive, not a fluke. Heap itself didn't meaningfully change
+(`total_free` ~18984B, comparable to before) — consistent with the earlier 2026-09-15 finding
+that disabling AVRCP doesn't raise the heap ceiling itself, it removes the specific traffic
+that triggers a large burst allocation attempt during reconnect in the first place. The two
+mechanisms are consistent, not contradictory.
+
+**Honest caveats**: 52 cycles is a strong sample but not infinite — this should keep being
+watched, not treated as mathematically proven zero. This also means AVRCP metadata (track
+title/artist) and play/pause/next/prev commands FROM THE CAR RADIO'S OWN CONTROLS (if it has
+any) will no longer work — per the user's own prior explicit approval, this is fine since the
+phone owns playback state and the ESP32/radio is a pure pass-through, but worth knowing this is
+a real, deliberate feature tradeoff, not a free lunch. Should be re-confirmed with a real phone
+(not just the desktop-as-BlueZ-source stress test) at the next opportunity, and the crash-rate
+methodology caveat from earlier tonight (BlueZ's own AVDTP bug potentially inflating measured
+rates vs. a real phone) still applies here too.

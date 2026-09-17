@@ -368,17 +368,30 @@ void audio_state_changed(esp_a2d_audio_state_t state, void *) {
   send_control(buf, pdMS_TO_TICKS(20));
 }
 
+// REAL BUG FOUND (2026-09-17, via fresh adversarial review, same night as
+// the residual-crash stress test): connection_state_changed() was fixed
+// to use a bounded pdMS_TO_TICKS(20) instead of the default unbounded
+// portMAX_DELAY on send_control(), specifically because blocking a
+// Bluedroid-owned callback task indefinitely on serial_mutex (held by
+// the audio-drain loop, which runs ~100-180 times/sec) is the exact
+// class of violation behind the host_recv_pkt_cb hci_hal_h4.c crash --
+// but that fix was never propagated to these two functions, which run on
+// the SAME Bluedroid task class (see the file-header comment on that).
+// Every track change or play/pause command could still block
+// indefinitely here. Plausible contributor to the ~15% residual
+// reconnect-crash rate measured tonight -- not confirmed as THE cause,
+// but a real gap in an already-established fix, worth closing either way.
 void avrc_playstatus_callback(esp_avrc_playback_stat_t playback) {
   switch (playback) {
-    case ESP_AVRC_PLAYBACK_PLAYING: send_control("PLAY"); break;
-    case ESP_AVRC_PLAYBACK_PAUSED:  send_control("PAUSE"); break;
-    case ESP_AVRC_PLAYBACK_STOPPED: send_control("STOP"); break;
-    case ESP_AVRC_PLAYBACK_FWD_SEEK: send_control("SEEK_FWD"); break;
-    case ESP_AVRC_PLAYBACK_REV_SEEK: send_control("SEEK_REV"); break;
+    case ESP_AVRC_PLAYBACK_PLAYING: send_control("PLAY", pdMS_TO_TICKS(20)); break;
+    case ESP_AVRC_PLAYBACK_PAUSED:  send_control("PAUSE", pdMS_TO_TICKS(20)); break;
+    case ESP_AVRC_PLAYBACK_STOPPED: send_control("STOP", pdMS_TO_TICKS(20)); break;
+    case ESP_AVRC_PLAYBACK_FWD_SEEK: send_control("SEEK_FWD", pdMS_TO_TICKS(20)); break;
+    case ESP_AVRC_PLAYBACK_REV_SEEK: send_control("SEEK_REV", pdMS_TO_TICKS(20)); break;
     default: {
       char buf[24];
       snprintf(buf, sizeof(buf), "PLAYSTATUS_%d", (int)playback);
-      send_control(buf);
+      send_control(buf, pdMS_TO_TICKS(20));
       break;
     }
   }
@@ -398,7 +411,7 @@ void avrc_metadata_callback(uint8_t id, const uint8_t *text) {
   }
   char buf[160];
   snprintf(buf, sizeof(buf), "%s%s", label, (const char *)text);
-  send_control(buf);
+  send_control(buf, pdMS_TO_TICKS(20));
 }
 
 void setup() {

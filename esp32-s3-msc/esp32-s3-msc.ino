@@ -517,6 +517,21 @@ void setup() {
   LinkSerial.setRxBufferSize(8192);
   LinkSerial.begin(UART_BAUD, SERIAL_8N1, UART_S3_RX_PIN, UART_S3_TX_PIN);
 
+  // REAL BUG FOUND (fresh adversarial review, 2026-09-17): link_task used
+  // to be created AFTER MSC.begin()/USB.begin() below -- a real boot-time
+  // data-loss window. The classic ESP32 starts transmitting continuous
+  // silence-or-real-audio frames over UART from its own boot, independent
+  // of BT state (feed_silence_if_no_real_audio()). If USB enumeration
+  // (a real, variable-length handshake) takes longer than it takes to
+  // fill the 8KB UART RX buffer at 921600 baud, incoming bytes get
+  // silently dropped before link_task ever starts draining them.
+  // Self-limiting (find_sync()'s resync logic already handles the
+  // resulting misalignment gracefully, confirmed in the UART-framing
+  // crosscheck), but still real, avoidable data loss on every boot.
+  // Fix: start draining the UART immediately after LinkSerial.begin(),
+  // before the slower USB enumeration work below.
+  xTaskCreatePinnedToCore(link_task, "link_task", 8192, nullptr, 2, nullptr, 1);
+
   USB.onEvent(usb_event_callback);
   MSC.vendorID("PHANTOMD");     // max 8 chars
   MSC.productID("USB_MSC");     // max 16 chars
@@ -528,8 +543,6 @@ void setup() {
   MSC.isWritable(false);
   MSC.begin(TOTAL_SECTORS, SECTOR_SIZE);
   USB.begin();
-
-  xTaskCreatePinnedToCore(link_task, "link_task", 8192, nullptr, 2, nullptr, 1);
 
   Serial.printf("[s3] FAT12 volume: %lu sectors, declared file size %lu bytes, "
                 "first data LBA %lu\n",

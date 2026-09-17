@@ -29,20 +29,28 @@ overwritten with fresh audio. The radio just keeps reading further into a file
 that appears enormous but is really only ever a rolling ~30-second window of real
 content.
 
-The ESP32-S3 side (the actual USB-MSC device) hasn't been built yet — everything
-in `sim/` is a PC-side stand-in used to design and validate the ring-buffer /
-FAT12-serving algorithm (`sim/fat12_disk.py`) before porting it to real S3
-firmware. See `CLAUDE.md` for the full breakdown of what's real hardware vs.
-what's a throwaway prototype.
+The physical ESP32-S3 board hasn't arrived yet, but its firmware (`esp32-s3-msc/`)
+has already been written and extensively verified without hardware — a careful
+C++ port of the ring-buffer/FAT12 algorithm originally designed and validated in
+`sim/fat12_disk.py`, cross-checked byte-for-byte against that Python reference and
+stress-tested under real concurrent, real-time-paced load (see
+`esp32-s3-msc/crosscheck/`). It has never actually run on real S3 hardware yet.
+See `CLAUDE.md` for the full breakdown of what's real hardware vs. what's a
+throwaway prototype.
 
 ## Repo layout
 
 - `esp32-bt-mp3-test/` — real, flashed firmware for the classic ESP32 (Bluetooth
   A2DP sink + real-time Shine MP3 encoding).
+- `esp32-s3-msc/` — real firmware for the ESP32-S3 (USB-MSC device role), written
+  before the physical board arrived. `crosscheck/` holds host-only tests proving
+  its core logic matches the Python reference and holds up under real concurrent
+  load — see its own README for what's been verified and what still needs the
+  real board.
 - `sim/` — PC-side prototypes: `fat12_disk.py` (the core ring-buffer/FAT12 disk
-  algorithm meant to be ported to the S3), `s3_sim_serial.py` (desktop stand-in
-  for the not-yet-built ESP32-S3), `car_sim.py` (desktop stand-in for the real
-  car radio's USB-MSC reads).
+  algorithm the S3 firmware above is ported from), `s3_sim_serial.py` (desktop
+  stand-in for the S3 during PC-only testing), `car_sim.py` (desktop stand-in for
+  the real car radio's USB-MSC reads).
 - `progress/` — running project log (`STATUS.md`) plus research/audit notes.
 - `firmware/` — historical "Stage 1" proof-of-concept on a Digispark/ATtiny
   board (V-USB), done before the ESP32 phase. Kept for reference only; its

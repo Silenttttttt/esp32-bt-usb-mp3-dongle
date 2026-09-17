@@ -77,12 +77,26 @@ Real bugs found and fixed on the real ESP32 firmware + PC-side prototype so far:
    in the live `DIAG_LOOP_DRAIN` path) — an earlier version of this doc incorrectly said this
    was "written but unflashed"; don't trust that note if you see it copied anywhere else.
 5. ESP32 reboots on real Bluetooth reconnect (~35% rate originally) — root-caused to a
-   core-affinity change (`set_task_core(0)`) violating a Bluedroid/HCI assumption; reverted.
-   **Residual, real, measured crash rate (~15% per reconnect attempt as of 2026-09-17, likely
-   a deeper ESP-IDF/Bluedroid HCI-layer bug, not fixable from application code) — NOT
-   eliminated.** What IS fixed and verified (see item 8 below): the system now self-heals from
-   this crash automatically, with zero human action, which is the property that actually
-   matters for unattended driving use.
+   core-affinity change (`set_task_core(0)`) violating a Bluedroid/HCI assumption; reverted,
+   dropping the rate to ~15%. **Then apparently actually solved (2026-09-17 night)**: pulled
+   the real ESP-IDF source and found the exact assert (`host_recv_pkt_cb hci_hal_h4.c:662`) is
+   a heap-allocation failure during a burst of HCI packets — not an ISR-context or
+   controller-blob bug. Root cause of the burst: AVRCP traffic during reconnect (already
+   identified with explicit user approval back on 2026-09-15 — "AVRCP is irrelevant to the
+   actual product" — and a library patch already existed for it, but the `-DA2DP_DISABLE_AVRC`
+   build flag needed to actually use that patch had never been included in any of this
+   session's build commands). Restored the flag: **0 crashes in two independent 26-cycle real
+   stress tests (0/52 total)**, vs. the prior ~15-19% baseline — statistically decisive
+   (~0.02% chance of that happening if the rate were unchanged). **This flag is critical, see
+   the Build/flash commands section below** — it's easy to silently drop since it lives in a
+   build command, not the `.ino` file, which is exactly how it got lost the first time. Also
+   fixed a related gap the same night: `avrc_playstatus_callback()`/`avrc_metadata_callback()`
+   still used unbounded `portMAX_DELAY` on `send_control()`, the same class of Bluedroid-task
+   blocking risk already fixed in `connection_state_changed()` — now consistent (moot while
+   AVRCP is disabled, but correct either way). What was ALREADY fixed and verified regardless
+   (see item 8 below): the system self-heals from any crash automatically, zero human action —
+   the property that actually matters for unattended driving use, now hopefully needed far
+   less often.
 6. Ring-wrap MP3 splice + "stale audio replay" on pause/disconnect — fixed via (a) an
    ESP32-side silence injector (`feed_silence_if_no_real_audio()`) that keeps the ring "live"
    through any gap instead of freezing, and (b) real write-side backpressure
@@ -113,9 +127,11 @@ Real bugs found and fixed on the real ESP32 firmware + PC-side prototype so far:
     forever; caught and fixed a second bug in the first fix attempt (the capping addition
     could itself overflow) before trusting it. See `progress/STATUS.md` 2026-09-17.
 
-**Known still-open items**: the residual reconnect-crash rate (item 5, ~15%, likely not
-fixable from application code — see `progress/STATUS.md` for the full stress-test writeup and
-an important methodology caveat about how that rate was measured); `/dev/ttyACMx` path
+**Known still-open items**: the reconnect-crash rate (item 5) — believed solved (0/52 in
+testing) as of 2026-09-17 night, but 52 cycles isn't infinite and this was tested via the
+desktop as a BlueZ-based BT source, not a real phone yet (see `progress/STATUS.md` for the
+full writeup and methodology caveats) — worth re-confirming with real-phone use before fully
+trusting it's gone; `/dev/ttyACMx` path
 instability + a recurring USB-permission-settle race after re-enumeration (the real ESP32
 firmware self-heals its own reboots automatically now — item 8 — but if a PC/laptop is in the
 loop as an S3 stand-in, that PC-side script needs to auto-recover too — see
@@ -131,11 +147,19 @@ Classic ESP32 (already flashed, only needed again after a code change):
 ```
 cd esp32-bt-mp3-test
 arduino-cli compile --fqbn esp32:esp32:esp32 \
-  --build-property "compiler.c.extra_flags=-DINT2IDX_SIZE=4000 -DDIAG_LOOP_DRAIN -DDIAG_FRAG_TRACE" \
-  --build-property "compiler.cpp.extra_flags=-DINT2IDX_SIZE=4000 -DDIAG_LOOP_DRAIN -DDIAG_FRAG_TRACE" .
+  --build-property "compiler.c.extra_flags=-DINT2IDX_SIZE=4000 -DDIAG_LOOP_DRAIN -DDIAG_FRAG_TRACE -DA2DP_DISABLE_AVRC" \
+  --build-property "compiler.cpp.extra_flags=-DINT2IDX_SIZE=4000 -DDIAG_LOOP_DRAIN -DDIAG_FRAG_TRACE -DA2DP_DISABLE_AVRC" .
 # confirm target port's serial number matches 5B52096812 (see Safety-critical section above) before uploading:
 arduino-cli upload -p /dev/ttyACM<N> --fqbn esp32:esp32:esp32 .
 ```
+**`-DA2DP_DISABLE_AVRC` is critical, not optional** — it's the fix that took the residual
+Bluetooth-reconnect crash rate from ~15% to 0/52 in testing (see item 5/the "MAJOR" 2026-09-17
+entry in `progress/STATUS.md`). It's a build flag, not something in the `.ino` file itself, so
+it's easy to silently drop when recompiling by hand — **this already happened once** (a
+2026-09-15 decision to disable AVRCP was made and even patched into the library, but the flag
+never made it into any of this session's actual build commands until it was rediscovered and
+restored late on 2026-09-17). If you ever compile this firmware without copy-pasting the exact
+command above, double-check this flag is still there.
 
 ESP32-S3 (never flashed yet — this is the actual first real upload):
 ```
