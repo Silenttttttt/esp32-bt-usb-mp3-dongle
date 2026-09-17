@@ -3350,3 +3350,31 @@ phone's own negotiation almost certainly still takes meaningfully longer, consis
 earlier real-phone observations. The T1→T2→T3 chain, however, is measured on the real firmware
 logic and the real ring regardless of what drives the Bluetooth side, and is the part actually
 addressable by this project's own code.
+
+## Follow-up: is the catch-up lag a one-time cost, or does it recur on every song? (2026-09-17, same night)
+
+Muni pushed back correctly: the previous entry's "one-time" framing was about one continuous BT
+session, not "the first time ever" -- and every test done tonight (his and this session's) had
+been a fresh connection, so it was fair to ask why the delay "always" shows up. Reasoning (not
+yet fully confirmed): since the reader consumes at least as fast as the writer produces (the
+writer runs slightly below nominal due to the already-documented encoder CPU-budget deficit),
+the gap between "what's on the phone now" and "what's playing" should shrink after the initial
+catch-up and settle near real-time, not stay fixed for the whole session -- supported indirectly
+by every straddle-count trend tonight going flat after the initial ramp, never recurring, across
+runs sustained 20-900+ seconds.
+
+Attempted to confirm this directly with a two/three-song same-connection test (desktop-as-source,
+autonomous). Got a **second real measurement of first-connection ring catch-up lag: 9.32s**
+(vs. the earlier 12.29s -- same mechanism, different reader/writer phase, both plausible given
+the ~12.8s ring). **Could not cleanly measure a same-session second play**: one attempt's `aplay`
+failed instantly with a real `bluealsa` PCM-not-ready race (looked like "the song played" from
+process-exit timing alone -- it hadn't; checking the player's own log, not just process
+lifetime, was the fix), and a follow-up attempt got lost in a stuck background shell. This is a
+limitation of the desktop-as-source test rig's own reconnection flakiness, not a firmware
+finding -- real phones handle BT reconnection more gracefully. Recommended Muni verify directly:
+skip to a different song within one continuous real-phone connection (no disconnect) and check
+whether the wait is meaningfully shorter than the first one.
+
+Also chased down an apparent "corrupted UART frame" in the live log (`ENCODE_US:av` followed by
+garbage bytes) -- confirmed it was a false alarm, a `tail`/read race against a line still being
+written, not real corruption; re-reading the same region moments later showed clean content.
