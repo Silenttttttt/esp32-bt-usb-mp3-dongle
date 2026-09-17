@@ -52,11 +52,25 @@ static const uint32_t NUM_FATS = 2;
 static const uint32_t ROOT_ENTRIES = 16;
 static const char FILE_NAME[12] = "STREAM  MP3";  // 8.3, space-padded (11 bytes + NUL)
 
-// Matches sim/s3_sim_serial.py's --capacity-mb default (0.4578MB): 117
-// clusters * 4096 bytes/cluster = 479232 bytes (~30s of audio at
-// 16000 B/s). See fat12_disk.py's own docstring for why this is sized as
-// "acceptable worst-case catch-up lag", not "how long is the drive".
-static const uint32_t DATA_CLUSTERS = 117;
+// REDUCED from 117 clusters (~30s) to 59 (~15.1s) on 2026-09-17 after a
+// real phone test: the car radio reader always starts reading from file
+// position 0 (cluster 2), and since the ring is a continuously-
+// overwritten circular buffer, whatever's CURRENTLY at position 0 can be
+// up to a FULL RING DURATION stale -- exactly the mechanism
+// s3_sim_serial.py's own --capacity-mb help text already documented
+// ("the reader's wrap-to-start cycle... can replay content from up to
+// the FULL ring duration ago"). With a fresh/idle ring (silence-injected
+// since boot) sitting at position 0, this meant up to ~30s of stale
+// silence had to be read through before the reader's traversal caught up
+// to wherever real audio was actually being written -- a real,
+// measured, user-reported ~30s time-to-first-real-audio delay, not a
+// regression from any one pipeline. Halving ring duration halves this
+// worst-case bound. See fat12_disk.py's own docstring for why this is
+// sized as "acceptable worst-case catch-up lag", not "how long is the
+// drive" -- 50 clusters * 4096 bytes/cluster = 204800 bytes (~12.8s at
+// 16000 B/s), comfortably inside the accepted "10-15s" range rather than
+// right at its edge.
+static const uint32_t DATA_CLUSTERS = 50;
 static const uint32_t CLUSTER_SIZE = SECTORS_PER_CLUSTER * SECTOR_SIZE;
 static const uint32_t DECLARED_FILE_SIZE = DATA_CLUSTERS * CLUSTER_SIZE;  // 479232
 

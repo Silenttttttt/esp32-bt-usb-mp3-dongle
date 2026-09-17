@@ -3060,3 +3060,56 @@ This directly extends the reconnect-crash-fix confidence (CLAUDE.md item 5, prev
 this same method but never against this new pipeline) to the new real-firmware-logic path, and
 confirms the pipeline swap didn't introduce any new fragility around connection-state
 transitions.
+
+## First real phone test: two real bugs found and fixed (2026-09-17, same night)
+
+Muni tested with an actual phone for the first time (everything before tonight used the
+desktop-as-BlueZ-source method). Two real, previously-unconfirmed issues surfaced immediately.
+
+**Bug 1 — phone couldn't pair at all ("couldn't connect").** Root cause, confirmed by reading
+`BluetoothA2DPSink.cpp` directly: `a2dp_sink.start("ESP32-MP3-Test", true)` enables
+`set_auto_reconnect(true, AUTOCONNECT_TRY_NUM=1000)`, which persists the last-connected
+address to NVS and retries it on every disconnect. That address was still the desktop from
+tonight's earlier stress testing (a device the desktop-side bond had since been removed for) —
+the ESP32 was spending its Bluetooth radio dialing out to a device that no longer accepted it,
+starving the phone's incoming pairing attempt. Fix: added a one-time
+`a2dp_sink.clean_last_connection();` call right after `a2dp_sink.start(...)` in
+`esp32-bt-mp3-test.ino`, wiping the stale NVS entry. Recompiled with the exact required
+`-DA2DP_DISABLE_AVRC` build command from this doc, reflashed the classic ESP32 (confirmed
+target serial `5B52096812` before and after), confirmed clean boot with no repeated
+reconnect-attempt spam. Phone paired successfully afterward. **This line must be removed on
+the next flash** — left in permanently, it would wipe the phone's own remembered address on
+every future reboot/crash, defeating the item-8 crash-recovery safety property it's supposed to
+preserve; it's a one-time fix for a stale NVS entry, not a permanent behavior change.
+
+**Bug 2 — ~30s delay before hearing any real audio, worse than the previously-accepted ~15s
+AVDTP-negotiation floor.** Initially suspected as just that known floor plus MP3 decode
+buffering, but the actual mechanism was already documented and missed: `sim/s3_sim_serial.py`'s
+own `--capacity-mb` help text states the car-radio reader's "wrap-to-start cycle runs on its
+own clock, completely independent of the phone's actual playback position... can replay
+content from up to the FULL ring duration ago." The reader always starts reading from file
+position 0, and since the ring is a continuously-overwritten circular buffer that had been
+running on injected silence since boot, whatever sat at position 0 was up to a full ring
+duration (~30s, matching the then-current `DECLARED_FILE_SIZE`/16000) old — so the reader had
+to read all the way through stale silence before its traversal caught up to wherever real
+audio was actually being written. Not a regression from tonight's pipeline swap — this applies
+identically to the old `s3_sim_serial.py` design, since it's a property of the ring+naive-
+repeat-track-reader combination, not the disk-serving implementation.
+
+Fix: reduced `DATA_CLUSTERS` in `fat_disk_shared.h` (the shared source, so this applies to the
+real `.ino` too, not just the PC stand-in) from 117 clusters (~30s) to 50 clusters (~12.8s),
+directly halving-plus the worst-case staleness bound into the accepted 10-15s range with some
+margin. Re-verified `esp32-s3-msc.ino` still compiles clean for the S3 target (RAM usage
+dropped slightly, as expected with a smaller static ring). Validated stability of the smaller
+ring/margin ratio using the existing silence-injection stream (same byte throughput as real
+audio, so a valid proxy without touching the phone's now-correctly-remembered BT connection):
+straddle-triggered zero-fill events plateaued at 19 during the (now proportionally shorter,
+~21-25s) cold-start ramp, then held flat for 20+ continuous seconds afterward — no new
+steady-state glitching from the smaller ring. `READ_MARGIN_BYTES` stays a smaller fraction of
+the new ring size (8192/204800 ≈ 4%) than the Python prototype's own well-validated margin
+ratio, so no reason to expect this to reintroduce the retry-era margin problems.
+
+Not yet done: a real-phone confirmation that the delay is now actually ≤15s end-to-end (only
+validated via silence-injection proxy + analytical ring-size math so far, deliberately avoiding
+a second BT reconnection cycle that would have overwritten the phone's newly-correct
+`last_connection` NVS entry back to the desktop).

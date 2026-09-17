@@ -140,6 +140,17 @@ Real bugs found and fixed on the real ESP32 firmware + PC-side prototype so far:
     during the initial ring-fill/cold-start ramp (26 straddles in the first ~37s), then zero
     over 44+ continuous steady-state seconds — `READ_MARGIN_BYTES` is not under-provisioned
     against currently-measured real timing. See `progress/STATUS.md` 2026-09-17.
+12. First real phone test found two real bugs. (a) Phone couldn't pair at all — the classic
+    ESP32's `set_auto_reconnect` had the desktop's address (from earlier stress testing)
+    persisted in NVS and was busy dialing out to it, starving the phone's incoming connection.
+    Fixed with a one-time `a2dp_sink.clean_last_connection();` call, reflashed — **must be
+    removed on the next flash**, it would otherwise wipe the phone's own remembered address on
+    every future crash/reboot. (b) ~30s delay before hearing any real audio — root cause: the
+    car radio reader always starts at file position 0, and a continuously-overwritten ring
+    buffer means position 0 can be up to a full ring duration stale; the ring was sized for
+    ~30s. Fixed by reducing `DATA_CLUSTERS` in `fat_disk_shared.h` from 117 to 50 (~12.8s),
+    applying to the real `.ino` too since it's shared source. See `progress/STATUS.md`
+    2026-09-17's "First real phone test" entry.
 
 **Known still-open items**: the reconnect-crash rate (item 5) — believed solved (0/52 in
 testing) as of 2026-09-17 night, but 52 cycles isn't infinite and this was tested via the
