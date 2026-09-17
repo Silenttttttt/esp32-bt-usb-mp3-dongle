@@ -1,4 +1,4 @@
-# PhantomDrive
+# usb-stick-mp3-via-esp32-a2dp
 
 Stream Bluetooth audio from a phone into an aftermarket car radio that only accepts
 USB-stick MP3 playback — no Bluetooth input, no AUX. The radio is never modified or
@@ -44,9 +44,10 @@ what's a throwaway prototype.
   for the not-yet-built ESP32-S3), `car_sim.py` (desktop stand-in for the real
   car radio's USB-MSC reads).
 - `progress/` — running project log (`STATUS.md`) plus research/audit notes.
-- `firmware/`, `vusb-src/`, `cdc-reference/`, `micronucleus-*` — historical
-  "Stage 1" proof-of-concept on a Digispark/ATtiny board (V-USB), done before
-  the ESP32 phase. Kept for reference only.
+- `firmware/` — historical "Stage 1" proof-of-concept on a Digispark/ATtiny
+  board (V-USB), done before the ESP32 phase. Kept for reference only; its
+  vendored V-USB/DigiCDC/micronucleus dependencies are intentionally not
+  checked in here.
 - `CLAUDE.md` — project context and working conventions for AI-assisted
   development on this repo.
 
