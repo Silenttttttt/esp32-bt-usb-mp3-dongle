@@ -2939,3 +2939,22 @@ running continuously with zero `RESET_REASON` events beyond the original post-fl
 window, not specifically a reconnect-stress scenario, but it's still a real additional data
 point on top of the 0/52 stress-test result — no spontaneous crash of any kind over a genuinely
 long real duration.
+
+## Power/brownout resilience audit for real car deployment (2026-09-17)
+
+Given this needs to survive a real car's electrical environment (engine-crank voltage sags,
+alternator noise, abrupt ignition-off power loss) unattended, checked whether tonight's
+software resilience work has any power-supply-level blind spot. **No firmware gaps found**:
+ESP32 brownout detection is on by default at a reasonable threshold (~2.43-2.44V) on both
+boards without needing explicit configuration, and the classic ESP32 already logs
+`RESET_REASON:BROWNOUT` explicitly if it ever happens. The new auto-reconnect feature's NVS
+write (saving the last-connected BT address) is safe by ESP-IDF's own design — NVS is built to
+survive power loss mid-write (atomic, with corruption recovery); worst case on an abrupt cut is
+losing that one saved address (falls back to needing a fresh pair), never a corrupted/bricked
+state. The S3 firmware has no persistent storage at all to worry about.
+
+**One practical, non-firmware takeaway for the actual physical install**: use a reasonably
+reputable USB car charger, not a bargain-bin one — a charger's own job already includes
+regulating against the automotive electrical environment's real transients (cranking sags,
+alternator load-dump spikes), and cheap ones are the actual common failure point, not the
+ESP32 itself.
