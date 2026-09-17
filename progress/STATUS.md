@@ -2958,3 +2958,12 @@ reputable USB car charger, not a bargain-bin one — a charger's own job already
 regulating against the automotive electrical environment's real transients (cranking sags,
 alternator load-dump spikes), and cheap ones are the actual common failure point, not the
 ESP32 itself.
+
+**Also checked and cleared**: `msc_on_write`/`msc_on_start_stop` in the S3 firmware (accept-
+and-discard writes, unconditional true on start/stop) match TinyUSB's own reference example's
+pattern for an always-present device — not a gap. `feed_silence_if_no_real_audio()`'s 150ms
+threshold and a narrow check-then-act race with `audio_data_callback` were both found to be
+real but too low-severity/probability (a possible single ~23ms masked blip, at most) to justify
+adding synchronization complexity to a real-time-critical Bluedroid task path. No fixes
+warranted from this round — a reassuring result after the major crash fix, not a gap in the
+review.

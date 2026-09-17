@@ -1,5 +1,9 @@
 # digispark-msc — BT-to-USB-MP3 car radio bridge
 
+**If the ESP32-S3 board just arrived, start with `progress/MORNING_RUNBOOK.md`** — a single
+ordered checklist for bringing it up, pulled together from everything scattered across this
+file and STATUS.md.
+
 ## The actual goal
 
 Stream Bluetooth audio (phone) into an aftermarket car radio that **only** accepts
