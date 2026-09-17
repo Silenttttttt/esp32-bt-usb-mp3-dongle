@@ -30,6 +30,11 @@ static atomic<uint32_t> g_write_pos{0};
 static atomic<uint32_t> g_total_written{0};
 static atomic<uint32_t> g_last_read_offset{0};
 static mutex g_ring_mutex;
+// TEST-ONLY ground truth, uncapped -- see realtime_concurrency_sim.cpp's
+// identical comment. g_total_written is now intentionally capped
+// (2026-09-17 overflow fix) so it can't double as this test's verification
+// reference anymore.
+static uint64_t g_ground_truth_written = 0;
 
 static atomic<bool> g_stop{false};
 static atomic<bool> g_reader_stalled{true};  // starts stalled, released after N seconds
@@ -45,7 +50,8 @@ static bool disk_append(const uint8_t *data, uint32_t n, bool unread_protect) {
     if (unread_protect) return false;
     lock_guard<mutex> lk(g_ring_mutex);
     memcpy(g_ring, data + (n - DECLARED_FILE_SIZE), DECLARED_FILE_SIZE);
-    g_write_pos = 0; g_total_written += n;
+    g_write_pos = 0; g_total_written = DECLARED_FILE_SIZE;
+    g_ground_truth_written += n;
     return true;
   }
   lock_guard<mutex> lk(g_ring_mutex);
@@ -67,7 +73,10 @@ static bool disk_append(const uint8_t *data, uint32_t n, bool unread_protect) {
     memcpy(g_ring, data + first_part, end - DECLARED_FILE_SIZE);
   }
   g_write_pos = end % DECLARED_FILE_SIZE;
-  g_total_written += n;
+  if (g_total_written < DECLARED_FILE_SIZE) {
+    g_total_written = min(g_total_written + n, DECLARED_FILE_SIZE);
+  }
+  g_ground_truth_written += n;
   return true;
 }
 
@@ -76,7 +85,7 @@ static inline uint32_t disk_valid_bytes() {
   return (tw < DECLARED_FILE_SIZE) ? tw : DECLARED_FILE_SIZE;
 }
 
-static bool disk_read_data(uint32_t data_off, uint8_t *buffer, uint32_t n, uint32_t *out_tw) {
+static bool disk_read_data(uint32_t data_off, uint8_t *buffer, uint32_t n, uint64_t *out_tw) {
   memset(buffer, 0, n);
   lock_guard<mutex> lk(g_ring_mutex);
   uint32_t avail = disk_valid_bytes();
@@ -91,7 +100,7 @@ static bool disk_read_data(uint32_t data_off, uint8_t *buffer, uint32_t n, uint3
       memcpy(buffer, g_ring + data_off, real_n);
     }
     g_last_read_offset = (data_off + n) % DECLARED_FILE_SIZE;
-    *out_tw = g_total_written.load();
+    *out_tw = g_ground_truth_written;
     return true;
   }
   g_straddle_hits++;
@@ -109,11 +118,12 @@ static void writer_thread(double run_seconds) {
   vector<uint8_t> chunk(512);
   int chunk_sizes[] = {256, 320, 384, 448, 512};
   int csi = 0;
+  uint64_t local_written = 0;  // avoids reading the shared value from this thread; see realtime_concurrency_sim.cpp
 
   while (duration<double>(steady_clock::now() - start).count() < run_seconds && !g_stop) {
     int n = chunk_sizes[csi % 5]; csi++;
     n -= n % 4;
-    uint32_t base = g_total_written.load();
+    uint64_t base = local_written;
     for (int i = 0; i < n; i += 4) {
       uint32_t v = base + i;
       chunk[i] = v&0xFF; chunk[i+1]=(v>>8)&0xFF; chunk[i+2]=(v>>16)&0xFF; chunk[i+3]=(v>>24)&0xFF;
@@ -125,6 +135,7 @@ static void writer_thread(double run_seconds) {
       this_thread::sleep_for(milliseconds(5));
     }
     if (!ok) { disk_append(chunk.data(), n, false); g_forced_writes++; }
+    local_written += n;
     g_writes_done++;
 
     next_tick += duration_cast<steady_clock::duration>(duration<double>(n / bytes_per_sec));
@@ -148,7 +159,7 @@ static void reader_thread(double run_seconds, double stall_seconds) {
 
   while (duration<double>(steady_clock::now() - start).count() < run_seconds && !g_stop) {
     for (int i = 0; i < 8 && !g_stop; i++) {
-      uint32_t total_after = 0;
+      uint64_t total_after = 0;
       bool served = disk_read_data(read_pos, buf.data(), 512, &total_after);
       g_reads_done++;
       if (served) {

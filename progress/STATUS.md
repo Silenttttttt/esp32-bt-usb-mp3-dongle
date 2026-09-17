@@ -2731,3 +2731,46 @@ fail — but the "phone stuck thinking it's connected" failure mode specifically
 *phone's* own BT stack behavior after a silent link loss, which is outside anything this
 project's code controls, and hasn't been tested against a real phone's real behavior in that
 exact scenario.
+
+## A genuine uint32_t overflow bug found and fixed, C++-specific (2026-09-17)
+
+While reasoning through the S3 firmware once more (not prompted by any test failure — just
+thinking carefully about a very-long-session scenario, per Muni's "measure any real limits"
+ask): `g_total_written` is a `uint32_t`, incremented forever for the life of the session. At
+the real ~16000 B/s audio rate, that overflows after 2^32/16000 ≈ 74.6 hours of continuous
+operation. Since the write-side backpressure gate is `g_total_written >= DECLARED_FILE_SIZE`,
+wrapping back to a small value would silently disable backpressure for the ~30s it takes to
+re-cross that threshold — right at the 74.6-hour mark. **Python's `total_written` is
+arbitrary-precision and has no analogous issue**, so this was never going to be caught by the
+earlier byte-for-byte cross-check against `fat12_disk.py` — it's a genuinely C++-specific bug,
+found by reasoning about fixed-width-integer arithmetic over a long timescale, not by any test.
+
+**Fix**: cap `g_total_written` at `DECLARED_FILE_SIZE` and never grow it further once reached
+— nothing downstream needs the exact unbounded count, only "has the ring filled at least once"
+(the `>=` comparison, which stays true forever once the cap is reached) and
+`disk_valid_bytes()`'s already-capped return value.
+
+**Caught a bug in my own first attempt at this fix, before trusting it**: the first version was
+`g_total_written = min(g_total_written + n, DECLARED_FILE_SIZE)` — but `g_total_written + n`
+can *itself* overflow if `g_total_written` is already near `UINT32_MAX`, producing a small
+wrapped value before `min()` ever sees it, silently reproducing the exact bug being fixed.
+Verified this directly: seeded a test at `UINT32_MAX - 100` and watched the "fixed" gate close
+again immediately. Corrected by skipping the addition entirely once already at the cap (`if
+(g_total_written < DECLARED_FILE_SIZE) { g_total_written = min(...) }`) — verified the gate
+never closes again after that correction, and separately verified the natural growth-from-zero
+path still caps at exactly the right value.
+
+**Propagated the fix to all three crosscheck simulations** (they'd each copy-pasted the old,
+uncapped `disk_append`) and discovered the fix has a real second-order effect on those tests
+specifically: their corruption-verification logic used `total_written` both as the real
+firmware's backpressure-gate value AND as their own ground-truth reference for checking
+whether read content is legitimate — once capped, it can't serve double duty as a
+monotonically-increasing test reference anymore. Added a separate, test-only, uncapped
+`g_ground_truth_written` counter (updated under the same lock, so still race-free) purely for
+verification purposes, keeping the real firmware-mirroring logic exactly matching the actual
+(now-fixed) `.ino`. Reran all three simulations after this — `realtime_concurrency_sim.cpp`
+(60s and 120s, up to 4.01 real-time laps) and `reader_stall_sim.cpp` (100s/65s stall,
+identical 200-retry-exhausted + 1-forced-write result as before) — all still show zero
+corruption. `ring_crosscheck.cpp` vs `fat12_disk.py` now shows one legitimate, documented
+divergence (`total_written`: 479232 capped in C++ vs 1992704 uncapped in Python) with every
+other tracked value still matching exactly.

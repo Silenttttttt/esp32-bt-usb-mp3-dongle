@@ -199,6 +199,25 @@ static void build_root_dir() {
   entry[31] = (DECLARED_FILE_SIZE >> 24) & 0xFF;
 }
 
+// REAL BUG FOUND via reasoning through long-session arithmetic, not
+// caught by the byte-for-byte Python cross-check (Python ints are
+// arbitrary-precision, so fat12_disk.py's total_written has no analogous
+// issue): letting g_total_written grow unbounded for the whole session
+// would overflow this uint32_t after 2^32/16000 =~ 74.6 HOURS of
+// continuous operation. Once it wraps back to a small value, the
+// unread_protect gate below (`g_total_written >= DECLARED_FILE_SIZE`)
+// would go false again for the ~30s it takes to re-cross that threshold
+// -- silently disabling write-side backpressure right at that mark, on
+// a session long enough that someone could plausibly hit it (multi-day
+// continuous power, not a single drive, but real). Fix: g_total_written
+// only ever needs to answer "has the ring filled at least once" (a
+// boolean-like fact) plus feed disk_valid_bytes()'s already-capped
+// return value -- so cap it AT DECLARED_FILE_SIZE and never grow it
+// further, eliminating the overflow risk entirely regardless of session
+// length. Safe: the >= comparison stays true forever once the cap is
+// reached, and disk_valid_bytes() already caps at DECLARED_FILE_SIZE
+// too, so nothing downstream needed the exact unbounded count.
+//
 // Mirrors fat12_disk.py's append(unread_protect=...). Called only from
 // the UART-receive task -- safe to block briefly on the mutex here.
 static bool disk_append(const uint8_t *data, uint32_t n, bool unread_protect) {
@@ -207,7 +226,7 @@ static bool disk_append(const uint8_t *data, uint32_t n, bool unread_protect) {
     xSemaphoreTake(g_ring_mutex, portMAX_DELAY);
     memcpy(g_ring, data + (n - DECLARED_FILE_SIZE), DECLARED_FILE_SIZE);
     g_write_pos = 0;
-    g_total_written += n;
+    g_total_written = DECLARED_FILE_SIZE;
     xSemaphoreGive(g_ring_mutex);
     return true;
   }
@@ -235,14 +254,21 @@ static bool disk_append(const uint8_t *data, uint32_t n, bool unread_protect) {
     memcpy(g_ring, data + first_part, end - DECLARED_FILE_SIZE);
   }
   g_write_pos = end % DECLARED_FILE_SIZE;
-  g_total_written += n;
+  // Must not even attempt the += once already at the cap -- caught this
+  // directly (2026-09-17): g_total_written + n can ITSELF overflow if
+  // g_total_written is already huge, producing a small wrapped value
+  // before min() ever sees it, silently defeating the whole point of
+  // capping. Only grow while still below the cap; once capped, leave it
+  // exactly there forever.
+  if (g_total_written < DECLARED_FILE_SIZE) {
+    g_total_written = min(g_total_written + n, DECLARED_FILE_SIZE);
+  }
   xSemaphoreGive(g_ring_mutex);
   return true;
 }
 
 static inline uint32_t disk_valid_bytes() {
-  uint32_t tw = g_total_written;
-  return (tw < DECLARED_FILE_SIZE) ? tw : DECLARED_FILE_SIZE;
+  return g_total_written;  // already capped at DECLARED_FILE_SIZE by disk_append()
 }
 
 // Concurrency design note (real-hardware-only concern, doesn't exist in

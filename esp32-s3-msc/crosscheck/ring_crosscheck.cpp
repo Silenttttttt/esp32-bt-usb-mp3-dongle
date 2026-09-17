@@ -23,7 +23,7 @@ static bool disk_append(const uint8_t *data, uint32_t n, bool unread_protect) {
     if (unread_protect) return false;
     memcpy(g_ring, data + (n - DECLARED_FILE_SIZE), DECLARED_FILE_SIZE);
     g_write_pos = 0;
-    g_total_written += n;
+    g_total_written = DECLARED_FILE_SIZE;
     return true;
   }
   uint32_t wp = g_write_pos;
@@ -46,7 +46,19 @@ static bool disk_append(const uint8_t *data, uint32_t n, bool unread_protect) {
     memcpy(g_ring, data + first_part, end - DECLARED_FILE_SIZE);
   }
   g_write_pos = end % DECLARED_FILE_SIZE;
-  g_total_written += n;
+  // Overflow fix (2026-09-17, real bug caught by reasoning + a direct
+  // test, see esp32-s3-msc.ino's own comment on disk_append): must not
+  // even attempt the += once already capped, since that addition can
+  // itself overflow a uint32_t on a session long enough to matter.
+  // Python's total_written is arbitrary-precision and has no analogous
+  // issue, so this is an intentional, necessary divergence from the
+  // Python reference -- the final total_written value WILL differ from
+  // fat12_disk.py's (capped here, uncapped there); every other tracked
+  // value (write_pos, last_read_offset, straddle/rejection counts) is
+  // unaffected and still expected to match exactly.
+  if (g_total_written < DECLARED_FILE_SIZE) {
+    g_total_written = min(g_total_written + n, DECLARED_FILE_SIZE);
+  }
   return true;
 }
 

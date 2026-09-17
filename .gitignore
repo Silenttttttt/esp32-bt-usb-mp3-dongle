@@ -5,3 +5,8 @@ __pycache__/
 *.elf
 .DS_Store
 progress/run_resilient*.log*
+esp32-s3-msc/crosscheck/fat12_crosscheck
+esp32-s3-msc/crosscheck/ring_crosscheck
+esp32-s3-msc/crosscheck/link_crosscheck
+esp32-s3-msc/crosscheck/realtime_concurrency_sim
+esp32-s3-msc/crosscheck/reader_stall_sim

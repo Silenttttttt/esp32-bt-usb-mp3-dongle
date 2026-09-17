@@ -34,10 +34,19 @@ python3 ring_crosscheck.py
 Both run the identical scripted sequence (fill past 2 ring laps, then
 2000 interleaved read/write steps with periodic forced-straddle reads)
 and print final `write_pos`/`total_written`/`last_read_offset` plus
-`straddle_hits`/`protected_rejections` counts. Every value must match
-exactly. Confirmed identical 2026-09-17: `writes_done=3892 reads_done=2000
-straddle_hits=40 protected_rejections=0 final write_pos=75776
-total_written=1992704 last_read_offset=315392` on both sides.
+`straddle_hits`/`protected_rejections` counts.
+
+**Note (2026-09-17): `total_written` is expected to differ, intentionally.** A real bug was
+found and fixed in the firmware (see `esp32-s3-msc.ino`'s own comment on `disk_append`):
+letting `total_written` grow unbounded for an entire session would overflow its `uint32_t`
+after ~74.6 hours of continuous operation, silently disabling write-side backpressure for ~30s
+right at that mark. Fixed by capping it at `DECLARED_FILE_SIZE` and never growing it further —
+Python's `total_written` is arbitrary-precision and has no analogous issue, so it's correctly
+NOT capped there. Every other tracked value must still match exactly. Confirmed 2026-09-17:
+`writes_done=3892 reads_done=2000 straddle_hits=40 protected_rejections=0 final
+write_pos=75776 last_read_offset=315392` identical on both sides; `total_written` legitimately
+differs (479232 capped in C++, 1992704 uncapped in Python) — that specific divergence is
+correct, not a bug.
 
 ## UART framing / resync logic
 
