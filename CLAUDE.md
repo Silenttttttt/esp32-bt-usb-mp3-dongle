@@ -232,6 +232,14 @@ Real bugs found and fixed on the real ESP32 firmware + PC-side prototype so far:
     cap as a backstop. No regression on the FAT12 primary (re-verified). See
     `progress/STATUS.md` 2026-09-17's "FAT16 fallback brought up to the same real-tested rigor"
     entry.
+14. Rigorously measured the real-audio startup delay instead of estimating it: added epoch-
+    timestamped T1/T2 instrumentation to `sim/s3_real_firmware_host.cpp` (checked directly
+    against actual served byte ranges, no production behavior changed — verified by diff, the
+    real `disk_read_at()` call and the bytes sent to the client are untouched) and a new
+    `sim/audio_level_monitor.py` measuring T3 from real output audio amplitude. Result: ring
+    catch-up lag is the dominant factor (~12.3s and ~9.3s in two real runs, ~72% of the total),
+    and the old ~9.5-10.6s decoder-buffering estimate was stale — measured at 4.2s instead. See
+    `progress/STATUS.md` 2026-09-17's "Rigorous, instrumented measurement" and follow-up entries.
 
 **Known still-open items**: the reconnect-crash rate (item 5) — believed solved (0/52 in
 testing) as of 2026-09-17 night, but 52 cycles isn't infinite and this was tested via the
