@@ -95,12 +95,26 @@ static const char FILE_NAME[12] = "STREAM  MP3";  // 8.3, space-padded (11 bytes
 // regression from any one pipeline. Halving ring duration halves this
 // worst-case bound. See fat12_disk.py's own docstring for why this is
 // sized as "acceptable worst-case catch-up lag", not "how long is the
-// drive" -- 50 clusters * 4096 bytes/cluster = 204800 bytes (~12.8s at
-// 16000 B/s), comfortably inside the accepted "10-15s" range rather than
-// right at its edge.
-static const uint32_t DATA_CLUSTERS = 50;
+// drive".
+//
+// DOUBLED from 50 to 100 clusters (2026-09-18, first live test against
+// real hardware + real car_sim.py): READ_MARGIN_BYTES (below) is a fixed
+// absolute size, so at 50 clusters it was ~4% of the ring -- confirmed
+// live via the real passthrough's own read counter, 8/249 reads (~3.2%)
+// came back straddle-protected zero-fill, each one enough to desync a
+// strict low-buffer MP3 decoder (car_sim.py's ffmpeg config) for a
+// while, producing persistent "Header missing" errors even after two
+// separate, confirmed, unrelated bugs were found and fixed (a ring-wrap
+// frame-splitting bug, and an ID3-tagged silence primer). Doubling the
+// ring halves the margin's fraction of it (~4% -> ~2%) without touching
+// the margin itself, directly cutting straddle frequency, at the real,
+// accepted cost of roughly doubling the worst-case stale-replay window
+// if the source pauses (~12.8s -> ~25.6s) -- a bounded, known tradeoff,
+// not a new risk. 100 clusters * 4096 bytes/cluster = 409600 bytes
+// (~25.6s at 16000 B/s).
+static const uint32_t DATA_CLUSTERS = 100;
 static const uint32_t CLUSTER_SIZE = SECTORS_PER_CLUSTER * SECTOR_SIZE;
-static const uint32_t DECLARED_FILE_SIZE = DATA_CLUSTERS * CLUSTER_SIZE;  // 479232
+static const uint32_t DECLARED_FILE_SIZE = DATA_CLUSTERS * CLUSTER_SIZE;  // 409600
 
 static const uint32_t FAT_ENTRIES_NEEDED = DATA_CLUSTERS + 2;
 static const uint32_t FAT_BYTES = (FAT_ENTRIES_NEEDED * 3 + 1) / 2;
@@ -127,6 +141,38 @@ static uint8_t *g_ring = nullptr;
 static volatile uint32_t g_write_pos = 0;
 static volatile uint32_t g_total_written = 0;
 static volatile uint32_t g_last_read_offset = 0;
+
+// TEMP DIAGNOSTIC (2026-09-18): investigating a real bug where content at a
+// fixed ring position stays byte-identical across multiple full laps even
+// though g_write_pos itself is confirmed advancing normally and the
+// classic ESP32's own UART source data is confirmed 100% unique (zero
+// duplicate frames over 1500+ samples) -- meaning the freeze is somewhere
+// in THIS write->read path specifically (possibly PSRAM cross-core cache
+// coherency between link_task on core 1 and the USB read callback, or a
+// logic bug). These record a lightweight rolling hash of whatever's
+// actually written/read whenever the position falls inside a fixed
+// DIAG_TARGET_POS window, from the firmware's own perspective (avoids any
+// ambiguity from an external USB/OS-level read path). Read via the
+// existing loop() heartbeat print. Remove once root-caused.
+// FIXED (2026-09-18, same session): the original DIAG_TARGET_WINDOW=512
+// full-containment check could never fire on the write side -- real
+// disk_append() chunks are only ~416-420 bytes (Shine's own encoded chunk
+// size), always smaller than a 512-byte window, so "fully contains the
+// window" was mathematically impossible and g_diag_write_count stayed 0
+// for 90+ seconds across multiple full ring laps. Switched to tracking a
+// single fixed byte instead of a window -- trivially satisfiable by any
+// write/read that merely covers that one byte, which happens on every lap
+// regardless of chunk size.
+#define DIAG_TARGET_POS 100000
+static volatile uint8_t g_diag_write_byte = 0;
+static volatile uint32_t g_diag_write_count = 0;
+static volatile uint8_t g_diag_read_byte = 0;
+static volatile uint32_t g_diag_read_count = 0;
+static inline uint32_t diag_hash(const uint8_t *p, uint32_t n) {
+  uint32_t h = 2166136261u;
+  for (uint32_t i = 0; i < n; i++) { h ^= p[i]; h *= 16777619u; }
+  return h;
+}
 
 // Guards g_ring/g_write_pos/g_total_written between the writer (UART
 // receive) and the reader (USB read callback on real hardware; the TCP
@@ -227,27 +273,49 @@ static bool disk_append(const uint8_t *data, uint32_t n, bool unread_protect) {
   FATDISK_MUTEX_TAKE_BLOCKING(g_ring_mutex);
   uint32_t wp = g_write_pos;
   uint32_t end = wp + n;
+
+  // REAL BUG FOUND (2026-09-18, first live test against real hardware,
+  // real car_sim.py, real S3): a normal wrap here used to byte-split a
+  // chunk's data across the ring's physical end/start boundary with zero
+  // awareness of where MP3 frame boundaries fall inside it. Each disk_append()
+  // call's payload is already a whole number of complete Shine-encoded MP3
+  // frames (esp32-bt-mp3-test.ino's send_framed('A', ...) never sends a
+  // partial frame), so a byte-level split always corrupts whichever frame
+  // straddles that exact boundary -- and since the wrap boundary IS byte 0,
+  // and car_sim.py (matching a real dumb head unit) always starts reading
+  // from byte 0 on every single pass, that ONE corrupted frame lands
+  // exactly where every playback attempt begins. Confirmed: persistent
+  // "Header missing" decoder errors on literally every read from byte 0,
+  // not an intermittent timing issue (a real retry-based fix was tried and
+  // reverted -- it didn't change the error rate at all, which is what
+  // pointed here instead). Fixed by never splitting a chunk across the
+  // wrap: if this append would cross the boundary, skip straight to
+  // position 0 and write the WHOLE chunk there as one unbroken unit,
+  // leaving whatever's between the old write_pos and DECLARED_FILE_SIZE
+  // untouched (a real, complete, still-valid frame from one lap earlier)
+  // instead of a byte-split, invalid one. Safe on the writer side (unlike
+  // the read path) since this thread is allowed to do real work.
+  if (end > DECLARED_FILE_SIZE) {
+    wp = 0;
+    end = n;
+  }
+
+  // TEMP DIAGNOSTIC -- see g_diag_* above. If this write touches the
+  // target window, hash what's about to be memcpy'd there.
+  if (wp <= DIAG_TARGET_POS && DIAG_TARGET_POS < end) {
+    g_diag_write_byte = data[DIAG_TARGET_POS - wp];
+    g_diag_write_count++;
+  }
+
   if (unread_protect && g_total_written >= DECLARED_FILE_SIZE) {
-    uint32_t wrapped_end = (end > DECLARED_FILE_SIZE) ? (end - DECLARED_FILE_SIZE) : end;
-    bool unsafe;
-    if (end <= DECLARED_FILE_SIZE) {
-      unsafe = (wp <= g_last_read_offset && g_last_read_offset < end);
-    } else {
-      unsafe = (g_last_read_offset >= wp || g_last_read_offset < wrapped_end);
-    }
+    bool unsafe = (wp <= g_last_read_offset && g_last_read_offset < end);
     if (unsafe) {
       FATDISK_MUTEX_GIVE(g_ring_mutex);
       return false;
     }
   }
-  if (end <= DECLARED_FILE_SIZE) {
-    memcpy(g_ring + wp, data, n);
-  } else {
-    uint32_t first_part = DECLARED_FILE_SIZE - wp;
-    memcpy(g_ring + wp, data, first_part);
-    memcpy(g_ring, data + first_part, end - DECLARED_FILE_SIZE);
-  }
-  g_write_pos = end % DECLARED_FILE_SIZE;
+  memcpy(g_ring + wp, data, n);
+  g_write_pos = end;
   if (g_total_written < DECLARED_FILE_SIZE) {
     g_total_written = min(g_total_written + n, DECLARED_FILE_SIZE);
   }
@@ -320,6 +388,12 @@ static void disk_read_at(uint32_t abs_pos, uint8_t *buffer, uint32_t len,
         if (data_off < avail) {
           uint32_t real_n = min(n, avail - data_off);
           memcpy(buffer + out_off, g_ring + data_off, real_n);
+          // TEMP DIAGNOSTIC -- see g_diag_* above. Records the byte actually
+          // copied out if this read covers the target position.
+          if (data_off <= DIAG_TARGET_POS && DIAG_TARGET_POS < data_off + real_n) {
+            g_diag_read_byte = g_ring[DIAG_TARGET_POS];
+            g_diag_read_count++;
+          }
         }
         g_last_read_offset = (data_off + n) % DECLARED_FILE_SIZE;
       } else {

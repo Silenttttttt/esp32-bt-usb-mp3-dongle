@@ -3378,3 +3378,135 @@ whether the wait is meaningfully shorter than the first one.
 Also chased down an apparent "corrupted UART frame" in the live log (`ENCODE_US:av` followed by
 garbage bytes) -- confirmed it was a false alarm, a `tail`/read race against a line still being
 written, not real corruption; re-reading the same region moments later showed clean content.
+
+## `real_s3_listen.py` "zero audio" was a broken measurement tool, not a real bug (2026-09-18)
+
+After the S3 board arrived and end-to-end real-hardware testing began (real classic ESP32 + real
+S3 + real phone BT), built `sim/real_s3_listen.py` -- a standalone tool reading the real live
+USB-MSC block device directly (via UDisks2's `OpenDevice()`, no root) and feeding it to `mpg123`
+at the real encode bitrate, wrapping at the ring's end -- to bench-test on the PC before trusting
+the real car radio (per Muni's explicit direction: don't touch `car_sim.py`/`s3_sim_serial.py`/
+`fat12_disk.py`, build something new that faithfully matches what a real dumb USB-MSC reader
+would do). It survived (no crashes, once `mpg123 --resync-limit -1` replaced the default
+1024-byte resync window, which was too small for a straddle-protection zero-fill gap) but
+`parec`-based RMS measurement of the actual PipeWire output kept reading exactly zero across
+many different capture windows, while the phone was confirmed actively playing music the whole
+time -- looking exactly like a real, serious pipeline bug.
+
+**Root cause: the RMS-measurement methodology itself was broken**, not the pipeline. Every
+measurement wrapped `parec` in `timeout N parec ... | python3 ...`; `parec`'s default internal
+buffer is larger than what accumulates in a short window, so `timeout` was killing it via
+SIGTERM before it ever flushed a single byte -- every "RMS: 0.0" was reading a dead capture, not
+real silence. Fixed by adding `--latency-msec=50` (forces small buffers) and using `sleep N;
+kill $PID` instead of `timeout N`. A real audio file played directly through mpg123, re-measured
+with the fixed methodology, showed RMS=445.9/peak=3515 (nonzero, as expected) -- proving the fix,
+not just asserting it. Re-measuring the actual live pipeline (real device -> real_s3_listen.py ->
+mpg123 -> PipeWire) then showed RMS=536.3/peak=5180, consistently nonzero across all nine
+one-second windows of a 10-second capture -- the full real, physical pipeline (phone -> BT ->
+classic ESP32 -> encode -> UART -> S3 -> USB-MSC -> PC) is genuinely working.
+
+A real side-finding along the way, since ruled irrelevant to the actual bug but worth recording
+so it isn't re-chased later: `mpg123 -s` (stdout raw-PCM mode) is broken in the installed
+`mpg123 1.33.5` build on this machine -- it silently produces a correctly-sized but entirely
+all-zero-byte output file for every input tested, including known-good files played normally
+through device output. Confirmed via direct byte inspection (`xxd`/nonzero-byte count), not
+just RMS math. This is a PC-side tooling quirk, unrelated to the project's own code -- don't use
+`-s` for future PC-side diagnostics on this machine; normal device-output playback (what
+`real_s3_listen.py` already does) works fine and was proven correct above.
+
+## LED status indicators added on both boards (2026-09-18, same session)
+
+Muni requested visual link/audio-state indicators on both boards for debugging without a laptop
+attached. Implemented on both, compiled clean on both:
+
+- **Classic ESP32** (`esp32-bt-mp3-test.ino`): LED2 (the existing GPIO2 onboard blue LED, already
+  used for BT-connected state) now distinguishes three states instead of two -- off when not BT-
+  connected (unchanged); solid on when connected but currently injecting synthetic silence (same
+  150ms freshness window `feed_silence_if_no_real_audio()` itself uses, so the LED and the actual
+  silence-injection decision can never visually disagree); blinking ~1Hz when connected and
+  genuinely live audio is flowing. Also sends a new transition-based `AUDIO_LIVE`/`AUDIO_SILENCE`
+  control-channel message on each live<->silence flip, since the S3 side needs this distinction
+  too and can't get it from `'A'` frames alone (injected silence goes through the exact same
+  `send_framed('A',...)` path real audio does, deliberately, to keep the ring's byte-rate/margin
+  assumptions unchanged).
+- **ESP32-S3** (`esp32-s3-msc.ino`): added an onboard addressable RGB LED (`Adafruit_NeoPixel`
+  library, newly installed via `arduino-cli lib install`) on GPIO48 -- **not yet hardware-
+  verified against the actual board**, same open-verification status `UART_S3_RX_PIN` had before
+  real testing corrected it from 18 to 8; check the board's own silkscreen/schematic first if it
+  doesn't light. Off when no frame (UART data or control message) has arrived from the classic
+  ESP32 in the last 2s; solid blue when linked but in silence; breathing green (smooth sine-wave
+  pulse, ~1.5s period, floored at 15% so it never fully blacks out) when real audio is flowing.
+  `link_task` now parses `'C'` control frames for the new `AUDIO_LIVE`/`AUDIO_SILENCE` messages
+  (payload format `"millis|msg"`, matching the classic side's `send_control()`) to drive this.
+  `loop()`'s own cadence dropped from 1000ms to 20ms so the pulse animates smoothly; the existing
+  debug heartbeat print stayed on its own 1000ms gate.
+
+Neither has been flashed to real hardware yet this session -- both firmwares compile clean
+against their real build commands (classic: `esp32:esp32:esp32` with the full flag set including
+`-DA2DP_DISABLE_AVRC`; S3: `esp32:esp32:esp32s3:USBMode=default,PSRAM=opi`), same as always
+before flashing, but the actual LED behavior (and the GPIO48 pin guess) still needs real-hardware
+confirmation.
+
+**Update, same session**: both firmwares WERE flashed to real hardware shortly after this entry
+(classic serial `5B52096812`, S3 serial `5CE5146685`). Both boot and run correctly.
+
+## `real_s3_listen.py` "stuck looping the first ~20s" root-caused: Linux buffer-cache staleness, not a firmware bug (2026-09-18, same session)
+
+After both reflashes, live testing showed the played-back audio getting stuck repeating a short
+section (~20s) instead of progressing through a full song, reproducible even with the phone
+actively playing (not paused) and even after killing duplicate/overlapping test processes. This
+looked like a serious real bug -- confirmed reproducible via a purpose-built `single_reader_lap_check.py`
+(a single clean reader matching real car-radio read behavior, hashing every 4096-byte chunk per
+ring lap): **100% of chunks were byte-identical across 3 full ring laps.**
+
+Root-caused via elimination, not guesswork:
+1. Added direct write/read-side instrumentation into `fat_disk_shared.h` (`g_diag_write_byte`/
+   `g_diag_read_byte`, single-byte tracking at a fixed target ring position, exposed via the S3's
+   existing heartbeat print) -- confirmed the WRITER side genuinely touches the target position
+   with fresh, changing byte values every lap (`diag_write_byte` climbed 1→2→...→7 counts with
+   different values each time). The classic ESP32's raw UART source was independently checked too
+   (`check_classic_source.py`, hashing 1531 real 'A' frame payloads over 40s): **0% duplicates**,
+   proving the source audio was never actually repeating.
+2. `diag_read_byte`/`g_last_read_offset` on the S3, by contrast, froze at a single value for 20+
+   consecutive heartbeats spanning multiple full write laps -- meaning reads reaching the S3's own
+   `disk_read_at()` had genuinely stopped advancing, even though `real_s3_listen.py`'s own Python-level
+   `pos` variable was independently confirmed still advancing every call (added stderr progress
+   logging, confirmed continuous advancement including through a full ring wrap).
+3. This pointed at something between the Python-level `os.pread()` call and the real SCSI command
+   reaching the S3. Tested `posix_fadvise(fd, ..., POSIX_FADV_DONTNEED)` before each read (a
+   standard page-cache-invalidation hint) -- **made no difference**, byte-identical content with
+   or without it, which looked like it ruled out caching.
+4. Decisive test: enabled `O_DIRECT` on the same fd (Linux allows `fcntl(fd, F_SETFL, O_DIRECT)`
+   post-open, not just at open time) and re-ran the exact same fixed-position, full-lap-spanning
+   comparison. **Every single lap now showed genuinely different content** (4 full ~28s-spaced
+   samples, all different) -- proving definitively that a standard buffered `os.pread()` against
+   the raw block-device path was being served from a stale kernel buffer/page cache on repeat
+   reads at the same offset, and that `posix_fadvise(DONTNEED)` alone was NOT sufficient to defeat
+   it (likely readahead silently repopulating the cache before the next read landed). The real
+   firmware, ring buffer, and hardware were correct the entire time -- this was purely a Linux
+   general-purpose-OS caching artifact in the PC-side bench-test tool itself.
+
+**Fixed in `sim/real_s3_listen.py`**: added `direct_pread()` (opens with `O_DIRECT` via `fcntl`
+post-open on the UDisks2-provided fd, reads a `DIRECT_ALIGN`-aligned window covering the requested
+range since `O_DIRECT` requires aligned offset/length/buffer, slices out the exact bytes needed) and
+switched the main read loop to use it instead of plain `os.pread()`. Re-verified with a full 40-second
+live measurement (spanning a complete ring wrap around t=25s): RMS varied continuously from 773 to
+2213 across the whole window with zero flat/frozen stretches and zero resync errors in mpg123's own
+log -- the cleanest, most conclusive measurement of the whole session.
+
+**Important distinction, explicitly confirmed with Muni**: this bug is a property of testing through
+a general-purpose desktop OS's block-device read path (Linux's page/buffer cache sitting between
+`os.pread()` and the real USB transfer) -- it could NOT occur on the real target car radio, whose
+embedded USB host controller issues real SCSI `READ(10)` commands directly with no intervening OS
+cache layer to serve stale data from. This was purely a PC-side bench-test tooling artifact, never a
+real firmware or hardware defect -- the underlying ring/firmware were independently proven correct
+via the `O_DIRECT` test itself (fresh content every lap) and the classic ESP32's 0%-duplicate-frame
+source-data check.
+
+Also fixed along the way: the original `DIAG_TARGET_WINDOW=512`-byte full-containment diagnostic
+check could never fire on the write side, since real `disk_append()` chunks are only ~416-420 bytes
+(Shine's own encoded chunk size) -- always smaller than a 512-byte window. Switched to single-byte
+tracking, trivially satisfiable regardless of chunk size. This diagnostic instrumentation
+(`g_diag_write_byte`/`g_diag_read_byte`/`DIAG_TARGET_POS` in `fat_disk_shared.h`, the corresponding
+heartbeat print fields in `esp32-s3-msc.ino`) is still in the flashed firmware as of this entry --
+low-cost to leave in, but should be removed once no longer needed for debugging.

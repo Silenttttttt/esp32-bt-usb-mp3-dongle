@@ -96,10 +96,21 @@ void send_control(const char *msg, TickType_t wait_ticks = portMAX_DELAY) {
   send_framed('C', (const uint8_t *)withTime, n, wait_ticks);
 }
 
+// TEMP DEBUG -- checking whether the audio-tools library's write() calls
+// are frame-aligned at all (128kbps/44.1kHz MP3 frames are ~417-418
+// bytes). Remove once the real "Header missing" root cause is confirmed.
+volatile uint32_t g_write_sizes[8] = {0};
+volatile uint32_t g_write_count = 0;
+volatile bool g_saw_ff_start = true;
+volatile uint32_t g_non_ff_start_count = 0;
+
 class SerialPrintSink : public Print {
  public:
   size_t write(uint8_t b) override { return write(&b, 1); }
   size_t write(const uint8_t *data, size_t len) override {
+    if (len > 0 && data[0] != 0xFF) g_non_ff_start_count++;
+    g_write_sizes[g_write_count % 8] = len;
+    g_write_count++;
     send_framed('A', data, len);
     return len;
   }
@@ -185,9 +196,21 @@ volatile uint32_t encode_us_count = 0;
 // live" apart from "frozen/stale" without needing any new signal from the
 // phone.
 volatile uint32_t last_real_audio_ms = 0;
+// TEMP DEBUG -- counts real audio_data_callback invocations, to directly
+// confirm whether the phone is actually delivering PCM at all right now.
+// Remove once real audio is confirmed reaching the encoder.
+volatile uint32_t g_audio_cb_count = 0;
+
+// Link-level BT connection state, set from connection_state_changed()
+// below -- used by loop()'s LED-status block so LED2 can distinguish
+// "not connected" (off) from the two connected sub-states (blinking vs
+// solid), instead of connection_state_changed() just writing the pin
+// directly and loop() never knowing the current state.
+volatile bool g_bt_connected = false;
 
 void audio_data_callback(const uint8_t *data, uint32_t length) {
   last_real_audio_ms = millis();
+  g_audio_cb_count++;
 #ifdef HEAP_TRACE
   if (length > max_chunk_seen) {
     max_chunk_seen = length;
@@ -353,7 +376,14 @@ void encode_task(void *) {
 // BT_DISCONNECTED log line is a strictly acceptable tradeoff against
 // crashing the whole board on every few reconnects.
 void connection_state_changed(esp_a2d_connection_state_t state, void *) {
-  digitalWrite(2, state == ESP_A2D_CONNECTION_STATE_CONNECTED ? HIGH : LOW);
+  // LED2 itself is now driven continuously from loop() (see its LED-status
+  // block) so it can distinguish live-audio blinking from silence-solid
+  // while connected -- this callback only updates the flag loop() reads,
+  // except on disconnect, where it forces the pin off immediately rather
+  // than waiting for loop()'s next pass (which would in practice be within
+  // ~1ms anyway, but zero-risk to just do it here too).
+  g_bt_connected = (state == ESP_A2D_CONNECTION_STATE_CONNECTED);
+  if (!g_bt_connected) digitalWrite(2, LOW);
   send_control(state == ESP_A2D_CONNECTION_STATE_CONNECTED ? "BT_CONNECTED" : "BT_DISCONNECTED",
                pdMS_TO_TICKS(20));
 }
@@ -638,6 +668,67 @@ void loop() {
                (unsigned long)avg_us, (unsigned long)max_us, (unsigned long)count,
                xPortGetCoreID());
       send_control(buf);
+    }
+  }
+
+  // TEMP DEBUG -- see g_audio_cb_count above. Remove once real audio is
+  // confirmed reaching audio_data_callback.
+  static uint32_t last_audio_status_ms = 0;
+  if (now_ms - last_audio_status_ms >= 1000) {
+    last_audio_status_ms = now_ms;
+    char buf[64];
+    snprintf(buf, sizeof(buf), "AUDIO_CB_STATUS:count=%lu,ms_since_last=%lu",
+             (unsigned long)g_audio_cb_count,
+             (unsigned long)(now_ms - last_real_audio_ms));
+    send_control(buf);
+    char buf2[100];
+    snprintf(buf2, sizeof(buf2),
+             "WRITE_SIZES:last8=%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,non_ff_start=%lu/%lu",
+             (unsigned long)g_write_sizes[0], (unsigned long)g_write_sizes[1],
+             (unsigned long)g_write_sizes[2], (unsigned long)g_write_sizes[3],
+             (unsigned long)g_write_sizes[4], (unsigned long)g_write_sizes[5],
+             (unsigned long)g_write_sizes[6], (unsigned long)g_write_sizes[7],
+             (unsigned long)g_non_ff_start_count, (unsigned long)g_write_count);
+    send_control(buf2);
+  }
+
+  // LED2 (classic ESP32 DevKit's onboard blue LED) status, requested by
+  // Muni for at-a-glance debugging without a laptop attached: off when not
+  // BT-connected; solid on when connected but currently injecting synthetic
+  // silence (same 150ms freshness window feed_silence_if_no_real_audio()
+  // itself uses, so the LED and the actual silence-injection decision can
+  // never visually disagree); blinking ~1Hz when connected and genuinely
+  // live audio is flowing. Only writes the pin on an actual state change or
+  // blink toggle, not every loop() pass.
+  //
+  // Also sends an AUDIO_LIVE/AUDIO_SILENCE control message on each
+  // live<->silence transition, for the S3's own RGB status LED. The S3
+  // can't tell live audio from injected silence purely from 'A' frames --
+  // feed_silence_if_no_real_audio() pushes silence through the exact same
+  // encode->send_framed('A',...) path real audio uses (deliberately, so
+  // the ring's byte rate/margin assumptions never change -- see that
+  // function's own header comment), so this is the only signal that
+  // actually carries the distinction across the wire. Transition-based
+  // (not periodic) to match this file's existing low-traffic convention.
+  {
+    static uint32_t last_led_toggle_ms = 0;
+    static bool led_on = false;
+    static bool prev_audio_live = false;
+    bool audio_live = (now_ms - last_real_audio_ms < 150);
+    if (g_bt_connected && audio_live != prev_audio_live) {
+      send_control(audio_live ? "AUDIO_LIVE" : "AUDIO_SILENCE");
+      prev_audio_live = audio_live;
+    }
+    if (!g_bt_connected) {
+      if (led_on) { digitalWrite(2, LOW); led_on = false; }
+    } else if (audio_live) {
+      if (now_ms - last_led_toggle_ms >= 500) {  // ~1Hz blink (500ms on/off)
+        last_led_toggle_ms = now_ms;
+        led_on = !led_on;
+        digitalWrite(2, led_on ? HIGH : LOW);
+      }
+    } else {
+      if (!led_on) { digitalWrite(2, HIGH); led_on = true; }
     }
   }
 

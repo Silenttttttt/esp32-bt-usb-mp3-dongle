@@ -54,12 +54,22 @@
 #include "esp_heap_caps.h"
 #include "silence_primer.h"
 #include "fat_disk_shared.h"
+#include <Adafruit_NeoPixel.h>
 
 // UART pins to the classic ESP32's TX (its Serial/UART0 TX pin, wired
 // directly -- see CLAUDE.md's real end-state architecture diagram).
-// *** NOT YET HARDWARE-VERIFIED *** -- placeholder pin, pick a real
-// UART-capable GPIO once the board's actual wiring is decided; these are
-// just commonly-free pins on typical ESP32-S3-WROOM-1 DevKitC-1 boards.
+//
+// HARDWARE-VERIFIED 2026-09-18: GPIO8 confirmed receiving real, continuous
+// electrical activity (~17-18K edges/sec, matching real 921600-baud
+// traffic) via a raw interrupt-based edge-counter test, bypassing the UART
+// peripheral entirely. GPIO18 was tried first and showed zero activity --
+// root cause turned out to be a physical wiring mix-up, not a bad pin:
+// this board's silkscreen-labeled "RX" pin near the programming/COM port
+// is the board's OWN UART0 programming pin (wired to the onboard USB-
+// serial bridge chip), not a general-purpose GPIO -- wiring into it
+// doesn't reach GPIO18 (or GPIO8) at all, and can also corrupt the
+// flashing handshake if something else is actively driving it at the same
+// time. Use the header pin literally labeled "8"/"GPIO8"/"IO8", not "RX".
 //
 // Real target board confirmed 2026-09-17 (Muni sent the actual purchase
 // listing): ESP32-S3-WROOM-1 N16R8 DevKitC-1 -- 16MB Quad flash + 8MB
@@ -68,13 +78,24 @@
 // has it -- confirms PSRAM=opi below is the right build flag, not a
 // guess) additionally dedicates GPIO 33-37 (Espressif's own
 // ESP32-S3-WROOM-1 datasheet: "not recommended for other uses" on
-// octal-PSRAM variants). GPIO 17/18 below are well outside that reserved
-// 26-37 range, so no conflict -- but if this pin choice changes once the
-// real wiring is decided, stay outside 26-37 on this specific module.
-#define UART_S3_RX_PIN 18
+// octal-PSRAM variants). GPIO 8 below is well outside that reserved
+// 26-37 range, so no conflict.
+#define UART_S3_RX_PIN 8
 #define UART_S3_TX_PIN 17  // unused (classic ESP32 -> S3 is one-way), kept for symmetry
 #define UART_BAUD 921600
 HardwareSerial LinkSerial(1);  // UART1
+
+// Onboard addressable RGB LED, requested by Muni for at-a-glance link/audio
+// status without a laptop attached. GPIO48 is the standard onboard-WS2812
+// pin on the official Espressif ESP32-S3-DevKitC-1 (both v1 and v1.1
+// silkscreens) -- **not yet hardware-verified against the actual board in
+// hand**, same open-verification status UART_S3_RX_PIN had before real
+// testing corrected it from 18 to 8. If the LED doesn't light, check this
+// pin against the board's own silkscreen/schematic before assuming
+// anything else is wrong.
+#define RGB_LED_PIN 48
+#define RGB_LED_COUNT 1
+Adafruit_NeoPixel status_led(RGB_LED_COUNT, RGB_LED_PIN, NEO_GRB + NEO_KHZ800);
 
 // FAT12 ring-buffer disk logic (constants, build_boot_sector/build_fat/
 // build_root_dir, disk_append, disk_valid_bytes, disk_read_at) now lives
@@ -117,6 +138,24 @@ static bool msc_on_start_stop(uint8_t power_condition, bool start, bool load_eje
 // can block on UART reads without affecting USB responsiveness.
 // WRITE_RETRY_DELAY_MS/MAX_WRITE_RETRIES come from fat_disk_shared.h.
 
+// TEMP DEBUG COUNTERS -- added to diagnose whether any bytes are arriving
+// over the wire at all during initial bring-up. Remove once real audio is
+// confirmed flowing end-to-end.
+volatile uint32_t g_link_bytes_read = 0;
+volatile uint32_t g_link_frames_ok = 0;
+volatile uint32_t g_link_frames_bad = 0;
+
+// RGB status LED state, updated from link_task below. g_link_last_frame_ms
+// (ANY frame, 'A' or 'C') is "are we hearing from the classic ESP32 at
+// all" -- loop() treats a long gap here as not-connected. g_s3_audio_live
+// tracks the AUDIO_LIVE/AUDIO_SILENCE control messages the classic now
+// sends on each transition (see esp32-bt-mp3-test.ino's loop(), the block
+// right after LED2's own status logic) -- 'A' frames alone can't carry
+// this distinction, since injected silence goes through the exact same
+// encode->send_framed('A',...) path real audio uses.
+volatile uint32_t g_link_last_frame_ms = 0;
+volatile bool g_s3_audio_live = false;
+
 static bool read_exact(uint8_t *buf, uint32_t n) {
   uint32_t got = 0;
   while (got < n) {
@@ -126,7 +165,7 @@ static bool read_exact(uint8_t *buf, uint32_t n) {
       continue;
     }
     int r = LinkSerial.read(buf + got, min((uint32_t)avail, n - got));
-    if (r > 0) got += r;
+    if (r > 0) { got += r; g_link_bytes_read += r; }
   }
   return true;
 }
@@ -152,9 +191,11 @@ static void link_task(void *) {
                        ((uint32_t)header[3] << 8) | (uint32_t)header[4];
 
     if ((frame_type != 'A' && frame_type != 'C') || length > MAX_FRAME_LEN) {
+      g_link_frames_bad++;
       continue;  // bad header -- rescan from find_sync(), same as the Python side
     }
     if (length) read_exact(payload, length);
+    g_link_last_frame_ms = millis();
 
     if (frame_type == 'A') {
       bool ok = false;
@@ -163,11 +204,24 @@ static void link_task(void *) {
         delay(WRITE_RETRY_DELAY_MS);
       }
       if (!ok) disk_append(payload, length, false);  // force through, same fallback as s3_sim_serial.py
+    } else {
+      // 'C' (control/diagnostic messages from the classic ESP32). Most of
+      // these (BT_CONNECTED/ENCODE_US/etc.) existed purely for the PC-side
+      // simulator's own logging and are still ignored here -- except
+      // AUDIO_LIVE/AUDIO_SILENCE, which now drive the RGB status LED (see
+      // g_s3_audio_live above). Payload format is "millis|msg" (see
+      // send_control() on the classic side); only the part after '|'
+      // matters here.
+      char *sep = (char *)memchr(payload, '|', length);
+      const uint8_t *msg = sep ? (const uint8_t *)sep + 1 : payload;
+      uint32_t msg_len = sep ? (length - ((uint8_t *)sep + 1 - payload)) : length;
+      if (msg_len == 10 && memcmp(msg, "AUDIO_LIVE", 10) == 0) {
+        g_s3_audio_live = true;
+      } else if (msg_len == 13 && memcmp(msg, "AUDIO_SILENCE", 13) == 0) {
+        g_s3_audio_live = false;
+      }
     }
-    // 'C' (control/diagnostic messages from the classic ESP32, e.g.
-    // BT_CONNECTED/ENCODE_US/etc.) -- nothing on this side needs to act
-    // on them; they existed purely for the PC-side simulator's own
-    // logging. Silently discarded here.
+    g_link_frames_ok++;
   }
 }
 
@@ -188,6 +242,11 @@ void setup() {
   Serial.begin(115200);  // USB CDC debug console (separate from the UART link)
   delay(200);
   Serial.println("[s3] booting");
+
+  status_led.begin();
+  status_led.setBrightness(80);  // full 255 is uncomfortably bright for a status LED at close range
+  status_led.setPixelColor(0, 0, 0, 0);
+  status_led.show();
 
   build_boot_sector();
   build_fat();
@@ -250,7 +309,50 @@ void setup() {
 }
 
 void loop() {
-  delay(1000);  // all real work happens in link_task + USBMSC callbacks
+  // All real disk/USB work happens in link_task + USBMSC callbacks; loop()
+  // only drives the RGB status LED and the debug heartbeat now. Runs every
+  // 20ms (was 1000ms) so the audio-live pulse actually looks smooth instead
+  // of stepping once a second.
+  uint32_t now_ms = millis();
+
+  // RGB status LED (see status_led/RGB_LED_PIN above). Off when no frame
+  // (from either the UART link or a control message) has arrived from the
+  // classic ESP32 in the last 2s -- covers "not wired up" and "classic
+  // reset/UART link dropped", not just BT state. Solid blue when linked
+  // but currently in silence (paused/no real audio -- mirrors LED2's own
+  // solid-on meaning on the classic side). Breathing green when real
+  // audio is actually flowing.
+  {
+    bool s3_connected = (g_link_last_frame_ms != 0) && (now_ms - g_link_last_frame_ms < 2000);
+    if (!s3_connected) {
+      status_led.setPixelColor(0, 0, 0, 0);
+    } else if (g_s3_audio_live) {
+      // ~1.5s breathing period, floor at 15% so it never fully blacks out.
+      float phase = fmodf((float)now_ms, 1500.0f) / 1500.0f;
+      float pulse = 0.15f + 0.85f * (0.5f + 0.5f * sinf(phase * 2.0f * (float)M_PI));
+      status_led.setPixelColor(0, 0, (uint8_t)(255 * pulse), 0);  // green
+    } else {
+      status_led.setPixelColor(0, 0, 0, 255);  // solid blue
+    }
+    status_led.show();
+  }
+
+  // TEMP DEBUG heartbeat -- see g_link_* counters above. Remove once real
+  // audio is confirmed flowing end-to-end. Still gated to 1s even though
+  // loop() itself now runs every 20ms.
+  static uint32_t last_heartbeat_ms = 0;
+  if (now_ms - last_heartbeat_ms >= 1000) {
+    last_heartbeat_ms = now_ms;
+    Serial.printf("[s3] link heartbeat: bytes_read=%lu frames_ok=%lu frames_bad=%lu "
+                  "write_pos=%lu total_written=%lu last_read_offset=%lu "
+                  "diag_write_byte=%02x(n=%lu) diag_read_byte=%02x(n=%lu)\n",
+                  (unsigned long)g_link_bytes_read, (unsigned long)g_link_frames_ok,
+                  (unsigned long)g_link_frames_bad, (unsigned long)g_write_pos,
+                  (unsigned long)g_total_written, (unsigned long)g_last_read_offset,
+                  (unsigned)g_diag_write_byte, (unsigned long)g_diag_write_count,
+                  (unsigned)g_diag_read_byte, (unsigned long)g_diag_read_count);
+  }
+  delay(20);
 }
 
 #endif  // ARDUINO_USB_MODE
