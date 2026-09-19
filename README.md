@@ -1,4 +1,4 @@
-# usb-stick-mp3-via-esp32-a2dp
+# esp32-bt-usb-mp3-dongle
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
@@ -7,6 +7,12 @@ USB-stick MP3 playback — no Bluetooth input, no AUX. The radio is never modifi
 opened up; instead it's tricked into thinking a real USB flash drive holding one huge
 MP3 file is plugged in, and the bytes of that "file" are generated live, on demand,
 from whatever's currently playing over Bluetooth.
+
+This is exactly the project [requested in `arduino-audio-tools` discussion
+#566](https://github.com/pschatzmann/arduino-audio-tools/discussions/566) back in 2023 —
+"Bluetooth AD2P + Mp3 Encoder + USB Mass Storage Class" — as a fix for commercial BT-to-USB-MP3
+dongles that have "BIG delays and sometimes the sound is skipped." Same idea, built and
+confirmed working end-to-end on real hardware.
 
 ## ✅ Status: working end-to-end on real hardware, confirmed on the actual car radio
 
