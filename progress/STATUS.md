@@ -3558,3 +3558,53 @@ hasn't arrived yet." Added a proper `LICENSE` (MIT, Muni's explicit choice when 
 
 Verified no dangling references to any removed/moved file across `.md`/`.ino`/`.h`/`.py`/`.sh`
 files before committing. Committed and pushed (`1854d87`).
+
+## Single-cable power design tried on real hardware, root-caused as genuinely non-viable (2026-09-19)
+
+Muni physically wired the originally-planned single-cable power design (S3's 5V pin feeding the
+classic ESP32's VIN pin, plus the required shared ground) to test it for real. Result: plugging
+in the classic's own USB powers both boards cleanly; plugging in the S3's own USB powers the S3
+but leaves the classic in a weak/brownout state (glows on reset, doesn't stay running) —
+reproducible, and unaffected by using a "known strong charger and wall plug," which ruled out
+available current as the cause (a stronger supply upstream can't fix a fixed voltage drop
+downstream).
+
+Root-caused against the **real, official Espressif schematic**
+(`SCH_ESP32-S3-DevKitC-1_V1.1_20221130.pdf`, fetched and read directly), not guessed: the S3's
+"5V" header pin sits on the same net (`VCC_5V`) that BOTH of the board's USB ports feed into,
+each through its own Schottky diode (D1 for one USB port, D7 for the native OTG port used all
+project) — a standard diode-OR arrangement so neither USB port can backfeed the other. This
+means power flowing OUT through the 5V pin, while the S3 is running off its own USB, has already
+dropped by the diode's forward voltage (Schottky, but still real, more under load) before it
+even leaves the board — on top of wire/connector drop getting to the classic. Power flowing the
+OTHER way (classic's own regulator into the S3's 5V pin) never passes through either diode at
+all, landing directly on `VCC_5V` — exactly why that direction works cleanly and the other
+doesn't. Confirmed this is a genuine physical voltage-drop problem, not a wiring defect: a bad/
+loose connection would be symmetric (same resistance either direction), but this asymmetry is
+directional, matching the diode explanation precisely, not a connection fault.
+
+Real solutions exist (an independent third 5V source Y-split directly to both boards' power
+pins in parallel, bypassing the S3's own diode entirely; or physically bridging D7 on the S3
+board, at the cost of losing its USB-port backfeed protection — a real, documented community
+workaround for similar boards) but neither was pursued. **Decision: stick with the two separate
+power sources setup, already proven working on the real Kenwood KDC-MP8090U test** — simpler,
+zero soldering, no tradeoffs. Also confirmed along the way that a plain "5V" pin isn't a digital
+0-or-5V signal — it's a real analog voltage that sags under load exactly like any other power
+rail (same reason a car battery reads lower while cranking the starter), so a diode's voltage
+drop is a completely ordinary, expected physical effect, not a contradiction.
+
+Updated `ARCHITECTURE.md`: the single-cable design's diagram/prose now documents this as a
+tried-and-root-caused dead end (with the schematic citation) rather than "untested" — removed
+the now-resolved "measure current draw" open item, since the real blocker turned out to be
+voltage, not current.
+
+Also planned (not yet built): a new return channel, S3 GPIO17 (TX, already reserved in the
+firmware, previously unused) → classic ESP32 GPIO4 (RX, newly chosen — GPIO16 was the first
+pick but isn't broken out on Muni's specific classic board, so GPIO4 was picked instead as a pin
+present on virtually every classic ESP32 DevKit variant), so the S3 can send commands back to
+the classic. Deliberately NOT wired into the classic's default UART0/GPIO3 (the same pin used
+for USB flashing/serial monitor) specifically to avoid bus contention with the PC's USB-serial
+chip during flashing — same reasoning that led the S3 side to use a second `HardwareSerial`
+instance instead of its own default debug serial. Firmware for the actual command
+receive/handling logic is intentionally deferred until Muni is ready to start that specific
+piece of work.

@@ -20,14 +20,12 @@ graph LR
     S3["ESP32-S3<br/>(esp32-s3-msc.ino)<br/>USB-MSC device +<br/>FAT12 ring-buffer disk<br/>+ RGB LED status (GPIO48)"]
     Radio["🚗 Car Radio<br/>Kenwood KDC-MP8090U<br/>real hardware, never modified<br/>USB-stick MP3 playback only"]
     PowerA["🔌 12V accessory outlet<br/>USB charger<br/>(CONFIRMED — used in the<br/>successful real-radio test)"]
-    PowerC["🔌 S3's own 5V pin<br/>(untested alternative)"]
     PowerB["🔌 Radio's own USB port<br/>(bus power)"]
 
     Phone -- "Bluetooth A2DP<br/>(real audio)" --> Classic
     Classic -- "wired UART<br/>TX0 (GPIO1) → GPIO8<br/>+ shared ground wire" --> S3
     S3 -- "USB-OTG<br/>(presents as a USB flash drive)" --> Radio
     PowerA -. "5V/GND" .-> Classic
-    PowerC -. "5V/GND (untested)" .-> Classic
     PowerB -. "5V/GND (bus power)" .-> S3
 ```
 
@@ -54,10 +52,22 @@ current (inrush at power-up, specifically) for two active ESP32 boards at once. 
 separate supplies, the radio's own port only ever has to power one board.
 
 An alternative, single-cable design (S3 draws bus power from the radio, classic ESP32
-taps its 5V/GND straight off the S3's own pins) was the original plan and remains
-possible, but was not what was used in the confirmed-working test and has not been
-current-draw-tested on a real meter. If that shared-supply design is ever used instead,
-measure real current draw before trusting it.
+taps its 5V/GND straight off the S3's own pins) was the original plan — **tried on real
+hardware and confirmed NOT viable, root-caused against the official Espressif schematic,
+not just abandoned as untested.** The S3's "5V" header pin sits downstream of a Schottky
+diode (D7 in the official ESP32-S3-DevKitC-1 schematic, SCH_ESP32-S3-DevKitC-1_V1.1)
+between it and the S3's own native USB port — a normal, deliberate part of the board's
+design (it OR-gates the board's two USB ports so neither backfeeds the other), but it
+means voltage pushed OUT through that pin, while the S3 is powered via its own USB, has
+already dropped below 5V before it even leaves the board. Live-tested: classic → S3
+power (through the same pin, opposite direction) works cleanly, since that path never
+passes through the diode at all; S3 → classic consistently produced a weak/brownout
+classic boot (glows on reset, doesn't stay running) regardless of how strong the
+upstream charger was — expected, since the bottleneck is a fixed voltage drop, not
+available current. A real fix exists (an independent third 5V source Y-split to both
+boards' power pins in parallel, bypassing the S3's onboard diode entirely; or physically
+bridging D7, at the cost of losing its port-isolation protection) but wasn't pursued —
+two separate power sources, already proven working, was preferred instead.
 
 ## PC-based bench-test tooling
 
@@ -120,9 +130,6 @@ real end-to-end pipeline.
 
 ## What's still genuinely open
 
-- **Real current-draw measurement for the alternative shared-power design** — not needed
-  for the setup actually confirmed working (two separate power sources), but relevant if
-  the original single-cable, shared-supply design is ever used instead.
 - **The wrap-point audio splice** is mitigated (a much larger ring makes it rare) but not
   structurally eliminated.
 - Everything else that used to be listed here as "unverified" — real TinyUSB timing under
