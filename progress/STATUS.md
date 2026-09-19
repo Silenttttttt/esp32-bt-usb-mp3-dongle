@@ -3510,3 +3510,15 @@ tracking, trivially satisfiable regardless of chunk size. This diagnostic instru
 (`g_diag_write_byte`/`g_diag_read_byte`/`DIAG_TARGET_POS` in `fat_disk_shared.h`, the corresponding
 heartbeat print fields in `esp32-s3-msc.ino`) is still in the flashed firmware as of this entry --
 low-cost to leave in, but should be removed once no longer needed for debugging.
+
+Committed and pushed to `origin/main` (`6a1d425`) after the fix was live-verified with a clean
+40-second measurement. Muni confirmed the real end-to-end fix live: "only like 10 second delay,
+which is amazing, it's working really well" -- consistent with this session's measured ~10-12s
+ring catch-up lag figures.
+
+**LED status indicators confirmed working on real hardware** (same session, after the O_DIRECT
+fix and commit): Muni confirmed both LEDs are functioning as designed -- the classic ESP32's
+GPIO2 LED2 (not-connected/connected-silent/connected-live-audio) and, notably, the S3's new RGB
+LED on GPIO48 -- which was an explicitly unverified pin guess at flash time (same
+open-verification status `UART_S3_RX_PIN` had before real testing corrected it from 18 to 8) --
+turned out to be correct on the first try. No further pin correction needed.
