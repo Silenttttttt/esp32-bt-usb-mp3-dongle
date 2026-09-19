@@ -3522,3 +3522,74 @@ GPIO2 LED2 (not-connected/connected-silent/connected-live-audio) and, notably, t
 LED on GPIO48 -- which was an explicitly unverified pin guess at flash time (same
 open-verification status `UART_S3_RX_PIN` had before real testing corrected it from 18 to 8) --
 turned out to be correct on the first try. No further pin correction needed.
+
+**The real target car radio's exact model, confirmed 2026-09-18 (same session): Kenwood
+KDC-MP8090U.** Now documented in README.md and ARCHITECTURE.md wherever "the real target car
+radio" is mentioned, in place of the previous generic phrasing.
+
+## Ring buffer raised to ~4 minutes after the first successful real car radio test (2026-09-18)
+
+First real test on the actual physical Kenwood KDC-MP8090U: confirmed working end-to-end (real
+phone, real Bluetooth, real classic ESP32, real UART, real S3, real USB-MSC into the real radio),
+clean continuous audio, roughly a 10-second delay from power-up to hearing sound -- Muni called it
+"amazing." One real, reported issue: an audible stutter every ~25.6s, exactly matching the ring's
+wrap period. Root cause: inherent to any fixed-size looping ring, not a bug -- the byte just before
+the wrap and the byte just after it aren't temporally adjacent in the source audio (they're roughly
+one full ring-duration apart), so a real sequential reader always audibly splices two unrelated
+moments together there. Muni's requested fix: make the ring 3-5 minutes so the wrap is rare enough
+to not matter in practice.
+
+Implemented: `DATA_CLUSTERS` raised 100 -> 938 in `fat_disk_shared.h` (~25.6s -> ~240.1s / ~4.0min),
+comfortably inside FAT12's 4084-cluster ceiling and the S3's 8MB PSRAM budget (confirmed live --
+S3 booted clean post-flash with no PSRAM-allocation FATAL error, ring came up and started
+advancing normally). Also updated `sim/real_s3_listen.py`'s matching `DECLARED_FILE_SIZE` constant
+so the PC bench tool's own wrap point stays aligned with the real ring -- a stale constant there
+would silently reproduce the exact kind of misalignment bug chased earlier this same session.
+
+**Real, explicitly-flagged tradeoff, not a free fix**: this doesn't eliminate the wrap splice, it
+makes it ~9.4x rarer. It also scales up the SAME category of delay this project previously
+shrunk the ring specifically to fix (worst-case cold-boot catch-up lag and stale-replay-on-pause
+window, both now up to ~4 minutes instead of ~25.6s worst case) -- a real, known, accepted
+tradeoff given Muni's own explicit preference (fewer stutters during normal listening, over a
+worse worst-case delay in the rarer cold-start/pause-recovery case).
+
+Confirmed clean compile on the S3's real build command before flashing. Committed and pushed
+(`845f776`).
+
+## Full repo cleanup and doc rewrite for the real-hardware milestone (2026-09-18, same session)
+
+With the project now genuinely working end-to-end on real hardware (confirmed on the actual
+Kenwood KDC-MP8090U), did a full pass to clean up the repo and bring the top-level docs up to
+date -- both `README.md` and `ARCHITECTURE.md` were written entirely from before the physical S3
+board existed and had become badly stale, undersell-ing what's actually true now.
+
+**Removed** (all objectively dead, fully superseded once real hardware existed and worked):
+- `sim/s3_sim.py`, `sim/esp32_sim.py`, `sim/s3_sim_wifi.py` -- synthetic BOTH-SIDES
+  simulation prototypes from before the real classic ESP32 even existed. `s3_sim_wifi.py`
+  specifically simulated the abandoned WiFi transport attempt.
+- `esp32-serial-test/`, `esp32-bt-mp3-test/bisect1_shine/`, `esp32-bt-mp3-test/minimal_a2dp_test/`
+  -- dead-end bisection/debug scaffolding from the classic ESP32's earlier Bluetooth-reconnect
+  crash-debugging phase (see item 5's history above).
+- `sim/silence_primer.mp3` -- the original, buggy, ID3-tagged source primer, now fully superseded
+  by `silence_primer_clean.mp3` (both firmware variants' `silence_primer.h` are generated from
+  the clean one now).
+- A tracked compiled binary (`msc_test_client`) -- untracked and gitignored; its `.c` source is
+  kept, moved into `firmware/`.
+
+**Real bug found and fixed while cleaning up**: `esp32-s3-msc-fat16-fallback/silence_primer.h`
+was STILL generated from the old, buggy, ID3-tagged source -- it never received the same fix the
+primary firmware's `silence_primer.h` got fixed earlier this session. Regenerated from the same
+clean source (`silence_primer_clean.mp3`), same generation method, recompiled clean on the FAT16
+fallback's real build command.
+
+**Reorganized**: the historical "Stage 1" (Digispark/ATtiny) loose root files (`gen_fat_image.py`,
+`msc_test_client.c`) moved into `firmware/`, alongside the rest of that same historical phase's
+files (`main.c`, `disk_image.h`, `Makefile`) -- previously scattered between the repo root and
+`firmware/` for no real reason.
+
+**Docs rewritten from scratch**: `README.md` and `ARCHITECTURE.md` now both open with the real,
+current status (working end-to-end, confirmed on the real target radio) instead of "S3 board
+hasn't arrived yet." Added a proper `LICENSE` (MIT, Muni's explicit choice when asked).
+
+Verified no dangling references to any removed/moved file across `.md`/`.ino`/`.h`/`.py`/`.sh`
+files before committing. Committed and pushed (`1854d87`).

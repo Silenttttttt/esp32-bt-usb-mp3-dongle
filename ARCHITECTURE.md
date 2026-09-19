@@ -129,8 +129,8 @@ a correspondingly worse lag bound — it exists purely as insurance against a
 real, researched compatibility risk (some cheap embedded USB-MSC host stacks
 only fully support FAT16/32), not because it's otherwise preferable. That
 risk did not materialize: FAT12 has been confirmed working on the real target
-car radio, both as a standalone thumb-drive test and via the full real
-end-to-end pipeline.
+car radio (a Kenwood KDC-MP8090U), both as a standalone thumb-drive test and
+via the full real end-to-end pipeline.
 
 ## What's still genuinely open
 

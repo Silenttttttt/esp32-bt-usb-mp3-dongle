@@ -11,10 +11,10 @@ from whatever's currently playing over Bluetooth.
 ## ✅ Status: working end-to-end on real hardware, confirmed on the actual car radio
 
 Real phone → real Bluetooth → real classic ESP32 (A2DP sink + live MP3 encode) → real
-wired UART → real ESP32-S3 (USB-MSC device) → **the actual target car radio** — plugged
-in and played correctly, with clean, continuous audio and roughly a 10-second delay from
-power-up to hearing sound. See `progress/STATUS.md` for the full build history, every bug
-found along the way, and how each one was root-caused.
+wired UART → real ESP32-S3 (USB-MSC device) → **the actual target car radio** (a Kenwood
+KDC-MP8090U) — plugged in and played correctly, with clean, continuous audio and roughly
+a 10-second delay from power-up to hearing sound. See `progress/STATUS.md` for the full
+build history, every bug found along the way, and how each one was root-caused.
 
 **See `ARCHITECTURE.md`** for full diagrams of the real hardware design and the PC-based
 bench-test tooling used to validate everything before every real-radio test.
