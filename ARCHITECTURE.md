@@ -19,13 +19,15 @@ graph LR
     Classic["Classic ESP32<br/>(esp32-bt-mp3-test.ino)<br/>BT A2DP sink +<br/>real-time Shine MP3 encoder<br/>+ LED status (GPIO2)"]
     S3["ESP32-S3<br/>(esp32-s3-msc.ino)<br/>USB-MSC device +<br/>FAT12 ring-buffer disk<br/>+ RGB LED status (GPIO48)"]
     Radio["🚗 Car Radio<br/>Kenwood KDC-MP8090U<br/>real hardware, never modified<br/>USB-stick MP3 playback only"]
-    PowerA["🔌 12V accessory outlet<br/>USB charger"]
+    PowerA["🔌 12V accessory outlet<br/>USB charger<br/>(CONFIRMED — used in the<br/>successful real-radio test)"]
+    PowerC["🔌 S3's own 5V pin<br/>(untested alternative)"]
     PowerB["🔌 Radio's own USB port<br/>(bus power)"]
 
     Phone -- "Bluetooth A2DP<br/>(real audio)" --> Classic
     Classic -- "wired UART<br/>TX0 (GPIO1) → GPIO8<br/>+ shared ground wire" --> S3
     S3 -- "USB-OTG<br/>(presents as a USB flash drive)" --> Radio
     PowerA -. "5V/GND" .-> Classic
+    PowerC -. "5V/GND (untested)" .-> Classic
     PowerB -. "5V/GND (bus power)" .-> S3
 ```
 
