@@ -81,9 +81,28 @@
 // octal-PSRAM variants). GPIO 8 below is well outside that reserved
 // 26-37 range, so no conflict.
 #define UART_S3_RX_PIN 8
-#define UART_S3_TX_PIN 17  // unused (classic ESP32 -> S3 is one-way), kept for symmetry
+#define UART_S3_TX_PIN 4  // moved off GPIO17 (2026-09-19) as part of a real hardware A/B test with a new short, direct cable -- see progress/STATUS.md
 #define UART_BAUD 921600
 HardwareSerial LinkSerial(1);  // UART1
+
+// REAL ROOT CAUSE, finally confirmed (2026-09-19, first live test of the
+// return channel): a heartbeat sent via LinkSerial's own TX pin never
+// arrived intact on the classic side. Several wrong theories were chased
+// first (RF/EMI noise from the classic's own Bluetooth radio, adjacent-
+// module-pin crosstalk on the S3, wire routing) before the real cause
+// surfaced: the physical wire was connected to the S3 board's own
+// silkscreen-labeled "TX" pin -- the native USB/programming-console UART,
+// not a general-purpose GPIO at all -- so the classic was receiving the
+// S3's own continuous debug-log output (`[s3] link heartbeat...` etc. at
+// 115200 baud) at a mismatched baud rate, which looks exactly like noise.
+// The SAME class of mistake as this project's earlier UART_S3_RX_PIN
+// mixup (silkscreen "RX" was also not a usable GPIO). Fixed by moving to
+// a genuine GPIO (4) with nothing else on it. Confirmed clean, 100%
+// reliable reception once wired correctly -- kept at a modest 9600 baud
+// (plenty for this low-bandwidth status channel) rather than reverting to
+// full speed, no real need to.
+#define RETURN_TX_BAUD 9600
+HardwareSerial ReturnTxSerial(2);  // UART2, dedicated, independent baud from LinkSerial
 
 // Onboard addressable RGB LED, requested by Muni for at-a-glance link/audio
 // status without a laptop attached. GPIO48 is the standard onboard-WS2812
@@ -272,7 +291,11 @@ void setup() {
   // MAX_FRAME_LEN frames) against link_task briefly falling behind
   // during a disk_append() retry stall.
   LinkSerial.setRxBufferSize(8192);
-  LinkSerial.begin(UART_BAUD, SERIAL_8N1, UART_S3_RX_PIN, UART_S3_TX_PIN);
+  // TX=-1: GPIO17 no longer belongs to this UART instance -- see
+  // ReturnTxSerial above for why (moved to its own dedicated, slower,
+  // noise-resilient UART instance instead).
+  LinkSerial.begin(UART_BAUD, SERIAL_8N1, UART_S3_RX_PIN, -1);
+  ReturnTxSerial.begin(RETURN_TX_BAUD, SERIAL_8N1, -1, UART_S3_TX_PIN);
 
   // REAL BUG FOUND (fresh adversarial review, 2026-09-17): link_task used
   // to be created AFTER MSC.begin()/USB.begin() below -- a real boot-time
@@ -352,6 +375,22 @@ void loop() {
                   (unsigned)g_diag_write_byte, (unsigned long)g_diag_write_count,
                   (unsigned)g_diag_read_byte, (unsigned long)g_diag_read_count);
   }
+
+  // Return channel: GPIO4 (physical wire to classic ESP32's GPIO19) --
+  // see ReturnTxSerial's own comment above for the full story of how the
+  // original wiring mistake (S3's silkscreen "TX" pin, not a real GPIO)
+  // was root-caused. Confirmed clean, 100% reliable, one send per
+  // interval is all that's needed. Plain line-based text, matching what
+  // the classic side expects on this channel.
+  static uint32_t last_return_hb_ms = 0;
+  static uint32_t s3_hb_counter = 0;
+  if (now_ms - last_return_hb_ms >= 2000) {
+    last_return_hb_ms = now_ms;
+    size_t sent = ReturnTxSerial.printf("S3_HB:%lu,write_pos=%lu\n",
+                       (unsigned long)(s3_hb_counter++), (unsigned long)g_write_pos);
+    Serial.printf("[s3] DIAG return-send attempted, bytes_sent=%u\n", (unsigned)sent);
+  }
+
   delay(20);
 }
 

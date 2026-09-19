@@ -26,6 +26,120 @@
 
 BluetoothA2DPSink a2dp_sink;
 
+// Forward declaration: defined further down, needed here since
+// poll_return_serial()/handle_pc_command() (below) call it before that
+// point in the file. The compiler's own auto-prototype generation doesn't
+// reliably handle this function's default argument, so this is explicit
+// rather than relied-upon.
+void send_control(const char *msg, TickType_t wait_ticks = portMAX_DELAY);
+
+// New return channel: the S3's GPIO4 (TX, see esp32-s3-msc.ino's
+// UART_S3_TX_PIN) now carries messages back to the classic ESP32,
+// received here on a SEPARATE physical pin/UART peripheral (UART2) from
+// the existing forward link (UART0/TX0/GPIO1 -> S3's GPIO8). Deliberately
+// not the classic's own RX0 (GPIO3): that pin is the USB-serial bridge's
+// own RX, needed free for flashing/PC console input, and using it here
+// would contend with that. Plain line-based text, not the 0xAA-framed
+// binary protocol (that framing exists to keep audio bytes and control
+// text unambiguous on ONE shared wire; this is a distinct wire with
+// nothing else on it, so no framing is needed).
+//
+// Root-cause history worth keeping: the FIRST wiring attempt used the
+// S3's board-silkscreen-labeled "TX" pin, which is the S3's own native
+// USB/programming-console UART, not a general-purpose GPIO at all -- so
+// the classic was receiving the S3's own continuous debug-log output
+// (`[s3] link heartbeat...` at 115200 baud) at a mismatched baud rate,
+// which looked exactly like random noise (a raw GPIO edge-counter showed
+// high activity on both the "connected" pin and a deliberately
+// unconnected control pin, which -- combined with not yet suspecting the
+// wiring itself -- pointed toward a false "classic's own BT radio causes
+// RF noise" theory before the real cause was found). The SAME class of
+// mistake as this project's earlier UART_S3_RX_PIN mixup (silkscreen
+// "RX" also wasn't a usable GPIO). Fixed by wiring to a genuine GPIO (4
+// on the S3) instead. Confirmed clean, 100% reliable reception once
+// correctly wired -- kept at a modest 9600 baud (see ReturnSerial.begin()
+// below), plenty for this low-bandwidth status channel.
+#define RETURN_RX_PIN 19
+HardwareSerial ReturnSerial(2);
+
+// Forwards whatever the S3 sends back onto the existing 'C' control
+// channel (so it's visible via the same s3_sim_serial.py-style logging
+// already used for BT_CONNECTED/AUDIO_CB_STATUS/etc.), prefixed so it's
+// unambiguous which board originated it.
+void poll_return_serial() {
+  static char buf[128];
+  static uint8_t len = 0;
+  while (ReturnSerial.available()) {
+    char c = (char)ReturnSerial.read();
+    if (c == '\n' || c == '\r') {
+      if (len > 0) {
+        buf[len] = 0;
+        char out[160];
+        snprintf(out, sizeof(out), "S3_RX:%s", buf);
+        send_control(out);
+        len = 0;
+      }
+    } else if (len < sizeof(buf) - 1) {
+      buf[len++] = c;
+    }
+  }
+}
+
+#ifdef AVRC_INVESTIGATION
+// TEMP, investigation-only (2026-09-19): a PC-typed command interface for
+// testing what a2dp_sink can send BACK to the phone (next/prev/play/pause/
+// volume), answering Muni's "what kind of commands can it send back"
+// question. Reads from Serial's RX (RX0/GPIO3) -- genuinely free to use
+// for this, since RX0 only ever carries bytes from the PC's own USB-serial
+// bridge; it was never wired to the S3 (only TX0 goes there) and is
+// otherwise completely idle in this firmware. Deliberately NOT triggered
+// automatically/on a timer: firing next()/pause() unprompted during a real
+// listening session would audibly interrupt real music, which defeats the
+// point of testing -- one command per explicit PC keystroke instead.
+void handle_pc_command(const char *cmd) {
+  if (strcmp(cmd, "next") == 0) {
+    a2dp_sink.next();
+    send_control("CMD_SENT:next");
+  } else if (strcmp(cmd, "prev") == 0) {
+    a2dp_sink.previous();
+    send_control("CMD_SENT:prev");
+  } else if (strcmp(cmd, "play") == 0) {
+    a2dp_sink.play();
+    send_control("CMD_SENT:play");
+  } else if (strcmp(cmd, "pause") == 0) {
+    a2dp_sink.pause();
+    send_control("CMD_SENT:pause");
+  } else if (strncmp(cmd, "vol:", 4) == 0) {
+    int v = atoi(cmd + 4);
+    a2dp_sink.set_volume((uint8_t)v);
+    char out[32];
+    snprintf(out, sizeof(out), "CMD_SENT:vol=%d", v);
+    send_control(out);
+  } else {
+    char out[64];
+    snprintf(out, sizeof(out), "CMD_UNKNOWN:%s", cmd);
+    send_control(out);
+  }
+}
+
+void poll_pc_commands() {
+  static char buf[32];
+  static uint8_t len = 0;
+  while (Serial.available()) {
+    char c = (char)Serial.read();
+    if (c == '\n' || c == '\r') {
+      if (len > 0) {
+        buf[len] = 0;
+        handle_pc_command(buf);
+        len = 0;
+      }
+    } else if (len < sizeof(buf) - 1) {
+      buf[len++] = c;
+    }
+  }
+}
+#endif  // AVRC_INVESTIGATION
+
 // audio_data_callback (Bluedroid's own task) and the AVRCP callbacks
 // (a separate Bluedroid task) both call send_framed()/send_control() on
 // the same Serial link. Without this, an AVRCP callback can interleave a
@@ -89,7 +203,7 @@ bool send_framed(char type, const uint8_t *data, size_t len,
 // into its own local fixed-size char buffer via snprintf (stack, not
 // heap), and send_control() takes const char* -- zero heap churn per
 // control message, no matter how long the session runs.
-void send_control(const char *msg, TickType_t wait_ticks = portMAX_DELAY) {
+void send_control(const char *msg, TickType_t wait_ticks) {
   char withTime[200];
   int n = snprintf(withTime, sizeof(withTime), "%lu|%s", millis(), msg);
   if (n > (int)sizeof(withTime) - 1) n = sizeof(withTime) - 1;
@@ -438,6 +552,16 @@ void avrc_metadata_callback(uint8_t id, const uint8_t *text) {
     case ESP_AVRC_MD_ATTR_TITLE:  label = "TITLE:"; break;
     case ESP_AVRC_MD_ATTR_ARTIST: label = "ARTIST:"; break;
     case ESP_AVRC_MD_ATTR_ALBUM:  label = "ALBUM:"; break;
+    // TEMP, investigation-only (2026-09-19): included specifically to
+    // answer Muni's "what info can the phone send, e.g. music name or
+    // size" question. Requesting ALBUM/PLAYING_TIME on top of TITLE/ARTIST
+    // increases combined AVRCP metadata response size, which the
+    // reconnect-crash investigation above (item 5's history) already
+    // found correlates with real packet_fragmenter.c crashes -- acceptable
+    // ONLY because this whole build already has AVRCP force-enabled for
+    // this same investigation (A2DP_DISABLE_AVRC omitted); never ship this
+    // wider mask in the default, crash-free build.
+    case ESP_AVRC_MD_ATTR_PLAYING_TIME: label = "DURATION_MS:"; break;
     default:
       snprintf(label_buf, sizeof(label_buf), "META%u:", id);
       label = label_buf;
@@ -450,6 +574,14 @@ void avrc_metadata_callback(uint8_t id, const uint8_t *text) {
 
 void setup() {
   pinMode(2, OUTPUT);
+  // RX only (TX=-1), 9600 baud -- deliberately slower than the forward
+  // link's 921600, though the real bug turned out to be wiring (see
+  // ReturnSerial's own comment above), not baud/noise. Kept at 9600 since
+  // it's confirmed reliable and this channel doesn't need more bandwidth.
+  // See esp32-s3-msc.ino's ReturnTxSerial for the matching sender-side
+  // instance (a dedicated UART on GPIO4, decoupled from LinkSerial's own
+  // busy 921600 baud).
+  ReturnSerial.begin(9600, SERIAL_8N1, RETURN_RX_PIN, -1);
   // ESP-IDF's native ESP_LOGx macros (used internally by ESP32-A2DP /
   // Bluedroid) have their own runtime log level, independent of Arduino's
   // "Core Debug Level" build setting, and default to printing on UART0 --
@@ -557,6 +689,18 @@ void setup() {
 #endif
 
 #ifndef DISABLE_AVRC_DIAG
+#ifdef AVRC_INVESTIGATION
+  // TEMP, investigation-only mask (2026-09-19): adds ALBUM + PLAYING_TIME
+  // back on top of the normal TITLE|ARTIST mask below, specifically to
+  // answer "what metadata can the phone actually send" for this one
+  // session. Real, accepted extra crash risk while this flag is set (see
+  // the ALBUM-dropped reasoning right below) -- only ever build this with
+  // AVRC_INVESTIGATION defined for a deliberate, time-boxed test, never as
+  // the default.
+  a2dp_sink.set_avrc_metadata_attribute_mask(
+      ESP_AVRC_MD_ATTR_TITLE | ESP_AVRC_MD_ATTR_ARTIST |
+      ESP_AVRC_MD_ATTR_ALBUM | ESP_AVRC_MD_ATTR_PLAYING_TIME);
+#else
   // ALBUM dropped deliberately: every packet_fragmenter.c crash tonight
   // correlated with large multi-attribute AVRCP metadata responses (real
   // titles observed 100+ chars), while a long metadata-free run (547s) and
@@ -566,6 +710,7 @@ void setup() {
   // TITLE/ARTIST, the two that actually matter here.
   a2dp_sink.set_avrc_metadata_attribute_mask(
       ESP_AVRC_MD_ATTR_TITLE | ESP_AVRC_MD_ATTR_ARTIST);
+#endif
   a2dp_sink.set_avrc_metadata_callback(avrc_metadata_callback);
   a2dp_sink.set_avrc_rn_playstatus_callback(avrc_playstatus_callback);
 #endif
@@ -633,6 +778,11 @@ void setup() {
 }
 
 void loop() {
+  poll_return_serial();
+#ifdef AVRC_INVESTIGATION
+  poll_pc_commands();
+#endif
+
   // Reported via the existing 'C' control channel -- s3_sim_serial.py
   // already logs these with a timestamp, so this needs no new wire
   // format or receiver-side change. Only sent when the count actually

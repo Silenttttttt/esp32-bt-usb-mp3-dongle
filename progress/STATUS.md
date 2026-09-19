@@ -3608,3 +3608,57 @@ chip during flashing — same reasoning that led the S3 side to use a second `Ha
 instance instead of its own default debug serial. Firmware for the actual command
 receive/handling logic is intentionally deferred until Muni is ready to start that specific
 piece of work.
+
+## S3→classic return channel: built, chased a real wrong theory for hours, actually just a wiring mistake (2026-09-19)
+
+Built the S3→classic return channel: a new `HardwareSerial` on the S3 (`ReturnTxSerial`, initially
+GPIO17) sending a periodic heartbeat (`S3_HB:<n>,write_pos=<n>`) to a new receiving
+`HardwareSerial` on the classic (`ReturnSerial`, initially GPIO4). First live test: **zero valid
+messages ever arrived**, despite the S3 confirming it was actually sending (`bytes_sent=25`
+logged every 2s on its own console).
+
+Spent a long diagnostic arc chasing this as a signal-integrity problem: a raw GPIO edge-counter
+(same technique that found the original `UART_S3_RX_PIN` mixup) showed heavy, noisy toggling on
+the classic's receive pin — far more than the sparse heartbeat traffic could explain. Ablation
+tests (disabling the UART peripheral's claim on the pin, adding an internal pulldown, moving to a
+different classic-side pin) all failed to meaningfully change the noise, and a genuinely
+**unconnected control pin** on the classic also showed similar noise — which was (wrongly)
+interpreted as proof the classic ESP32's own onboard Bluetooth radio was inducing real RF-coupled
+interference on any nearby floating GPIO, independent of wiring. Baud-rate mitigation attempts
+(921600 → 9600 → 1200, plus 5x message redundancy) produced small amounts of progress (occasional
+single garbled characters surviving at 9600, none at 1200 or 921600) but never a single clean
+message — which in hindsight was itself a strong clue the RF-noise theory was wrong (real random
+noise corrupting occasional bits wouldn't behave this way; a real, valid, high-speed signal at
+the *wrong sample rate* aliasing into occasional accidentally-valid characters would).
+
+**Muni correctly rejected this whole theory** ("not true at all, and irrelevant" / "the cable is
+fine, youre making up stuff") and pushed for a real test (a short, direct cable) instead of more
+theorizing. That, plus his own clarifying detail ("the s3 is on tx rn bro, not 17"), revealed the
+actual root cause: **the physical wire had been connected to the S3 board's own
+silkscreen-labeled "TX" pin, not GPIO17** — that pin is the S3's native USB/programming-console
+UART, which was continuously printing real debug output (`[s3] link heartbeat...` etc.) at 115200
+baud. The classic's receiver, configured for a completely different baud rate, was receiving that
+real, continuous, unrelated data stream and — being sampled at the wrong rate — it looked exactly
+like noise: constant toggling, occasional bytes that happened to decode by chance, and behavior
+that got *worse* at an even more mismatched baud (1200), never better. This is the exact same
+class of mistake as this project's earlier `UART_S3_RX_PIN` mixup (silkscreen "RX" also wasn't a
+real GPIO) — a lesson that apparently needed relearning.
+
+**Fixed**: rewired to genuine GPIOs on both sides (S3 TX moved to GPIO4, classic RX moved to
+GPIO19 per Muni's own pin choices during the fix), confirmed working **immediately and perfectly
+cleanly** — every single message decoding correctly, every 2-second interval, no drops, no
+corruption. Cleaned up all the now-wrong diagnostic scaffolding and comments (the RF-noise theory,
+the edge-counter code, the 5x redundancy workaround) and simplified back to a single send per
+interval at a modest 9600 baud (confirmed reliable, no need for anything fancier). Real lesson
+reinforced: when a signal-integrity investigation produces confusing, inconsistent results (works
+sometimes, gets worse when it should get better), seriously reconsider "is this actually wired to
+what I think it's wired to" before trusting increasingly elaborate electrical theories.
+
+**AVRCP investigation (metadata + commands) not yet done** — the classic is currently flashed
+with the `AVRC_INVESTIGATION` build (AVRCP enabled, `A2DP_DISABLE_AVRC` omitted, real crash-risk
+tradeoff accepted for this session only) and has the metadata-logging (`TITLE`/`ARTIST`/`ALBUM`/
+`DURATION_MS`) and PC-command-interface (`next`/`prev`/`play`/`pause`/`vol:N` typed at the
+classic's own USB serial console) code already built and compiled clean, but not yet actually
+tested against a real, connected phone. **Must revert to the default `A2DP_DISABLE_AVRC` build
+before considering this firmware done** — the investigation build carries a real, known
+Bluetooth-reconnect-crash risk that was specifically fixed earlier in this project.
