@@ -110,9 +110,35 @@ static const char FILE_NAME[12] = "STREAM  MP3";  // 8.3, space-padded (11 bytes
 // the margin itself, directly cutting straddle frequency, at the real,
 // accepted cost of roughly doubling the worst-case stale-replay window
 // if the source pauses (~12.8s -> ~25.6s) -- a bounded, known tradeoff,
-// not a new risk. 100 clusters * 4096 bytes/cluster = 409600 bytes
-// (~25.6s at 16000 B/s).
-static const uint32_t DATA_CLUSTERS = 100;
+// not a new risk.
+//
+// RAISED AGAIN from 100 to 938 clusters (2026-09-18, same session, after
+// the FIRST REAL CAR RADIO TEST): confirmed working end to end on the
+// actual physical radio, but with an audible stutter every ~25.6s at the
+// ring's wrap point. This is inherent to a fixed-size looping ring, not a
+// bug: the byte just before wrap (position DECLARED_FILE_SIZE-1) and the
+// byte just after it (position 0) are NOT temporally adjacent in the
+// original audio -- they're roughly one full ring-duration apart -- so a
+// real dumb sequential reader always audibly splices two unrelated
+// moments together there. Stretching the ring to ~4 minutes doesn't
+// eliminate that splice, it just makes it ~9.4x rarer (once per ~4min
+// instead of once per ~25.6s), which is the whole point: most real
+// listening sessions/songs are shorter than that, so the wrap is rarely
+// even reached. REAL, ACCEPTED TRADEOFF, same mechanism as the doubling
+// above but now much larger: worst-case stale-replay-on-pause and
+// worst-case cold-boot-catch-up-lag both scale with ring size too -- this
+// is the exact same category of delay that was previously found bad
+// enough to deliberately SHRINK the ring for (was ~30s, cut to ~12.8s,
+// see the 59-cluster history above) -- raising it back up to ~4 minutes
+// reintroduces a much larger version of that specific, previously-fixed
+// problem. Accepted here because a real user on real hardware explicitly
+// weighed "occasional ~25s stutter" against "much longer cold-start/
+// pause-recovery lag" and chose the latter as the better tradeoff for
+// this use case. 938 clusters * 4096 bytes/cluster = 3,842,048 bytes
+// (~240.1s, ~4.0min at 16000 B/s). Comfortably inside FAT12's 4084-total-
+// cluster ceiling (see the static_assert below) and well inside the
+// real S3 module's 8MB PSRAM budget.
+static const uint32_t DATA_CLUSTERS = 938;
 static const uint32_t CLUSTER_SIZE = SECTORS_PER_CLUSTER * SECTOR_SIZE;
 static const uint32_t DECLARED_FILE_SIZE = DATA_CLUSTERS * CLUSTER_SIZE;  // 409600
 

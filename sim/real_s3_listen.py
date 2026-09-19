@@ -33,7 +33,7 @@ DEVICE = sys.argv[1] if len(sys.argv) > 1 else "/dev/sda"
 
 SECTOR_SIZE = 512
 FIRST_DATA_LBA = 4          # matches fat_disk_shared.h's current layout
-DECLARED_FILE_SIZE = 409600  # matches the current 100-cluster ring
+DECLARED_FILE_SIZE = 3842048  # matches fat_disk_shared.h's current 938-cluster (~4min) ring
 BITRATE_BYTES_PER_SEC = 16000  # 128kbps
 READ_CHUNK = 4096  # one cluster
 
