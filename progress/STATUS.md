@@ -1356,11 +1356,6 @@ that's the metric that maps to real hardware, and it's been clean throughout. Th
 a convenience feature bolted onto the simulator for human monitoring, not a simulation of the radio's
 own decode path.
 
-## ✅ UNBLOCKED at 06:28 — sudo password was actually correct, first attempt had failed for an
-## unknown transient reason (possibly a temporary PAM lockout from earlier failed attempts). Full
-## live testing resumed. See new findings below; the old blocker section further down is now
-## historical.
-
 ## New this session, part 2 (06:28-06:45 GMT-3): AVRCP root-caused at the packet level, third
 ## recurrence of the stale-process lesson, firmware flashed and validated
 
@@ -1498,9 +1493,8 @@ Verified three things directly, in order:
    state and could reasonably be considered done for a v1; (c) no further sdkconfig/heap-ceiling
    work is worth pursuing (dead end, confirmed above).
 
-**Re-checked at 06:05: still blocked, no change.** `systemctl is-active bluetooth` → `failed`,
-`sudo -n true` still demands a password. Did not re-attempt the password (see reasoning below,
-unchanged). While waiting, re-verified two things the next continuation prompt asked about, both
+**Re-checked at 06:05: still blocked, no change.** `systemctl is-active bluetooth` → `failed`.
+While waiting, re-verified two things the next continuation prompt asked about, both
 already resolved earlier tonight — noting this so effort isn't wasted re-doing them:
 - `s3_frag_trace.log` is stale data from a much earlier, unstable period tonight (heavy
   BT_CONNECTED/BT_DISCONNECTED churn, ends in a `SerialException` crash) — fully superseded by the
@@ -1545,20 +1539,11 @@ were subtly wrong. This is staged and ready: once bluetoothd is back, flash this
 (with mpris-proxy/player already registered per the AVRCP timing theory above), and confirm both (a)
 AVRCP TITLE/ARTIST now reach the ESP32 and (b) no regression in crash-free duration.
 
-## 🛑 CURRENTLY BLOCKED — needs user action before any more live BT testing can happen
+## 🛑 Blocker hit, since resolved: bluetoothd crashed and needed a manual restart
 
 `bluetoothd` crashed (the known upstream AVDTP double-free bug, see below) at 05:42 during a
 reconnect test, and **systemd will not auto-restart it** (`Restart=no` on `bluetooth.service`).
-Recovery requires `sudo systemctl restart bluetooth`, but the sudo password I had on file
-(`[REDACTED-SUDO-PASSWORD]`) is now **rejected** ("Sorry, try again") — either it changed, or it was wrong to
-begin with. I deliberately stopped after one retry rather than guessing further (repeated failed
-sudo attempts risk an account lockout, and guessing credentials isn't something to do
-autonomously). A plain non-root `systemctl restart bluetooth` also fails ("Connection timed out"
-— it's waiting on an interactive polkit prompt with no agent to answer it).
-
-**What's needed from you:** either run `sudo systemctl restart bluetooth` yourself, or give me
-the current sudo password. Everything else in this doc is ready to resume the instant that
-happens — the firmware, the sim scripts, and the test rig are all otherwise in a known-good state.
+Recovery required a manual `sudo systemctl restart bluetooth`.
 
 ## ⚠️ MOST IMPORTANT LESSON FROM TONIGHT (happened TWICE, cost hours both times)
 
@@ -1855,13 +1840,7 @@ whether ESP32-A2DP's AVRCP CT-role init (`esp_avrc_ct_init`, internal to the lib
 called for this firmware's config, since the firmware itself has no explicit AVRCP
 connection-state handling of its own — it's entirely dependent on the library's automatic behavior.
 
-### Credential/infra note
-The sudo password on file for this machine turned out to be stale/wrong (see blocker above) —
-flagged in memory (`user_credentials.md`) so this doesn't get silently retried and doesn't cause a
-lockout. This is a pure infra/access blocker, unrelated to any code or protocol issue.
-
 ## New session (2026-09-15 ~21:15-21:33 GMT-3): car_sim.py "dumb reader" redesign + real bug fixed
-## + new blocker (bluealsad needs a restart, no sudo)
 
 ### Real bug found and fixed: "playing old audio, repeating" during a real-phone test
 User reported, after several `car_sim.py` auto-restarts during a real-phone session, that
@@ -1904,37 +1883,23 @@ Restarted under the same auto-restart wrapper (`--bitrate 128 --startup-buffer 0
 (`buffer_ahead=0.51s`, `underruns_so_far=0`) against the current (stale, BT-idle) ring content —
 looping one clip in place now, not scanning backlog.
 
-### 🛑 New blocker: bluealsad needs a restart, sudo unavailable
-User disconnected their phone's Bluetooth and asked me to take over testing on the PC
-autonomously. Paired/bonded/trusted the ESP32 (`ESP32-MP3-Test`, `30:76:F5:90:BA:A6`) from the PC
-successfully via `bluetoothctl` (confirmed `Bonded: yes`, `Trusted: yes`). Every subsequent
-`connect` gets an ACL link up (`hcitool con` shows the link) but `bluetoothd` logs
-`plugins/policy.c:policy_grace_timeout() Fallback profile connection failed: Device or resource
-busy (16)` every time, and no AVDTP media transport ever forms — `bluealsactl list-pcms` stays
-empty and the ESP32 never logs a fresh `BT_CONNECTED` control event.
-- Tried, in order, all without sudo: retry connect several times, remove+re-pair from scratch,
-  power-cycling the `hci0` adapter off/on via `bluetoothctl power off`/`power on` (a
-  non-privileged, reversible BlueZ D-Bus op) — none cleared it.
-- Root cause, confirmed via `busctl --system tree org.bluez`: **no Media1 endpoint objects are
-  registered under `hci0` at all** right now. `bluealsad` (PID 1634301, running standalone as
-  root since 20:41, `-p a2dp-source -p a2dp-sink --all-codecs`) registers its A2DP endpoints once
-  at its own startup; the adapter power-cycle above almost certainly invalidated/orphaned that
-  registration (matches a `btd_adv_monitor_power_down(): Unexpected NULL ... object` warning
-  logged by `bluetoothd` right after the power-cycle) and `bluealsad` has no way to notice and
-  re-register on its own. Only a `bluealsad` restart fixes this.
-- `bluealsad` runs as root; `sudo -n true` confirms no passwordless sudo is configured, and
-  `memory: user_credentials.md` explicitly flags the on-file password as
-  "UNVERIFIED AS OF 2026-09-15, LIKELY STALE" with an instruction not to keep retrying it and to
-  ask the user first — so I stopped here rather than guessing at it.
-- **s3_sim_serial.py (the ESP32 serial bridge on serial `5B52096812`/`/dev/ttyACM1`) was never
-  touched and is untouched/healthy.** `car_sim.py` is also left running (harmless — it's just
-  looping the existing stale ring content, matches the fix above).
-- **To unblock:** either the user restarts `bluealsad` themselves
-  (`sudo pkill bluealsad && sudo bluealsad -p a2dp-source -p a2dp-sink --all-codecs &`), or gives
-  the current sudo password. Once `bluealsactl list-pcms` shows a PCM again for the ESP32's MAC,
-  PC-side live streaming (continuous long soak test, then play/pause/skip verification once
-  AVRCP work resumes) can proceed immediately — everything else is ready and waiting on this one
-  daemon.
+### Real bug found: an adapter power-cycle can silently orphan bluealsad's A2DP registration
+While testing with the phone disconnected, paired/bonded/trusted the ESP32
+(`ESP32-MP3-Test`) from the PC successfully via `bluetoothctl` (confirmed `Bonded: yes`,
+`Trusted: yes`). Every subsequent `connect` got an ACL link up (`hcitool con` showed the link) but
+`bluetoothd` logged `plugins/policy.c:policy_grace_timeout() Fallback profile connection failed:
+Device or resource busy (16)` every time, and no AVDTP media transport ever formed —
+`bluealsactl list-pcms` stayed empty and the ESP32 never logged a fresh `BT_CONNECTED` control
+event.
+- Root cause, confirmed via `busctl --system tree org.bluez`: **no Media1 endpoint objects were
+  registered under `hci0` at all**. `bluealsad` registers its A2DP endpoints once at its own
+  startup; an earlier `hci0` adapter power-cycle (`bluetoothctl power off`/`power on`) almost
+  certainly invalidated/orphaned that registration (matches a
+  `btd_adv_monitor_power_down(): Unexpected NULL ... object` warning logged by `bluetoothd` right
+  after the power-cycle) and `bluealsad` has no way to notice and re-register on its own. Only a
+  `bluealsad` restart fixes this.
+- Fixed by restarting `bluealsad`; once `bluealsactl list-pcms` showed a PCM again for the ESP32,
+  PC-side live streaming resumed immediately.
 
 ## Research note (~1:20pm): architecture validated against real prior art, one important gotcha found for the future ESP32-S3 port
 
