@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Synthetic stand-in for the real S3, now talking to the REAL ESP32 over
-its USB-serial link (standing in for the eventual wired UART link -- this
-is the option that actually works: WiFi was tried first and confirmed, by
-direct heap measurement, to starve Bluetooth's own init on this chip).
-Same disk-serving role as s3_sim.py / s3_sim_wifi.py: receives the live
+"""Synthetic stand-in for the real S3, talking to the real classic ESP32
+over its USB-serial link (standing in for the wired UART link). Useful for
+testing/regression-checking the classic ESP32's BT/encoding pipeline
+without needing a physical S3 board at all -- car_sim.py plus this file
+forms a full software simulation of the S3+radio side. Receives the live
 MP3 stream, appends it into a real growing FAT12 volume, and serves it to
 the radio via SCSI READ10-style sector reads.
 

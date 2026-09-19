@@ -13,3 +13,4 @@ esp32-s3-msc/crosscheck/reader_stall_sim
 sim/s3_real_firmware_host
 sim/s3_real_firmware_host_fat16
 sim/.car_sim_resume_cache.json
+firmware/msc_test_client

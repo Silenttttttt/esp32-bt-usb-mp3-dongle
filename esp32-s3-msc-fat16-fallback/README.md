@@ -1,7 +1,8 @@
 # FAT16 fallback — NOT the primary firmware
 
-**Use the primary firmware (`../esp32-s3-msc/`) first.** Only reach for this if the real car
-radio confirms it won't mount the primary's FAT12 volume.
+**Use the primary firmware (`../esp32-s3-msc/`) first — it's confirmed working end-to-end on
+real hardware, including a real car radio.** Only reach for this if the real car radio confirms
+it won't mount the primary's FAT12 volume.
 
 ## Why this exists
 
@@ -22,9 +23,11 @@ to the classic ESP32, the USBMSC wiring — is identical.
   minimizes the size penalty of FAT16's 4085-cluster floor: 4096 clusters × 512B = 2MB, vs.
   ~16.7MB if using the primary's cluster size.
 - **Declared volume: 2,097,152 bytes** (~131s / ~2.2 minutes of audio at 16000 B/s), vs. the
-  primary's ~30s. This is a real, meaningful UX tradeoff — a much bigger worst-case catch-up-lag
-  bound — not a free fix. Don't treat switching to this as a minor detail if it's ever actually
-  needed; it changes real behavior.
+  primary's current ~4 minutes (raised from an original ~25.6s after real car-radio testing
+  found an audible stutter at the ring's wrap point — see the primary firmware's own comments
+  in `fat_disk_shared.h`). This is a real, meaningful UX tradeoff either way — a much bigger
+  worst-case catch-up-lag bound — not a free fix. Don't treat switching to this as a minor
+  detail if it's ever actually needed; it changes real behavior.
 
 ## What's been verified (no physical S3 board needed for any of this)
 
@@ -35,7 +38,8 @@ to the classic ESP32, the USBMSC wiring — is identical.
   to mount cleanly, present the file with the correct name/size, byte-exact content, and decode
   without error via a real, independent MP3 decoder (`mpg123`).
 - The ring-buffer/backpressure/concurrency logic was re-verified specifically at this variant's
-  much larger `DECLARED_FILE_SIZE` (2097152, vs. the primary's 479232) using the same real-time
+  much larger `DECLARED_FILE_SIZE` (2097152, vs. the primary's current 3842048) using the same
+  real-time
   concurrent simulation methodology as the primary firmware — zero corruption across 1.14
   real-time ring laps. The logic is generic over ring size, not re-derived per filesystem type.
 
