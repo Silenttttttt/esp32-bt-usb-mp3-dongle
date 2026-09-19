@@ -96,7 +96,11 @@ Both boards have onboard LED status for debugging without a laptop attached:
 ## Repo layout
 
 - `esp32-bt-mp3-test/` — real, flashed firmware for the classic ESP32 (Bluetooth A2DP
-  sink + real-time Shine MP3 encoding + LED status).
+  sink + real-time Shine MP3 encoding + LED status). `bisect1_shine/` and
+  `minimal_a2dp_test/` are earlier bisection/debug sketches from the Bluetooth-reconnect
+  crash investigation, kept for reference.
+- `esp32-serial-test/` — a minimal early bring-up sketch, superseded once the real
+  classic ESP32 firmware existed. Kept for reference.
 - `esp32-s3-msc/` — real, flashed firmware for the ESP32-S3 (USB-MSC device role, FAT12
   primary, RGB LED status). `fat_disk_shared.h` holds the core ring-buffer/FAT12 disk
   logic, shared verbatim with the PC-hosted bench-test stand-in below — one source of
@@ -121,6 +125,10 @@ Both boards have onboard LED status for debugging without a laptop attached:
     and a full software simulation of the S3+radio side (talking to the real classic
     ESP32 over serial) — useful for testing the classic ESP32's own BT/encoding pipeline
     without needing any S3 hardware at all.
+  - `s3_sim.py` / `esp32_sim.py` / `s3_sim_wifi.py` — earlier, fully-synthetic
+    both-sides-simulated prototypes from before the real classic ESP32 existed at all
+    (`s3_sim_wifi.py` specifically modeled the WiFi transport that was tried and
+    abandoned). Superseded by the tools above; kept for reference.
   - `s3_real_firmware_host.cpp` / `s3_real_firmware_host_fat16.cpp` — PC-hosted programs
     that compile and run the **real firmware's actual disk logic** (shared source with
     the `.ino` files) against the real classic ESP32 — used throughout development
