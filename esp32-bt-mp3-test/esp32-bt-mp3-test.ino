@@ -572,6 +572,26 @@ void avrc_metadata_callback(uint8_t id, const uint8_t *text) {
   send_control(buf, pdMS_TO_TICKS(20));
 }
 
+#ifdef AVRC_TRACK_POSITION
+// TEMP, investigation-only, its own dedicated opt-in flag (2026-09-19):
+// elapsed PLAYBACK POSITION is a genuinely different AVRCP mechanism from
+// DURATION (ESP_AVRC_MD_ATTR_PLAYING_TIME, handled above) -- duration is
+// static per-track metadata, position is a separate, periodically-repeating
+// notification the library re-subscribes to on each firing
+// (BluetoothA2DPSink::av_play_pos_changed()). Kept behind its OWN flag,
+// separate from AVRC_INVESTIGATION, specifically so it can be left out
+// even when AVRCP itself is enabled -- Muni asked for it to add no extra
+// weight and be independently disableable. The interval argument to
+// set_avrc_rn_play_pos_callback() below directly controls how often this
+// fires (and how much extra 'C' control-channel traffic it adds); higher
+// values cost less.
+void avrc_play_pos_callback(uint32_t play_pos) {
+  char buf[32];
+  snprintf(buf, sizeof(buf), "POSITION_MS:%lu", (unsigned long)play_pos);
+  send_control(buf, pdMS_TO_TICKS(20));
+}
+#endif  // AVRC_TRACK_POSITION
+
 void setup() {
   pinMode(2, OUTPUT);
   // RX only (TX=-1), 9600 baud -- deliberately slower than the forward
@@ -713,6 +733,12 @@ void setup() {
 #endif
   a2dp_sink.set_avrc_metadata_callback(avrc_metadata_callback);
   a2dp_sink.set_avrc_rn_playstatus_callback(avrc_playstatus_callback);
+#ifdef AVRC_TRACK_POSITION
+  // 5s interval: real elapsed-position data without meaningfully adding to
+  // AVRCP traffic volume (this is a periodic re-subscription, not a
+  // continuous stream -- see avrc_play_pos_callback's own comment).
+  a2dp_sink.set_avrc_rn_play_pos_callback(avrc_play_pos_callback, 5);
+#endif
 #endif
   // Confirmed by direct measurement (pcm_drops + ENCODE_US telemetry): the
   // Shine encode work draining in loop() (DIAG_LOOP_DRAIN) needs ~1050ms

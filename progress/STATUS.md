@@ -3662,3 +3662,125 @@ classic's own USB serial console) code already built and compiled clean, but not
 tested against a real, connected phone. **Must revert to the default `A2DP_DISABLE_AVRC` build
 before considering this firmware done** — the investigation build carries a real, known
 Bluetooth-reconnect-crash risk that was specifically fixed earlier in this project.
+
+## AVRCP investigation completed via PC-as-BT-source, real months-long-feeling detour into a real PC Bluetooth stack bug (2026-09-19, same session)
+
+Muni asked to test what AVRCP data/commands actually work, using the PC's own Bluetooth (via
+`bluealsad`/`aplay`, the same desktop-as-BT-source method this project has used before) instead of
+a phone, specifically so this could run autonomously. What followed was several hours of a real,
+serious PC-side Bluetooth instability investigation that turned out to be completely unrelated to
+the ESP32 firmware, before finally reaching a real fix and completing the actual AVRCP test.
+
+### The real PC-side bug, root-caused and fixed
+
+Real chronology, condensed: `bluealsad` wasn't running at all initially (needed `sudo systemctl
+start bluealsa` — a real system service, not something startable without root). Once started,
+pairing/connecting worked, but every `aplay` playback attempt failed with
+`bluealsa-pcm.c:847:(bluealsa_hw_params) Couldn't change BlueALSA PCM configuration: Input/output
+error`, or `PCM not found` entirely.
+
+**Wrong theories chased first, each with real evidence gathered before being ruled out** (worth
+recording so this isn't re-chased blind next time):
+- Suspected AVRCP itself (both roles, CT+TG, registering simultaneously) was interfering with the
+  underlying A2DP codec negotiation — patched a LOCAL copy of the vendored `ESP32-A2DP` library
+  (`~/Arduino/libraries/ESP32-A2DP/src/BluetoothA2DPSink.cpp`) to add a new
+  `A2DP_DISABLE_AVRC_TG` flag, letting AVRCP controller-only (no target role) be tested in
+  isolation. Ruled out: CT-only failed identically to CT+TG.
+- Suspected the OLD classic ESP32's own Bluedroid bond database had gone stale from repeated
+  pair/remove cycles tonight (a real, previously-documented mechanism in this exact project,
+  `clean_last_connection()` — see CLAUDE.md item 12). Added that one-time fix, then went further
+  and did a full `esptool erase_flash` on the classic (wiping its ENTIRE NVS, not just the app-
+  level "last connected" address `clean_last_connection()` touches) for a truly clean bond slate.
+  Ruled out: identical failure even on a freshly-erased, freshly-reflashed chip.
+- Suspected the specific classic ESP32 UNIT itself had some hardware-level BT radio degradation
+  from hours of testing. Muni provided a brand-new, never-before-paired second classic ESP32
+  board (fresh MAC `00:70:07:84:C1:66`) specifically to test this. Ruled out: the fresh board
+  reproduced the exact identical `bluez`-level error
+  (`GDBus.Error:org.bluez.Error.Failed: Resource temporarily unavailable`) on its very first
+  pairing attempt, conclusively proving this was never about any specific ESP32 hardware or
+  firmware content.
+- Tried `bluetoothd`/`bluealsad` full service restarts (twice), an adapter power-cycle via
+  `bluetoothctl power off`/`on`, and a non-root `rfkill block`/`unblock` radio-level reset. None
+  fixed it, though each was a real, principled thing to try given the accumulated state from a
+  long night of pair/unpair/reconnect churn.
+
+**Real root cause, found via actual research** (not guessed): a documented `bluealsad` flag,
+`--a2dp-force-audio-cd` (forces 44.1kHz sample-rate negotiation for A2DP), specifically exists for
+this exact error class — found via a real web search that surfaced a GitHub discussion describing
+the identical `"Couldn't set A2DP configuration: ... Resource temporarily unavailable"` symptom
+with other real headphone hardware. This is a genuine `bluez`/`bluealsa` interop quirk (not an
+ESP32-specific bug at all) where the daemon's default codec negotiation can fail against certain
+real A2DP sink implementations. Applied via a systemd drop-in override
+(`/etc/systemd/system/bluealsa.service.d/override.conf`, added `--a2dp-force-audio-cd` to
+`ExecStart`) — confirmed fixed immediately after: real, clean, sustained audio playback (`count`
+climbing continuously, `ms_since_last` staying under 25ms) on both the original classic board and
+briefly on the fresh second board before it lost USB power.
+
+**Real methodology bug found along the way, while testing the PC-command-interface**: opening a
+`pyserial` connection to the classic ESP32 repeatedly triggers its DTR/RTS-based auto-program
+reset circuit — meaning every single `serial.Serial(...)` open silently reboots the board. This
+caused a real, confusing false alarm (audio appeared to stop and a data-integrity anomaly showed
+up, `WRITE_SIZES`'s `non_ff_start` counter going from always-0 to `842/4339`) that was actually
+just several real reboots happening back-to-back, not a genuine regression. Worth remembering:
+never `pyserial.Serial()`-open a live, actively-streaming ESP32's serial port repeatedly without
+expecting real resets.
+
+### AVRCP investigation results (the actual original goal)
+
+With the real pipeline finally working, tested the classic's actual AVRCP capabilities:
+- **Commands FROM the classic TO the phone/source — confirmed fully working.** `next`, `prev`,
+  `play`, `pause`, and `vol:N` (typed at the classic's own PC-facing USB console, via the new
+  `AVRC_INVESTIGATION`-gated `poll_pc_commands()`/`handle_pc_command()` code) all produced real
+  `CMD_SENT:*` confirmations, each one a genuine `a2dp_sink.next()`/`.pause()`/etc. call sending a
+  real AVRCP passthrough command.
+- **Metadata/position FROM the phone TO the classic — code confirmed correct and already wired
+  up, but genuinely untestable via this specific PC-as-source method.** `aplay` is a raw audio
+  pipe with zero "now playing" concept — there is no title/artist/duration/position data
+  anywhere in the pipeline for it to send, regardless of what the classic's AVRCP controller
+  requests. This is not a firmware gap; a real phone's OS-level media session (which DOES track
+  real title/artist/duration/position) is required to actually exercise this half of AVRCP.
+
+**Full AVRCP capability inventory** (compiled by reading the vendored `ESP32-A2DP` library's full
+public API), given to Muni directly:
+- **ESP32 → phone (commands)**: `play()`/`pause()`/`stop()`/`next()`/`previous()`/
+  `fast_forward()`/`rewind()`/`volume_up()`/`volume_down()`/`set_volume(uint8_t)` — all already
+  exercised and confirmed working above.
+- **Phone → ESP32 (info/notifications)**: title/artist/album/duration (`set_avrc_metadata_callback`
+  + `set_avrc_metadata_attribute_mask`, wired up), play/pause/stop state changes
+  (`set_avrc_rn_playstatus_callback`, wired up), elapsed playback position
+  (`set_avrc_rn_play_pos_callback`, **added this session**, see below), track-changed events
+  (`set_avrc_rn_track_change_callback`, not wired up), the phone's own volume changes
+  (`set_avrc_rn_volumechange`/`_completed`, not wired up), and the AVRCP link's own connect/
+  disconnect state independent of the audio link (`set_avrc_connection_state_callback`, not wired
+  up).
+
+**Added this session, per Muni's explicit request** ("wire up elapsed position, but make sure it
+doesn't add extra weight and can be disabled"): `avrc_play_pos_callback()`, logging
+`POSITION_MS:<ms>` over the existing control channel, registered via
+`a2dp_sink.set_avrc_rn_play_pos_callback(avrc_play_pos_callback, 5)` (5s interval — a periodic
+re-subscription, not a continuous stream, so this adds minimal traffic). Gated behind its OWN
+new, separate `AVRC_TRACK_POSITION` build flag (distinct from `AVRC_INVESTIGATION`), specifically
+so it can be left out even when AVRCP itself is otherwise enabled. Confirmed near-zero binary size
+cost (+136 bytes vs. the investigation build without it; the default `A2DP_DISABLE_AVRC` build is
+completely unaffected, exactly 0 bytes different). Elapsed position, like metadata, could not
+produce real data via `aplay`-as-source for the same reason (no real playback-position concept in
+a raw audio pipe) — genuinely needs a real phone to test with real data.
+
+**Cleanup before finishing**: removed the temporary `clean_last_connection()` one-time fix (the
+NVS bond issue it was meant to address was superseded by the full flash-erase, and the REAL root
+cause turned out to be the PC-side `bluealsad` flag anyway — this fix was never actually needed).
+Reflashed the classic back to the safe, default `A2DP_DISABLE_AVRC` build as the final state,
+matching this project's standing rule that the crash-risk AVRCP build is never the one left
+running. The `AVRC_INVESTIGATION`/`AVRC_TRACK_POSITION`-gated code all stays in the source,
+compiled and verified clean in every combination, ready for a real future test with an actual
+phone whenever that's wanted.
+
+**Also left in place, real and permanent**: the `A2DP_DISABLE_AVRC_TG` flag added to the vendored
+`ESP32-A2DP` library itself (`~/Arduino/libraries/ESP32-A2DP/src/BluetoothA2DPSink.cpp`) during
+the AVRCP-TG-role investigation — a real, harmless, backward-compatible addition (does nothing
+unless explicitly defined) that might be useful again later if AVRCP TG-role-specific behavior
+ever needs isolating. Not part of this project's own repo (it's a system-wide Arduino library
+install), so not committed here, but worth remembering it exists outside the repo the next time
+this library gets reinstalled/updated (the same class of "external dependency can be silently
+reset" issue this project's `CLAUDE.md` already flags for the `audio-tools` library's own local
+patch).
