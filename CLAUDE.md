@@ -326,6 +326,15 @@ name, `Stream.mp3` (8.3 aliases `STREAM~1..3.MP3`); the radio shows only `F01 T-
 921600 without). `--mode line` produces garbage on the classic, which led to hours of wrong
 conclusions on 2026-09-24. S3 `--baud 115200 --mode line` (921600 with `MSC_TRACE`).
 
+**Serving the radio's file opens (`fat_disk_shared.h`, 2026-09-25):** a radio opening a file
+reads probes (512 KB strides, the last 2 KB), a 40 KB head, then a 58 KB read-ahead burst from
+0. Probe reads get silent frames and don't move the live cursor; a read at offset 0 places the
+cursor at the file's start (seamless after a natural end; `FATDISK_RADIO_READAHEAD` (60 KB)
+earlier after Next/Back/mount, since the radio dropped its read-ahead); re-reads of the same
+open get the same bytes. Heartbeat: `[s3] live: underruns= opens= probes=`. Expect 0 new
+underruns per Next/Back/mount and ~1 s once per natural file end (the burst after the radio's
+1.9-3.5 s pause outruns what's been written; the alternative is replaying heard audio).
+
 **car_sim (`sim/car_sim.py --device auto --gui`) is a model of the real Kenwood (rewritten
 2026-09-25 from the car trace; change it only to match observed radio behavior):**
 - 2 KB reads; a ~58 KB (~3.7 s) read-ahead, so audio plays ~3.7 s behind the reads (the car

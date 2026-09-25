@@ -5876,3 +5876,15 @@ Harness gotcha: bluetoothctl registers its own agent and swallows confirmations;
   All OK, tone reached the classic every round (PCM_PEAK 1803-2032) and car_sim heard it
   (-30 dB), 0 classic reboots. Gotcha: the laptop's Bluetooth output starts at 0% volume,
   which sends pure silence (the first run showed AUDIO_LIVE with PCM_PEAK 0).
+
+## 2026-09-25 evening: underrun silence at every file open -- fixed (`1b45712`)
+
+Bench S3 counter showed +45..55 underrun reads (several seconds of silence) at every car_sim
+file open: the open pattern (probes, 40 KB head, 58 KB read-ahead burst -- the real Kenwood
+does the same) was all served from the live cursor, racing ~100 KB past the newest audio.
+Would have meant seconds of silence at every Next/Back/file change in the car.
+
+Fix in `fat_disk_shared.h` (see CLAUDE.md "Serving the radio's file opens"). Host test drives
+the Kenwood pattern through the real serve path: mount/Next/Back 0 underrun reads, natural end
+~1 s (seamless continuity), 0 violations. On the bench (S3 `1b45712`): Next, Back restart and a
+double Back -- 5 opens, **0** new underruns (was ~50 each).
