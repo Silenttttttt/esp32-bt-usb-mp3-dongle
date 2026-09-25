@@ -552,6 +552,12 @@ void setup() {
   // ReturnTxSerial above for why (moved to its own dedicated, slower,
   // noise-resilient UART instance instead).
   LinkSerial.begin(UART_BAUD, SERIAL_8N1, UART_S3_RX_PIN, -1);
+  // Occasional click, root-caused 2026-09-25: the driver's default RX
+  // "FIFO full" interrupt fires at 120 of the 128-byte hardware FIFO -- at
+  // 2 Mbaud only ~40 us of headroom, so any interrupt latency beyond that
+  // overflowed it (every link resync matched a UART_FIFO_OVF_ERROR, zero
+  // framing errors). At 32 bytes the ISR has ~480 us.
+  LinkSerial.setRxFIFOFull(32);
   LinkSerial.onReceiveError([](hardwareSerial_error_t e) {
     if ((unsigned)e < 6) g_uart_errs[e]++;
   });
