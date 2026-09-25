@@ -5801,7 +5801,11 @@ constants `common/link_protocol.h`, commit 6057b27). Phone streaming real music:
 Build: S3 `d8726ed` (MULTI_FILE, buffer files, LFN, EARLY_END_FAT default), classic with
 ENCODE_ON_S3. Reported by Muni from the real Kenwood:
 - First plug-in: radio showed "N/A device". Unplug/replug -> it started playing.
-- Audio playback itself worked. **Everything else failed:**
+- **Live streaming WORKS on the real Kenwood** (FATDISK_ALWAYS_SERVE_LIVE): first time on the
+  car -- the earlier streaming car test failed, and only the old fill-a-file approach was known
+  to work. Latency ~10 s in the car (bench: ~1-5 s); Muni: fine for now. Worth measuring in the
+  laptop session (likely the radio's own read-ahead/buffering).
+- Everything else failed:
 - Next on the radio -> "unsupported file" error, then it jumped to file 3.
 - On file 3, Next doesn't go forward.
 - Long file names don't show.
