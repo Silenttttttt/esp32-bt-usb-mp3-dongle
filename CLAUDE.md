@@ -342,8 +342,8 @@ arduino-cli upload -p /dev/ttyACM<N> --fqbn "esp32:esp32:esp32s3:USBMode=default
   disk image to run `fsck.fat -n -v -l` on.
 - A new `TITLE:` makes the S3 end the open file early (`force_track_change`) so the radio
   opens the next file, which already has the new name; the hop is never relayed to the phone.
-  car_sim only sees that with `--recheck-size` (size re-read while playing). Unconfirmed on
-  the real Kenwood.
+  It only works on a radio that notices the change mid-file; car_sim (size read at open, like
+  FatFs) doesn't, so there the new name shows at the next open. Unconfirmed on the Kenwood.
 - S3 debug console: `serial_logger.py --baud 115200 --mode line`.
 
 **A required local library patch lives OUTSIDE this repo and can be silently lost.** The
