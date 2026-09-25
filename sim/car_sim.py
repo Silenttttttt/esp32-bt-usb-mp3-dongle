@@ -483,6 +483,11 @@ ASSUMED_BYTES_PER_SEC = 16000
 # firmware's new, much tighter tolerance instead of the stale 5s figure.
 BURST_AHEAD_SECONDS = 1.0
 
+# The real Kenwood goes silent for about half a second whenever it changes
+# file (Next/Back or a file ending) -- Muni, 2026-09-25, in the car. The GUI
+# used to switch seamlessly, which hid the cost of every file change.
+FILE_CHANGE_GAP_S = 0.5
+
 # REAL BUG-CLASS GAP FOUND (2026-09-21): this bench tool passed
 # FATDISK_ALWAYS_SERVE_LIVE's design on a real, live GUI test ("nearly 0
 # delay") the same night a real car test of the identical firmware hit
@@ -830,6 +835,11 @@ def gui_read_loop(transport, layout, state, player, capture_f, volume_serial, bu
                 file_size = open_current_file()
                 file_bytes = 0
                 state.lap_bytes = 0
+                # Radio's file-change gap: no reads and no audio, then the
+                # new file plays from its start. Pacing re-anchors to now,
+                # same as after a pause.
+                time.sleep(FILE_CHANGE_GAP_S)
+                next_send_time = time.monotonic()
             if file_bytes >= file_size:
                 # EOF at the declared size (not the cluster chain's end): a
                 # real radio moves on to the next file in directory order.
