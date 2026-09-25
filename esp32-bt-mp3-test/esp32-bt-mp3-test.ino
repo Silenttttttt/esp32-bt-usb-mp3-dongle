@@ -904,8 +904,13 @@ void self_healing_gap_callback(esp_bt_gap_cb_event_t event,
   }
   switch (event) {
     case ESP_BT_GAP_ACL_CONN_CMPL_STAT_EVT:
-      if (param->acl_conn_cmpl_stat.stat == ESP_BT_STATUS_SUCCESS) g_acl_links++;
-      g_last_gap_activity_ms = millis();
+      // Only a link that actually came up counts: our own failed pages of
+      // a vanished phone (stat 260) also produce this event, and must not
+      // keep a genuinely wedged stack from being restarted.
+      if (param->acl_conn_cmpl_stat.stat == ESP_BT_STATUS_SUCCESS) {
+        g_acl_links++;
+        g_last_gap_activity_ms = millis();
+      }
       break;
     case ESP_BT_GAP_ACL_DISCONN_CMPL_STAT_EVT:
       if (g_acl_links > 0) g_acl_links--;
