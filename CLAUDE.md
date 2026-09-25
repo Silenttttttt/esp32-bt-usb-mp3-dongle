@@ -340,6 +340,11 @@ arduino-cli upload -p /dev/ttyACM<N> --fqbn "esp32:esp32:esp32s3:USBMode=default
   plain FAT directory entries, not a FAT16/32 feature. With `FATDISK_MULTI_FILE` the root
   directory has 64 entries (16 without). Host check: `crosscheck/lfn_image_test.cpp` writes a
   disk image to run `fsck.fat -n -v -l` on.
+- Buffer files (Muni's "do it twice"): the playing file is full length; its two neighbors are
+  ~5 s buffers (`FATDISK_BUFFER_FILE_BYTES`). Next/Back or a file end opens a buffer (old
+  name); the press is relayed, the new title renames all files, the buffer runs out and the
+  radio opens the full-length file with the new name. Works on a size-at-open radio (car_sim).
+  A switch right at the end the radio was given (full, buffer or early end) is never relayed.
 - A new `TITLE:` makes the S3 end the open file early (`force_track_change`) so the radio
   opens the next file, which already has the new name; the hop is never relayed to the phone.
   It only works on a radio that notices the change mid-file; car_sim (size read at open, like

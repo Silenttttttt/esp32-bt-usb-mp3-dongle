@@ -207,6 +207,24 @@ static const char *const FILE_NAMES[NUM_FILES] = {FILE_NAME};
 static uint32_t g_file_sizes[NUM_FILES] = {DECLARED_FILE_SIZE};
 static uint32_t g_sfn_slot[NUM_FILES] = {0};
 
+// Buffer files (2026-09-25, Muni's "do it twice" design). A radio reads a
+// file's name and size when it opens it, and on Next/Back or a file end
+// it opens a neighbor of the playing file -- before the phone has sent the
+// new title. So the playing file is full length, and its neighbors are
+// short buffers: the radio opens a buffer (old name), the S3 relays the
+// press, the new title arrives within ~1-2s and renames every file, then
+// the buffer ends naturally and the radio opens the next file, full length,
+// with the new name. A buffer running out is a natural end, never relayed.
+#ifndef FATDISK_BUFFER_FILE_BYTES
+#define FATDISK_BUFFER_FILE_BYTES (20 * 4096)  // ~5s: 1s switch debounce + relay + phone + title
+#endif
+static const uint32_t BUFFER_FILE_SIZE = FATDISK_BUFFER_FILE_BYTES;
+static_assert(BUFFER_FILE_SIZE % CLUSTER_SIZE == 0 && BUFFER_FILE_SIZE < DECLARED_FILE_SIZE,
+              "buffer file must be whole clusters, shorter than a full file");
+#ifdef FATDISK_MULTI_FILE
+static volatile bool g_file_is_buffer[NUM_FILES] = {false, true, true};  // file 0 plays first
+#endif
+
 static const uint32_t FAT_ENTRIES_NEEDED = NUM_FILES * DATA_CLUSTERS + 2;
 static const uint32_t FAT_BYTES = (FAT_ENTRIES_NEEDED * 3 + 1) / 2;
 static const uint32_t FAT_SECTORS = (FAT_BYTES + SECTOR_SIZE - 1) / SECTOR_SIZE;
@@ -651,7 +669,7 @@ static bool set_title_utf8(const char *title, uint32_t len) {
 }
 
 static void init_file_names() {
-  for (uint32_t f = 0; f < NUM_FILES; f++) g_file_sizes[f] = DECLARED_FILE_SIZE;
+  for (uint32_t f = 0; f < NUM_FILES; f++) g_file_sizes[f] = g_file_is_buffer[f] ? BUFFER_FILE_SIZE : DECLARED_FILE_SIZE;
   g_names_initialized = true;
   set_title_utf8("Stream", 6);  // default until the phone sends a real title
 }
@@ -842,19 +860,22 @@ static const uint32_t SUPPRESS_WINDOW_MS = 10000;
 // All of it is undone once the radio switches file, or after
 // SUPPRESS_WINDOW_MS.
 static volatile bool g_early_end_active = false;
-// Size an early end gave the CURRENT file, kept after the size is restored:
+static volatile uint32_t g_early_end_restore_size = 0;  // the file's size before the cut
+// Per file, the size an early end gave it, kept after the size is restored:
 // a radio that opened the file while it was short stops there -- a natural
 // end, even though the directory says full size again by then. Seen live
-// 2026-09-25: 01:00:02, a GUI that opened the shortened file played it out
-// ~17s later, after the 10s restore, and the switch was relayed as "next".
-static volatile uint32_t g_current_file_early_end = 0;  // 0 = none
+// 2026-09-25 (01:00:02 and 01:11:12): a GUI that opened the cut file played
+// it out ~17s later, after the 10s restore, and the switch was relayed as
+// "next". Cleared once the radio leaves that file.
+static volatile uint32_t g_file_early_end[NUM_FILES] = {0};  // 0 = none
+
 static volatile uint32_t g_early_end_file = 0;
 static volatile uint32_t g_early_end_size = 0;
 
 static void restore_early_end() {
   if (!g_early_end_active) return;
   g_early_end_active = false;
-  set_file_declared_size(g_early_end_file, DECLARED_FILE_SIZE);
+  set_file_declared_size(g_early_end_file, g_early_end_restore_size);
 #ifdef EARLY_END_FAT
   uint32_t last_rel = (g_early_end_size - 1) / CLUSTER_SIZE;
   if (last_rel + 1 < DATA_CLUSTERS) {
@@ -862,6 +883,20 @@ static void restore_early_end() {
     set_fat12_entry(cluster, (uint16_t)(cluster + 1));
   }
 #endif
+}
+
+// Sizes the files around the playing one (see BUFFER_FILE_SIZE): after a
+// jump into a buffer, the file after it is the full-length landing file;
+// otherwise both neighbors are buffers. Never touches the playing file --
+// the radio already read its size.
+static void arrange_neighbor_sizes(uint32_t cur) {
+  if (g_early_end_active && g_early_end_file != cur) restore_early_end();
+  uint32_t next = (cur + 1) % NUM_FILES, other = (cur + 2) % NUM_FILES;
+  bool next_long = g_file_is_buffer[cur];
+  g_file_is_buffer[next] = !next_long;
+  g_file_is_buffer[other] = true;
+  set_file_declared_size(next, next_long ? DECLARED_FILE_SIZE : BUFFER_FILE_SIZE);
+  set_file_declared_size(other, BUFFER_FILE_SIZE);
 }
 
 // True when a read of file `file_index` at `file_rel_off` falls past an
@@ -940,9 +975,9 @@ static void fatdisk_note_file_read(uint32_t file_index, uint32_t file_rel_off, u
     if (g_candidate_bytes_read >= SWITCH_DEBOUNCE_BYTES) {
       g_reader_anchored = true;
       g_current_file_index = file_index;
-      g_current_file_early_end = 0;
       g_current_file_read_end = read_end;
       g_candidate_bytes_read = 0;
+      arrange_neighbor_sizes(file_index);
     }
     return;
   }
@@ -974,7 +1009,7 @@ static void fatdisk_note_file_read(uint32_t file_index, uint32_t file_rel_off, u
   // "The end" is wherever the radio thinks the file ends: the full size, or
   // an early end the S3 set while this file was open. Only a switch right
   // at one of those is natural; anywhere else is a button press.
-  uint32_t re = g_current_file_read_end, cut = g_current_file_early_end;
+  uint32_t re = g_current_file_read_end, cut = g_file_early_end[g_current_file_index];
   bool natural_eof = (direction == 1) &&
       (re + 2 * CLUSTER_SIZE >= get_file_declared_size(g_current_file_index) ||
        (cut != 0 && re + 2 * CLUSTER_SIZE >= cut && re <= cut + CLUSTER_SIZE));
@@ -994,10 +1029,11 @@ static void fatdisk_note_file_read(uint32_t file_index, uint32_t file_rel_off, u
                   (unsigned)g_prev_file_index_to_restore);
 #endif
   }
+  g_file_early_end[g_current_file_index] = 0;  // left it
   g_current_file_index = file_index;
   g_current_file_read_end = read_end;
-  g_current_file_early_end = 0;
   g_candidate_bytes_read = 0;
+  arrange_neighbor_sizes(file_index);
   // direction==0 means a non-adjacent jump (shouldn't happen with a real
   // radio's own sequential file navigation) -- still adopt the new current
   // index so debounce tracking stays correct, just don't relay a command
@@ -1019,8 +1055,15 @@ static void force_track_change(const char *new_name11) {
   uint32_t new_size = g_current_file_read_end + CLUSTER_SIZE;
   if (new_size > DECLARED_FILE_SIZE) new_size = DECLARED_FILE_SIZE;
   restore_early_end();  // a previous early end still pending
+  // The hop must land on a full-length file (it has the new name), not a buffer.
+  uint32_t landing = (g_current_file_index + 1) % NUM_FILES;
+  g_file_is_buffer[landing] = false;
+  set_file_declared_size(landing, DECLARED_FILE_SIZE);
+  uint32_t before = get_file_declared_size(g_current_file_index);
+  if (new_size > before) new_size = before;  // already ends sooner (e.g. a buffer near its end)
   g_prev_file_index_to_restore = g_current_file_index;
-  g_restore_size_for_prev_file = DECLARED_FILE_SIZE;
+  g_restore_size_for_prev_file = before;
+  g_early_end_restore_size = before;
   set_file_declared_size(g_current_file_index, new_size);
 #ifdef EARLY_END_FAT
   uint32_t last_rel = (new_size - 1) / CLUSTER_SIZE;
@@ -1030,7 +1073,7 @@ static void force_track_change(const char *new_name11) {
   g_early_end_file = g_current_file_index;
   g_early_end_size = new_size;
   g_early_end_active = true;
-  g_current_file_early_end = new_size;
+  g_file_early_end[g_current_file_index] = new_size;
 
   uint32_t next_idx = (g_current_file_index + 1) % NUM_FILES;
   (void)new_name11;  // names now come from set_title_utf8(), for every file at once

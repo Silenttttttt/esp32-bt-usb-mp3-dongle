@@ -5783,3 +5783,15 @@ constants `common/link_protocol.h`, commit 6057b27). Phone streaming real music:
   car_sim needs `--recheck-size` for that (default is still size-read-at-open). **Whether the
   real Kenwood does this is untested**, and it's the one thing to check in the car. If it doesn't,
   the fallback is shorter declared files, so a new name shows up at the next natural file end.
+
+## 2026-09-25 ~01:20 GMT-3: click fixed, false Next fixed, song name via buffer files
+
+- **Click:** every S3 link resync matched a UART RX FIFO overflow (0 framing errors); the
+  default 120/128 FIFO-full threshold left ~40 us at 2 Mbaud. Now 32 -> 0 overflows since.
+- **False Next (01:00:02, 01:11:12):** the first title after boot counted as a change and cut the
+  file the PC's mount probe had touched; the GUI played it out ~17 s later, after the 10 s
+  restore, and that was relayed. Fixed: first title never cuts; an end the radio was given
+  (full, buffer or early end, kept per file) is never relayed.
+- **Name one song behind:** buffer files (Muni's design). Verified 01:18: GUI Next -> buffer ->
+  one relay -> title 0.5 s later -> file 3/3 showing the new song's name.
+- `EARLY_END_FAT` / `EARLY_END_READ_ERROR` remain car-test flags (off by default).

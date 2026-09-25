@@ -421,9 +421,14 @@ static void link_task(void *) {
         // it, and it's a natural EOF anyway). Driven by the title rather
         // than TRACK_CHANGED so the rename always lands before the hop,
         // whichever of the two the classic sends first.
-        if (set_title_utf8((const char *)(msg + 6), msg_len - 6) && fatdisk_reader_active()) {
-          force_track_change(nullptr);
-        }
+        // The first title after boot only names the files: it isn't a song
+        // change, and right after boot the only "reader" may be the PC's
+        // mount probe -- cutting the file it touched made the next radio to
+        // open it end ~17s in (01:00:02 and 01:11:12, 2026-09-25).
+        static bool s_title_seen = false;
+        bool changed = set_title_utf8((const char *)(msg + 6), msg_len - 6);
+        if (changed && s_title_seen && fatdisk_reader_active()) force_track_change(nullptr);
+        s_title_seen = true;
 #endif
       }
     }

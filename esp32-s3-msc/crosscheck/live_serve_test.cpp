@@ -16,6 +16,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
+#include <string>
+#include <cstring>
 #include <thread>
 #include <chrono>
 
@@ -153,167 +155,161 @@ int main() {
            r.real, r.underrun_reads, r.episodes, r.violations, ok ? "OK" : "FAIL (want exactly 1 episode)");
   }
 
-  // Switch detector: a file played to its end, then the next file, must NOT
-  // relay a button press; a mid-file jump to the next file must.
+  // Switch detector + buffer files + title-driven early end, driven by a
+  // model radio that behaves like car_sim / FatFs: it reads a file's name
+  // and size when it OPENS it, reads one cluster at a time, and at that
+  // size opens the next file. Next/Back open a neighbor from mid-file.
   g_file_switch_callback = on_switch;
-  g_current_file_index = 0; g_candidate_file_index = 0; g_candidate_bytes_read = 0;
-  g_current_file_read_end = 0; g_suppress_next_switch_callback = false;
-  g_any_file_read = false;
-  for (uint32_t off = 3000000; off < DECLARED_FILE_SIZE; off += CLUSTER_SIZE)
-    fatdisk_note_file_read(0, off, CLUSTER_SIZE);  // radio resumed mid-file, plays to EOF
-  for (uint32_t off = 0; off < 8 * CLUSTER_SIZE; off += CLUSTER_SIZE)
-    fatdisk_note_file_read(1, off, CLUSTER_SIZE);
-  bool eof_ok = g_callbacks_next == 0 && g_current_file_index == 1;
-  for (uint32_t off = 8 * CLUSTER_SIZE; off < 40 * CLUSTER_SIZE; off += CLUSTER_SIZE)
-    fatdisk_note_file_read(1, off, CLUSTER_SIZE);
-  for (uint32_t off = 0; off < 8 * CLUSTER_SIZE; off += CLUSTER_SIZE)
-    fatdisk_note_file_read(2, off, CLUSTER_SIZE);  // button: left file 1 at ~160KB
-  bool press_ok = g_callbacks_next == 1 && g_current_file_index == 2;
-  // Reader restarts after an idle gap on file 0 (relaunch / radio power-up):
-  // adopted silently, not relayed as "next" (2 -> 0 is adjacent).
-  std::this_thread::sleep_for(std::chrono::milliseconds(READER_IDLE_RESET_MS + 200));
-  for (uint32_t off = 0; off < 8 * CLUSTER_SIZE; off += CLUSTER_SIZE)
-    fatdisk_note_file_read(0, off, CLUSTER_SIZE);
-  bool restart_ok = g_callbacks_next == 1 && g_callbacks_prev == 0 && g_current_file_index == 0;
-  // Remount: host probes read a few KB scattered across files, then the
-  // reader streams file 2. Must anchor on file 2 without relaying anything.
+  init_file_names();
+  g_any_file_read = false; g_reader_anchored = false;
+  struct Radio {
+    uint32_t file = 0, pos = 0, size = 0;
+    std::string name;
+    bool honors_recheck = false;  // true: re-reads its size every cluster
+    void open(uint32_t f) {
+      file = f; pos = 0; size = get_file_declared_size(f);
+      name.clear();
+      for (uint32_t i = 0; i < g_long_len; i++) name += (char)g_long_name[i];
+    }
+    void step() {  // one cluster; natural end opens the next file
+      if (honors_recheck) size = get_file_declared_size(file);
+      if (pos >= size) { open((file + 1) % NUM_FILES); return; }
+      fatdisk_note_file_read(file, pos, CLUSTER_SIZE);
+      pos += CLUSTER_SIZE;
+    }
+    void steps(int n) { for (int i = 0; i < n; i++) step(); }
+    void press(int dir) { open((file + NUM_FILES + dir) % NUM_FILES); }
+  };
+  auto title = [](const char *t) {  // the .ino's TITLE: handler
+    if (set_title_utf8(t, strlen(t)) && fatdisk_reader_active()) force_track_change(nullptr);
+  };
+  auto expect = [&](const char *what, bool ok) {
+    printf("  %-58s %s\n", what, ok ? "OK" : "FAIL");
+    failures += !ok;
+  };
+  const int BUF = BUFFER_FILE_SIZE / CLUSTER_SIZE;
+  Radio r;
+  title("Song A");
+  r.open(0);
+  r.steps(100);
+  expect("starts on the full-length file 0", r.file == 0 && r.size == DECLARED_FILE_SIZE);
+  int n0 = g_callbacks_next, p0 = g_callbacks_prev;
+
+  // 1. Next mid-file: buffer (old name) -> relayed once -> title -> the
+  //    buffer ends -> full-length file with the new name.
+  r.press(+1);
+  expect("Next opens a short buffer", r.file == 1 && r.size == BUFFER_FILE_SIZE);
+  r.steps(6);  // ~1.5s: debounce reached, relayed
+  expect("Next relayed once", g_callbacks_next == n0 + 1);
+  title("Song B");
+  r.steps(BUF + 2);
+  expect("buffer ends -> full-length file", r.file == 2 && r.size == DECLARED_FILE_SIZE);
+  expect("...showing the new name", r.name == "Song B.mp3");
+  r.steps(60);
+  expect("no extra relay", g_callbacks_next == n0 + 1 && g_callbacks_prev == p0);
+
+  // 2. Back mid-file: same, in the other direction.
+  r.press(-1);
+  expect("Back opens a short buffer", r.file == 1 && r.size == BUFFER_FILE_SIZE);
+  r.steps(6);
+  expect("Back relayed once", g_callbacks_prev == p0 + 1 && g_callbacks_next == n0 + 1);
+  title("Song A2");
+  r.steps(BUF + 2);
+  expect("buffer ends -> full-length file with the new name",
+         r.file == 2 && r.size == DECLARED_FILE_SIZE && r.name == "Song A2.mp3");
+  r.steps(60);
+
+  // 3. The title resent every 5s: nothing happens.
+  uint32_t before = get_file_declared_size(r.file);
+  title("Song A2");
+  expect("resent title changes nothing", get_file_declared_size(r.file) == before);
+
+  // 4. Song changes on the phone mid-file (no button). This radio read the
+  //    size at open, so it plays on; the name catches up at the file end.
+  title("Song C");
+  r.steps(60);
+  expect("size-at-open radio keeps playing the open file", r.file == 2);
+  r.steps((DECLARED_FILE_SIZE / CLUSTER_SIZE) + BUF + 4);  // to its end, through the buffer
+  expect("file end -> buffer -> full-length file, new name, nothing relayed",
+         r.size == DECLARED_FILE_SIZE && r.name == "Song C.mp3" &&
+         g_callbacks_next == n0 + 1 && g_callbacks_prev == p0 + 1);
+
+  // 5. A radio that re-reads the size hops right away on a mid-file song change.
+  r.honors_recheck = true;
+  r.steps(40);
+  uint32_t was = r.file;
+  title("Song D");
+  r.steps(4);
+  expect("re-reading radio hops to a full-length file with the new name",
+         r.file == (was + 1) % NUM_FILES && r.size == DECLARED_FILE_SIZE && r.name == "Song D.mp3" &&
+         g_callbacks_next == n0 + 1);
+  r.honors_recheck = false;
+  r.steps(60);
+
+  // 6. The radio opened a file while it was cut and reaches the cut after
+  //    the 10s restore (01:00:02 / 01:11:12): natural, not relayed.
+  title("Song E");  // cuts the playing file 1 cluster past what's read
+  r.press(0);       // (re)open it now: this radio caches the cut size
+  uint32_t cut_file = r.file, cut = r.size;
+  // Play it at a pace that crosses the 10s restore before reaching the cut.
+  uint32_t pace_ms = (SUPPRESS_WINDOW_MS + 1500) / (cut / CLUSTER_SIZE);
+  bool restored_before_end = false;
+  while (r.file == cut_file) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(pace_ms));
+    if (r.pos + CLUSTER_SIZE >= cut) restored_before_end = get_file_declared_size(cut_file) != cut;
+    r.step();
+  }
+  r.steps(4);
+  expect("cut reached after the restore is not relayed",
+         cut < DECLARED_FILE_SIZE && restored_before_end && g_callbacks_next == n0 + 1 &&
+         g_callbacks_prev == p0 + 1);
+  r.steps(60);
+
+  // 7. A reader restarting after a gap (radio power-up, GUI relaunch, the
+  //    PC probing at mount) is adopted silently.
   std::this_thread::sleep_for(std::chrono::milliseconds(READER_IDLE_RESET_MS + 200));
   fatdisk_note_file_read(0, 32768, 2048);
   fatdisk_note_file_read(1, 0, 4096);
-  fatdisk_note_file_read(2, DECLARED_FILE_SIZE - 512, 512);
-  for (uint32_t off = 0; off < 8 * CLUSTER_SIZE; off += CLUSTER_SIZE)
-    fatdisk_note_file_read(2, off, CLUSTER_SIZE);
-  restart_ok = restart_ok && g_callbacks_next == 1 && g_callbacks_prev == 0 && g_current_file_index == 2;
-  printf("natural EOF not relayed: %s; mid-file Next relayed once: %s; reader restart not relayed: %s\n",
-         eof_ok ? "OK" : "FAIL", press_ok ? "OK" : "FAIL", restart_ok ? "OK" : "FAIL");
-  failures += !eof_ok + !press_ok + !restart_ok;
-
-  // Title-driven early end (the .ino's TITLE: handler): a NEW title renames
-  // every file, then ends the open file just past what's been read, so the
-  // radio opens the next file -- which carries the new name. The hop must
-  // not be relayed. Plays the reader like car_sim/FatFs: stop at the
-  // declared size, then open the next file.
-  init_file_names();
-  auto play_until_eof_then_next = [](uint32_t file, uint32_t from) {
-    uint32_t off = from;
-    while (off < get_file_declared_size(file)) { fatdisk_note_file_read(file, off, CLUSTER_SIZE); off += CLUSTER_SIZE; }
-    uint32_t next = (file + 1) % NUM_FILES;
-    for (uint32_t o = 0; o < 8 * CLUSTER_SIZE; o += CLUSTER_SIZE) fatdisk_note_file_read(next, o, CLUSTER_SIZE);
-    return off;
-  };
-  // Wait out SUPPRESS_WINDOW_MS the way a playing radio does: still reading
-  // (the S3 treats 3s with no reads as the radio having stopped).
-  auto read_through_window = [](uint32_t file, uint32_t &off) {
-    for (uint32_t t = 0; t <= SUPPRESS_WINDOW_MS; t += 1000) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(1000));
-      fatdisk_note_file_read(file, off, SECTOR_SIZE);
-      off += SECTOR_SIZE;
-    }
-  };
-  auto long_name_is = [](const char *want) {
-    uint32_t n = strlen(want);
-    if (g_long_len != n) return false;
-    for (uint32_t i = 0; i < n; i++) if (g_long_name[i] != (uint8_t)want[i]) return false;
-    return true;
-  };
-  int next0 = g_callbacks_next, prev0 = g_callbacks_prev;
-  // (a) Button: radio on file 2 presses Next -> file 0 (relayed), THEN the
-  // phone's new title arrives while file 0 plays with the old name.
-  for (uint32_t off = 8 * CLUSTER_SIZE; off < 40 * CLUSTER_SIZE; off += CLUSTER_SIZE)
-    fatdisk_note_file_read(2, off, CLUSTER_SIZE);
-  for (uint32_t off = 0; off < 8 * CLUSTER_SIZE; off += CLUSTER_SIZE)
-    fatdisk_note_file_read(0, off, CLUSTER_SIZE);
-  bool a_relayed = g_callbacks_next == next0 + 1 && g_current_file_index == 0;
-  bool a_changed = set_title_utf8("Song B", 6);
-  if (a_changed) force_track_change(nullptr);
-  uint32_t shrunk = get_file_declared_size(0);
-  play_until_eof_then_next(0, 8 * CLUSTER_SIZE);
-  bool a_ok = a_relayed && a_changed && shrunk < DECLARED_FILE_SIZE && g_current_file_index == 1 &&
-              g_callbacks_next == next0 + 1 && get_file_declared_size(0) == DECLARED_FILE_SIZE &&
-              long_name_is("Song B.mp3");
-  // (b) The same title resent (every 5s) must not hop again.
-  bool b_ok = !set_title_utf8("Song B", 6) && get_file_declared_size(1) == DECLARED_FILE_SIZE;
-  // (c) Song changes on the phone mid-file (no button): hop, not relayed.
-  for (uint32_t off = 8 * CLUSTER_SIZE; off < 60 * CLUSTER_SIZE; off += CLUSTER_SIZE)
-    fatdisk_note_file_read(1, off, CLUSTER_SIZE);
-  if (set_title_utf8("Song C", 6)) force_track_change(nullptr);
-  play_until_eof_then_next(1, 60 * CLUSTER_SIZE);
-  bool c_ok = g_current_file_index == 2 && g_callbacks_next == next0 + 1 && g_callbacks_prev == prev0 &&
-              get_file_declared_size(1) == DECLARED_FILE_SIZE && long_name_is("Song C.mp3");
-  printf("title after Next hops once, unrelayed: %s; resent title no hop: %s; mid-file song change hops: %s\n",
-         a_ok ? "OK" : "FAIL", b_ok ? "OK" : "FAIL", c_ok ? "OK" : "FAIL");
-  failures += !a_ok + !b_ok + !c_ok;
-
-  // (d) 01:00:02 regression: the radio opened the file while it was cut
-  // short, plays to that cut AFTER the 10s restore -- still a natural end.
-  for (uint32_t off = 60 * CLUSTER_SIZE; off < 70 * CLUSTER_SIZE; off += CLUSTER_SIZE)
-    fatdisk_note_file_read(2, off, CLUSTER_SIZE);
-  if (set_title_utf8("Song E", 6)) force_track_change(nullptr);
-  uint32_t cut = get_file_declared_size(2);
-  uint32_t pos = 70 * CLUSTER_SIZE;
-  read_through_window(2, pos);  // radio cached `cut`; reads slowly up to it
-  fatdisk_note_file_read(2, pos, cut - pos);  // restored by now; radio still stops at `cut`
-  bool d_restored = get_file_declared_size(2) == DECLARED_FILE_SIZE;
-  for (uint32_t o = 0; o < 8 * CLUSTER_SIZE; o += CLUSTER_SIZE) fatdisk_note_file_read(0, o, CLUSTER_SIZE);
-  bool d_ok = d_restored && g_current_file_index == 0 && g_callbacks_next == next0 + 1;
-  // (e) A radio that ignored the early end (size read at open) reads well
-  // past it; a Next pressed there is a real press and must be relayed.
-  for (uint32_t off = 8 * CLUSTER_SIZE; off < 20 * CLUSTER_SIZE; off += CLUSTER_SIZE)
-    fatdisk_note_file_read(0, off, CLUSTER_SIZE);
-  if (set_title_utf8("Song F", 6)) force_track_change(nullptr);
-  for (uint32_t off = 20 * CLUSTER_SIZE; off < 60 * CLUSTER_SIZE; off += CLUSTER_SIZE)
-    fatdisk_note_file_read(0, off, CLUSTER_SIZE);  // past the cut at 21 clusters
-  pos = 60 * CLUSTER_SIZE;
-  read_through_window(0, pos);
-  for (uint32_t o = 0; o < 8 * CLUSTER_SIZE; o += CLUSTER_SIZE) fatdisk_note_file_read(1, o, CLUSTER_SIZE);
-  bool e_ok = g_current_file_index == 1 && g_callbacks_next == next0 + 2;
-  printf("early end reached after restore not relayed: %s; Next well past an ignored early end relayed: %s\n",
-         d_ok ? "OK" : "FAIL", e_ok ? "OK" : "FAIL");
-  failures += !d_ok + !e_ok;
+  r.open((r.file + 1) % NUM_FILES);
+  r.steps(20);
+  expect("reader restart not relayed", g_callbacks_next == n0 + 1 && g_callbacks_prev == p0 + 1);
 
 #if defined(EARLY_END_FAT) || defined(EARLY_END_READ_ERROR)
-  // Early-end variants (build with -DEARLY_END_FAT and/or -DEARLY_END_READ_ERROR):
-  // file 2 is open (case c); a new title ends it early.
-  auto fat_entry = [](uint32_t cl) -> uint16_t {
-    const uint8_t *p = g_fat_sector_cache + (cl * 3) / 2;
-    return (cl & 1) ? (uint16_t)((p[0] >> 4) | (p[1] << 4)) : (uint16_t)(p[0] | ((p[1] & 0x0F) << 8));
-  };
-  auto read_err = [](uint32_t file, uint32_t rel) {
-    uint8_t buf[SECTOR_SIZE]; bool err = false;
-    g_link_last_frame_ms = FATDISK_MILLIS();  // link alive, else the stale-link path serves zeros first
-    disk_read_at(FIRST_DATA_LBA * SECTOR_SIZE + file * DECLARED_FILE_SIZE + rel, buf, SECTOR_SIZE,
-                 nullptr, nullptr, &err);
-    return err;
-  };
-  for (uint32_t off = 8 * CLUSTER_SIZE; off < 40 * CLUSTER_SIZE; off += CLUSTER_SIZE)
-    fatdisk_note_file_read(1, off, CLUSTER_SIZE);
-  if (set_title_utf8("Song G", 6)) force_track_change(nullptr);
-  uint32_t end = get_file_declared_size(1);
-  uint32_t last_cl = 2 + 1 * DATA_CLUSTERS + (end - 1) / CLUSTER_SIZE;
-  bool v_ok = end < DECLARED_FILE_SIZE;
+  // Early-end variants: a new title cuts the playing (full-length) file.
+  {
+    auto fat_entry = [](uint32_t cl) -> uint16_t {
+      const uint8_t *p = g_fat_sector_cache + (cl * 3) / 2;
+      return (cl & 1) ? (uint16_t)((p[0] >> 4) | (p[1] << 4)) : (uint16_t)(p[0] | ((p[1] & 0x0F) << 8));
+    };
+    auto read_err = [](uint32_t file, uint32_t rel) {
+      uint8_t buf[SECTOR_SIZE]; bool err = false;
+      g_link_last_frame_ms = FATDISK_MILLIS();  // link alive, else the stale-link path serves zeros first
+      disk_read_at(FIRST_DATA_LBA * SECTOR_SIZE + file * DECLARED_FILE_SIZE + rel, buf, SECTOR_SIZE,
+                   nullptr, nullptr, &err);
+      return err;
+    };
+    while (r.size != DECLARED_FILE_SIZE) r.step();
+    r.steps(40);
+    uint32_t f = r.file;
+    title("Song V");
+    uint32_t end = get_file_declared_size(f);
+    uint32_t last_cl = 2 + f * DATA_CLUSTERS + (end - 1) / CLUSTER_SIZE;
+    bool v_ok = end < DECLARED_FILE_SIZE;
 #ifdef EARLY_END_FAT
-  v_ok = v_ok && fat_entry(last_cl) == 0xFFF && fat_entry(last_cl - 1) == last_cl;
+    v_ok = v_ok && fat_entry(last_cl) == 0xFFF && fat_entry(last_cl - 1) == last_cl;
 #endif
 #ifdef EARLY_END_READ_ERROR
-  v_ok = v_ok && read_err(1, end) && read_err(1, end + 5 * CLUSTER_SIZE) && !read_err(1, end - SECTOR_SIZE) &&
-         !read_err(2, end);
+    v_ok = v_ok && read_err(f, end) && read_err(f, end + 5 * CLUSTER_SIZE) && !read_err(f, end - SECTOR_SIZE) &&
+           !read_err((f + 1) % NUM_FILES, end);
 #endif
-  play_until_eof_then_next(1, 40 * CLUSTER_SIZE);  // radio moves on -> everything restored
-  v_ok = v_ok && g_current_file_index == 2 && get_file_declared_size(1) == DECLARED_FILE_SIZE &&
-         fat_entry(last_cl) == last_cl + 1 && !read_err(1, end) && g_callbacks_next == next0 + 2;
-  printf("early-end variant (FAT=%d, READ_ERROR=%d) applied and undone: %s\n",
-#ifdef EARLY_END_FAT
-         1,
-#else
-         0,
-#endif
-#ifdef EARLY_END_READ_ERROR
-         1,
-#else
-         0,
-#endif
-         v_ok ? "OK" : "FAIL");
-  failures += !v_ok;
+    r.honors_recheck = true;  // stands in for "the radio saw the cut", whichever way
+    r.steps(4);
+    r.honors_recheck = false;
+    r.steps(8);
+    v_ok = v_ok && r.file == (f + 1) % NUM_FILES && fat_entry(last_cl) == last_cl + 1 && !read_err(f, end) &&
+           g_callbacks_next == n0 + 1;
+    expect("early-end variant applied, then undone after the switch", v_ok);
+  }
 #endif
 
   printf(failures ? "FAILED (%d)\n" : "ALL OK\n", failures);
