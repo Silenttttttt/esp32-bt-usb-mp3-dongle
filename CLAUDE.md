@@ -173,7 +173,9 @@ Real bugs found and fixed on the real ESP32 firmware + PC-side prototype so far:
    AVRCP is disabled, but correct either way). What was ALREADY fixed and verified regardless
    (see item 8 below): the system self-heals from any crash automatically, zero human action —
    the property that actually matters for unattended driving use, now hopefully needed far
-   less often.
+   less often. **SUPERSEDED 2026-09-22/24: AVRCP must stay enabled (Muni's call) — do not build
+   with `-DA2DP_DISABLE_AVRC`. The crash was re-root-caused to heap fragmentation; see the
+   Build/flash section for the current flags.**
 6. Ring-wrap MP3 splice + "stale audio replay" on pause/disconnect — fixed via (a) an
    ESP32-side silence injector (`feed_silence_if_no_real_audio()`) that keeps the ring "live"
    through any gap instead of freezing, and (b) real write-side backpressure
@@ -274,23 +276,53 @@ verification once the physical board exists.
 
 ## Build/flash commands (for tomorrow, once the S3 board exists)
 
-Classic ESP32 (already flashed, only needed again after a code change):
+**These are the CURRENT build commands (verified 2026-09-24). Copy them exactly. Both boards'
+key features live in build flags, not in the source, and a bare `arduino-cli compile .`
+silently drops them — that happened on 2026-09-24 (two S3 reflashes for an LED color dropped
+`FATDISK_ALWAYS_SERVE_LIVE`, reintroducing a minutes-long delay, and `FATDISK_MULTI_FILE`,
+losing the 3 files and title renaming).** When unsure what a board is currently running, read
+the last build's recorded flags: `grep -h customBuildProperties
+~/.cache/arduino/sketches/*/build.options.json` (each entry lists its sketchLocation).
+
+Classic ESP32:
 ```
 cd esp32-bt-mp3-test
+F="-DINT2IDX_SIZE=4000 -DDIAG_LOOP_DRAIN -DDIAG_FRAG_TRACE -DV2_ALL"
 arduino-cli compile --fqbn esp32:esp32:esp32 \
-  --build-property "compiler.c.extra_flags=-DINT2IDX_SIZE=4000 -DDIAG_LOOP_DRAIN -DDIAG_FRAG_TRACE -DA2DP_DISABLE_AVRC" \
-  --build-property "compiler.cpp.extra_flags=-DINT2IDX_SIZE=4000 -DDIAG_LOOP_DRAIN -DDIAG_FRAG_TRACE -DA2DP_DISABLE_AVRC" .
-# confirm target port's serial number matches 5B52096812 (see Safety-critical section above) before uploading:
+  --build-property "compiler.c.extra_flags=$F" --build-property "compiler.cpp.extra_flags=$F" .
+# confirm the port's serial is 5B52096812 (see Safety-critical above), and stop its serial logger first:
 arduino-cli upload -p /dev/ttyACM<N> --fqbn esp32:esp32:esp32 .
 ```
-**`-DA2DP_DISABLE_AVRC` is critical, not optional** — it's the fix that took the residual
-Bluetooth-reconnect crash rate from ~15% to 0/52 in testing (see item 5/the "MAJOR" 2026-09-17
-entry in `progress/STATUS.md`). It's a build flag, not something in the `.ino` file itself, so
-it's easy to silently drop when recompiling by hand — **this already happened once** (a
-2026-09-15 decision to disable AVRCP was made and even patched into the library, but the flag
-never made it into any of this session's actual build commands until it was rediscovered and
-restored late on 2026-09-17). If you ever compile this firmware without copy-pasting the exact
-command above, double-check this flag is still there.
+- `-DV2_ALL` turns on the AVRCP-dependent features (radio button relay, track rename, auto
+  resume/skip). **Do NOT add `-DA2DP_DISABLE_AVRC`** — the older doc recommended it as a
+  crash fix, but Muni rejected disabling AVRCP (it's the whole point); the crash was instead
+  root-caused to heap fragmentation (see STATUS.md 2026-09-22).
+- `-DDIAG_LOOP_DRAIN` is load-bearing, not just a diagnostic: it keeps Shine encoding in
+  `loop()`. The separate `encode_task()` alternative breaks Bluetooth connectability on this
+  board (creating the task itself is the problem — confirmed by A/B test 2026-09-22).
+- The classic's `Serial` is 921600 baud and carries FRAMED binary (audio 'A' frames + text 'C'
+  frames — the same wire goes to the S3). Log it with `logs/serial_logger.py --baud 921600
+  --mode framed`; `--mode line` at 115200 produces garbage (done by mistake 2026-09-24, which
+  led to hours of wrong conclusions from a log that was actually unreadable).
+
+ESP32-S3:
+```
+cd esp32-s3-msc
+F="-DFATDISK_ALWAYS_SERVE_LIVE -DFATDISK_MULTI_FILE -DLED_RAINBOW_PLAYING"
+arduino-cli compile --fqbn "esp32:esp32:esp32s3:USBMode=default,PSRAM=opi" \
+  --build-property "compiler.cpp.extra_flags=$F" --build-property "compiler.c.extra_flags=$F" .
+# confirm the port's serial is 5CE5146685, and stop its serial logger first:
+arduino-cli upload -p /dev/ttyACM<N> --fqbn "esp32:esp32:esp32s3:USBMode=default,PSRAM=opi" .
+```
+- `FATDISK_ALWAYS_SERVE_LIVE`: reads are served from a persistent cursor that tracks the live
+  write edge (~1 s latency) instead of the requested offset. Without it the ring's full ~4 min
+  catch-up lag comes back.
+- `FATDISK_MULTI_FILE`: 3 directory entries aliasing the same live stream, S3-side handling of
+  the classic's `TITLE:`/`TRACK_CHANGED`, and the radio-button relay (`RADIO_CMD:next/prev`).
+- `LED_RAINBOW_PLAYING`: rainbow LED while audio is playing (Muni's preference) instead of solid green.
+- Host test for the live-serve path and the switch detector (run it after touching
+  `fat_disk_shared.h`): `crosscheck/live_serve_test.cpp`, build line at the top of the file.
+- S3 debug console: `serial_logger.py --baud 115200 --mode line`.
 
 **A required local library patch lives OUTSIDE this repo and can be silently lost.** The
 classic ESP32 firmware will not compile at all without a 2-line patch in
@@ -304,13 +336,6 @@ library was reinstalled/updated and the patch was lost. Reapply it (the exact ch
 commented in the file itself, or see `progress/STATUS.md`'s original entry for this fix) before
 assuming anything else is wrong.
 
-ESP32-S3 (never flashed yet — this is the actual first real upload):
-```
-cd esp32-s3-msc
-arduino-cli compile --fqbn "esp32:esp32:esp32s3:USBMode=default,PSRAM=opi" .
-# confirm the port is actually the S3, not the classic ESP32 or Fin-ESP, before uploading:
-arduino-cli upload -p /dev/ttyACM<N> --fqbn "esp32:esp32:esp32s3:USBMode=default,PSRAM=opi" .
-```
 `PSRAM=opi` is confirmed correct for the real N16R8 module (8MB Octal PSRAM) — don't change it
 without checking the actual module's datasheet first if a different board variant ever gets
 used. `UART_S3_RX_PIN`/`UART_S3_TX_PIN` in the .ino are placeholders (GPIO 18/17) — update them

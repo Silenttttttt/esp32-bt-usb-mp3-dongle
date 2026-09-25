@@ -169,3 +169,16 @@ real board -- see `progress/STATUS.md`'s bring-up checklist.
 If `esp32-s3-msc.ino`'s `disk_append`/`disk_read_at`/`build_*` functions
 change, re-run both sides of these cross-checks and update this file's
 expected values before trusting the change.
+
+## Live-serve read path + file-switch detector (`FATDISK_ALWAYS_SERVE_LIVE` / `FATDISK_MULTI_FILE`)
+
+```
+g++ -O2 -std=c++17 -Wall -DFATDISK_ALWAYS_SERVE_LIVE -DFATDISK_MULTI_FILE -o live_serve_test live_serve_test.cpp
+./live_serve_test
+```
+Feeds a numbered byte stream through `disk_append()` at exact / jittery / slow / fast rates
+across several ring wraps and checks every non-silence read is a contiguous, fully written,
+not-yet-overwritten stream range (catches serving past the write pointer and the stale
+wrap tail). Also checks the switch detector: natural EOF, a mid-file Next press, and a reader
+restart or post-mount probe noise are handled correctly. Must print `ALL OK`. Sweep the jump
+target lag with `-DFATDISK_LIVE_TARGET_LAG=<bytes>`. Added 2026-09-24.

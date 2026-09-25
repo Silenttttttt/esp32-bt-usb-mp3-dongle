@@ -135,6 +135,27 @@ static int32_t msc_on_read(uint32_t lba, uint32_t offset, void *buffer, uint32_t
   return bufsize;
 }
 
+// Set when a next/prev is relayed; loop()'s LED block blinks the current
+// color off/on until then (Muni's request, 2026-09-24: "make the s3 light
+// flash when we try to go to the next song").
+static volatile uint32_t g_cmd_flash_until_ms = 0;
+
+#ifdef FATDISK_MULTI_FILE
+// PLAN_NEXT.md C3: fired by fat_disk_shared.h's fatdisk_note_file_read()
+// (called from disk_read_at() above, i.e. from msc_on_read()'s own task
+// context -- a normal TinyUSB task, not an ISR, so a direct blocking
+// ReturnTxSerial call here is safe, same as the plain loop()-driven S3_HB
+// heartbeat below) once a real, debounced file-range switch is detected --
+// a physical proxy for the driver pressing next/previous on the radio
+// itself. Relayed to the classic over the SAME existing S3->classic return
+// channel already used for the S3_HB heartbeat, same plain line-based text
+// convention (see that call's own comment for the wiring/protocol history).
+static void on_file_switch_detected(int direction) {
+  ReturnTxSerial.printf("RADIO_CMD:%s\n", direction > 0 ? "next" : "prev");
+  g_cmd_flash_until_ms = millis() + 600;
+}
+#endif
+
 static int32_t msc_on_write(uint32_t lba, uint32_t offset, uint8_t *buffer, uint32_t bufsize) {
   // Read-only volume from the host's perspective -- a real car radio never
   // writes to the file it's playing. Silently accept-and-discard rather
@@ -172,8 +193,49 @@ volatile uint32_t g_link_frames_bad = 0;
 // right after LED2's own status logic) -- 'A' frames alone can't carry
 // this distinction, since injected silence goes through the exact same
 // encode->send_framed('A',...) path real audio uses.
-volatile uint32_t g_link_last_frame_ms = 0;
+// g_link_last_frame_ms moved to fat_disk_shared.h (PLAN_NEXT.md B1,
+// 2026-09-20) so disk_read_at() can consult it directly for staleness
+// protection -- still updated here in link_task() exactly as before.
 volatile bool g_s3_audio_live = false;
+// Muni's request (2026-09-21): distinguish "paired but silent/paused" from
+// "not paired at all" -- both currently show as identical LED states, since
+// g_s3_audio_live alone can't tell them apart. The classic already sends
+// BT_CONNECTED/BT_DISCONNECTED on every real A2DP connection-state change
+// (esp32-bt-mp3-test.ino's connection_state_changed()) -- it was already
+// arriving over the wire, just never parsed here. No classic-side change
+// needed, only wiring up what link_task() does with a message that was
+// already being sent.
+volatile bool g_s3_bt_connected = false;
+// Muni's follow-up request (2026-09-21): distinguish the FORWARD link
+// (classic->S3, already covered by g_link_last_frame_ms/"RX missing" below)
+// from the RETURN link (S3->classic) actually reaching its destination --
+// two genuinely different hardware paths, either of which can fail on its
+// own (a real, previously-root-caused wiring mistake on this exact return
+// wire already happened once, see ReturnTxSerial's own comment). The full
+// round-trip already existed for a different reason (the S3_HB heartbeat,
+// sent every 2s below, that the classic's poll_return_serial() already
+// echoes straight back as "S3_RX:S3_HB:..." on the ordinary forward 'C'
+// channel) -- this just starts listening for that echo as a genuine
+// "my own return-channel transmission got all the way there and back"
+// confirmation, nothing new needed on the classic side.
+volatile uint32_t g_return_ack_last_ms = 0;
+// Muni's request (2026-09-22, bench testing): a distinct LED color for
+// "the native USB-OTG port (the one presenting as USB-MSC to the car
+// radio/PC) isn't connected right now." Only meaningful on the bench --
+// in the real car install there's no separate debug-port power source, so
+// losing this port means the whole board loses power and shows nothing at
+// all (Muni's own reasoning); on the bench, the debug/programming USB port
+// keeps the board alive and this LED visible even while the native port is
+// separately unplugged, which is exactly the scenario this is for. Driven
+// by ARDUINO_USB_STARTED_EVENT/ARDUINO_USB_STOPPED_EVENT below, which
+// already fired (only to Serial.println, never reflected in the LED) --
+// no new detection mechanism needed, just wiring up what already existed.
+volatile bool g_native_usb_connected = false;
+// Tried making the "now playing" rainbow react to a real audio-level
+// signal (2026-09-21) -- built and flashed, but live-tested it didn't
+// actually feel connected to the song in any meaningful way. Muni's call:
+// drop it, keep the rainbow a plain, un-reactive animation. Removed
+// (was `LED_SONG_COLOR`, `g_audio_level`, classic-side `LEVEL:` telemetry).
 
 static bool read_exact(uint8_t *buf, uint32_t n) {
   uint32_t got = 0;
@@ -238,6 +300,48 @@ static void link_task(void *) {
         g_s3_audio_live = true;
       } else if (msg_len == 13 && memcmp(msg, "AUDIO_SILENCE", 13) == 0) {
         g_s3_audio_live = false;
+      } else if (msg_len == 12 && memcmp(msg, "BT_CONNECTED", 12) == 0) {
+        g_s3_bt_connected = true;
+      } else if (msg_len == 15 && memcmp(msg, "BT_DISCONNECTED", 15) == 0) {
+        g_s3_bt_connected = false;
+        g_s3_audio_live = false;  // can't be "live" with no peer connected
+      } else if (msg_len >= 12 && memcmp(msg, "S3_RX:S3_HB:", 12) == 0) {
+        // Our own return-channel heartbeat, echoed all the way back --
+        // confirms the S3->classic wire is genuinely reaching its
+        // destination, not just that the classic->S3 forward link is up.
+        g_return_ack_last_ms = millis();
+#ifdef FATDISK_MULTI_FILE
+      } else if (msg_len == 13 && memcmp(msg, "TRACK_CHANGED", 13) == 0) {
+        // PLAN_NEXT.md's C1/C2/C4/C6 unification (2026-09-21): a real
+        // track change happened on the phone -- force the currently-open
+        // file to an early EOF so the radio naturally rotates to the next
+        // file (fat_disk_shared.h's force_track_change()). Renaming is now
+        // handled separately below (TITLE:), not passed here -- see that
+        // branch's own comment for why.
+        force_track_change(nullptr);
+      } else if (msg_len > 6 && memcmp(msg, "TITLE:", 6) == 0) {
+        // C1/Step 2 (2026-09-22, Muni: "yes ofc i want it, its part of the
+        // plan"): the classic already sends this exact message (see
+        // avrc_metadata_callback() on that side) for its own debug logging
+        // -- it reaches the S3 for free over the same shared wire, no new
+        // message type needed. Deliberately NOT bundled into
+        // TRACK_CHANGED's own handling above: TRACK_CHANGED fires
+        // synchronously with the AVRCP track-change notification, but the
+        // real title arrives moments LATER via a separate, asynchronous
+        // AVRCP round trip (this file's own send_control() call happens
+        // from a different callback entirely) -- trying to pass the name
+        // at TRACK_CHANGED time would almost always still be the PREVIOUS
+        // track's stale title. Renaming here, independently, whenever the
+        // real title actually arrives, always targets whichever slot is
+        // currently "next" at that moment -- close enough in practice
+        // given metadata typically arrives well within one file's
+        // remaining playtime, without needing a more elaborate pending-name
+        // queue matched against specific rotation events.
+        char name11[11];
+        sanitize_to_8_3_name((const char *)(msg + 6), msg_len - 6, name11);
+        uint32_t next_idx = (g_current_file_index + 1) % NUM_FILES;
+        set_file_name(next_idx, name11);
+#endif
       }
     }
     g_link_frames_ok++;
@@ -250,8 +354,8 @@ static void usb_event_callback(void *arg, esp_event_base_t event_base, int32_t e
   (void)arg; (void)event_data;
   if (event_base == ARDUINO_USB_EVENTS) {
     switch (event_id) {
-      case ARDUINO_USB_STARTED_EVENT: Serial.println("[s3] USB PLUGGED"); break;
-      case ARDUINO_USB_STOPPED_EVENT: Serial.println("[s3] USB UNPLUGGED"); break;
+      case ARDUINO_USB_STARTED_EVENT: Serial.println("[s3] USB PLUGGED"); g_native_usb_connected = true; break;
+      case ARDUINO_USB_STOPPED_EVENT: Serial.println("[s3] USB UNPLUGGED"); g_native_usb_connected = false; break;
       default: break;
     }
   }
@@ -267,6 +371,9 @@ void setup() {
   status_led.setPixelColor(0, 0, 0, 0);
   status_led.show();
 
+#ifdef FATDISK_MULTI_FILE
+  init_file_names();
+#endif
   build_boot_sector();
   build_fat();
   build_root_dir();
@@ -283,7 +390,60 @@ void setup() {
   // fat12_disk.py's __init__, same rationale (see CLAUDE.md/STATUS.md):
   // gets the radio's decoder real bytes to engage with immediately on
   // mount instead of waiting for real audio to physically accumulate.
-  disk_append(SILENCE_PRIMER, SILENCE_PRIMER_LEN, false);
+  //
+  // PLAN_NEXT.md item B2 (2026-09-19 design, implemented 2026-09-20): a
+  // SINGLE primer append only covers ~1.26% of DECLARED_FILE_SIZE (~3s of
+  // ~4 minutes) -- disk_valid_bytes() only reports THAT much as valid, so
+  // any read past it fell through to the buffer's raw zero-fill default:
+  // literal null bytes with NO MP3 framing at all, not silence-as-MP3. A
+  // real car radio that scans ahead at mount time (building a duration
+  // estimate, checking frame-sync consistency) would find ~3s of valid
+  // frames followed by ~237s of raw zeros with no sync markers anywhere --
+  // a strong, concrete match for Muni's real "invalid file" report right
+  // after power-on, before any real audio has ever played.
+  //
+  // REAL BUG FOUND AND FIXED (2026-09-21, first real car test of this
+  // fix): the loop below (disk_append() repeatedly until "full") DID NOT
+  // actually guarantee full coverage as originally claimed -- confirmed
+  // live: Muni's real car test STILL hit "N/A device" on first connect,
+  // this exact symptom. Root cause: disk_valid_bytes() (== g_total_written)
+  // counts BYTES APPENDED, not DISTINCT RING POSITIONS FILLED -- and
+  // disk_append()'s own wrap-avoidance logic (correct and necessary for
+  // the REAL-TIME writer, see its own big comment -- never split an MP3
+  // frame across the wrap boundary) SKIPS STRAIGHT TO POSITION 0 instead
+  // of partial-writing whenever a chunk would cross DECLARED_FILE_SIZE,
+  // rather than filling the remaining tail. Since SILENCE_PRIMER_LEN
+  // (48483) does not evenly divide DECLARED_FILE_SIZE (3842048), the old
+  // loop always left a real, unwritten gap at the very tail of the ring
+  // (here, exactly 11891 bytes / ~0.74s) as raw zero-fill from the memset
+  // above -- while g_total_written incorrectly reported the ring as fully
+  // primed once total BYTES WRITTEN reached DECLARED_FILE_SIZE, even
+  // though those bytes didn't cover every physical position. This gap sits
+  // right at the mount-time scan a real radio does immediately on connect
+  // -- before any real audio could have looped around to overwrite it --
+  // a strong, concrete explanation for the symptom surviving the first
+  // "fix" attempt.
+  //
+  // Corrected fix: fill full-sized primer chunks up to (not across) the
+  // ring boundary via disk_append() as before, then handle the exact
+  // remaining tail directly (bypassing disk_append()'s wrap-avoidance
+  // entirely for this one boot-time-only step) -- safe to do here since
+  // this runs before link_task()/USB start, so no reader or concurrent
+  // writer exists yet, no race to protect against. This DOES leave one
+  // truncated/partial MP3 frame right at the physical wrap boundary
+  // (DECLARED_FILE_SIZE-1 -> 0) -- but that's the exact same class of
+  // minor, already-accepted glitch as the ring's own intentional,
+  // once-per-lap wrap splice (see DATA_CLUSTERS's own history), not raw
+  // zero-fill with zero sync headers across a real stretch of the file.
+  while (g_write_pos + SILENCE_PRIMER_LEN <= DECLARED_FILE_SIZE) {
+    disk_append(SILENCE_PRIMER, SILENCE_PRIMER_LEN, false);
+  }
+  uint32_t primer_tail_remaining = DECLARED_FILE_SIZE - g_write_pos;
+  if (primer_tail_remaining > 0) {
+    memcpy(g_ring + g_write_pos, SILENCE_PRIMER, primer_tail_remaining);
+    g_write_pos = (g_write_pos + primer_tail_remaining) % DECLARED_FILE_SIZE;
+    g_total_written = DECLARED_FILE_SIZE;
+  }
 
   // Default HardwareSerial RX buffer (256B) is far too small at 921600
   // baud for ~100-180 audio-frame chunks/sec from the classic ESP32 --
@@ -319,6 +479,9 @@ void setup() {
   MSC.onStartStop(msc_on_start_stop);
   MSC.onRead(msc_on_read);
   MSC.onWrite(msc_on_write);
+#ifdef FATDISK_MULTI_FILE
+  g_file_switch_callback = on_file_switch_detected;
+#endif
   MSC.mediaPresent(true);
   MSC.isWritable(false);
   MSC.begin(TOTAL_SECTORS, SECTOR_SIZE);
@@ -338,24 +501,208 @@ void loop() {
   // of stepping once a second.
   uint32_t now_ms = millis();
 
-  // RGB status LED (see status_led/RGB_LED_PIN above). Off when no frame
-  // (from either the UART link or a control message) has arrived from the
-  // classic ESP32 in the last 2s -- covers "not wired up" and "classic
-  // reset/UART link dropped", not just BT state. Solid blue when linked
-  // but currently in silence (paused/no real audio -- mirrors LED2's own
-  // solid-on meaning on the classic side). Breathing green when real
-  // audio is actually flowing.
+  // RGB status LED (see status_led/RGB_LED_PIN above). Priority-ordered:
+  // hardware/link-health states take precedence over BT/audio states,
+  // since a wiring problem is more important to surface than "paired or
+  // not." One fixed color per status (2026-09-22, Muni's request -- no
+  // multi-color-cycling/rainbow effects, they read as ambiguous/confusing
+  // at a glance; blinking on/off is fine, changing hue is not). This is
+  // the authoritative status/color table -- keep it in sync with the
+  // if/else chain immediately below whenever a state is added or changed.
+  //
+  // STANDING CONVENTION (2026-09-22, Muni): blink SPEED encodes severity,
+  // fastest = worst -- WHITE/CYAN (250ms, catastrophic: no audio possible)
+  // > ORANGE/YELLOW (500ms, real but minor: button-skip relay only) >
+  // resync BLUE (600ms, NOT a fault at all -- always resolves on its own).
+  // A fast blink must always mean a real fault; a genuinely non-fault
+  // transient state must always blink slower than every fault state above
+  // it. Apply this ordering to any new blinking state added later.
+  //
+  // Two INDEPENDENT links exist (classic<->S3 UART), asymmetric severity:
+  // forward (classic->S3, carries the actual live audio ring) losing this
+  // is CATASTROPHIC -- the S3 has nothing real to serve, the whole device's
+  // job breaks -- so its states take top priority (WHITE/CYAN). Return
+  // (S3->classic, only carries the physical-button track-skip relay under
+  // FATDISK_MULTI_FILE) losing this is a real but MINOR degradation -- audio
+  // itself keeps flowing fine, you just lose radio-button track skip -- so
+  // its states (ORANGE/YELLOW) are checked only once the forward link is
+  // confirmed healthy.
+  //
+  // IMPORTANT: the return-ack round trip (g_return_ack_last_ms) can ONLY
+  // ever be confirmed via a frame arriving on the FORWARD link (classic
+  // echoes "S3_RX:S3_HB:..." back over the same wire carrying audio) --
+  // so whenever forward is down, return is unconditionally unconfirmed too.
+  // The WHITE/CYAN states below are therefore always a "BOTH links down"
+  // signal, i.e. the classic looks fully off/unreachable, not just "one
+  // wire has an issue" -- confirmed live 2026-09-22 (Muni physically
+  // unplugged the classic; got exactly this branch). Deliberately given
+  // colors OUTSIDE the red/orange/yellow family used for the return-only,
+  // single-link fault below (that one CAN'T mean "board is off," since it
+  // only fires while forward is proven alive) -- so the two situations
+  // can't be confused with each other at a glance.
+  //
+  //   STATE                          | COLOR             | MEANING
+  //   -------------------------------|-------------------|---------------------------------------------
+  //   native USB-OTG port disconnect | solid WHITE       | BENCH-ONLY diagnostic (2026-09-22, Muni): the
+  //                                  |                   | native USB-OTG port (the one presenting as
+  //                                  |                   | USB-MSC to the car radio/PC) has no host right
+  //                                  |                   | now, even though the board itself is up (powered
+  //                                  |                   | via the separate debug/programming port). Checked
+  //                                  |                   | FIRST, ahead of every other state below -- if the
+  //                                  |                   | host can't even see the drive, nothing else this
+  //                                  |                   | LED reports matters. Can NEVER happen in the real
+  //                                  |                   | car install (no debug-port power there -- losing
+  //                                  |                   | this port means the whole board loses power and
+  //                                  |                   | goes dark, not white).
+  //   both links down: never linked  | blinking WHITE    | zero frames from the classic since S3 boot --
+  //                                  |                   | consistent with "off/disconnected from the start"
+  //   both links down: link lost     | blinking CYAN     | was receiving frames from the classic, now silent
+  //                                  |                   | 2s+ -- consistent with a mid-session crash/reset/
+  //                                  |                   | wire coming loose, or classic powered off WHILE
+  //                                  |                   | running (distinct from "never linked" above)
+  //   return only: never confirmed   | blinking ORANGE   | forward link is healthy (classic is alive and
+  //   (FATDISK_MULTI_FILE only)      |                   | sending real audio), but the S3->classic
+  //                                  |                   | return-channel ack has never been seen since
+  //                                  |                   | S3 boot
+  //   return only: confirmed->lost   | blinking YELLOW   | return-channel ack WAS being seen, now silent
+  //   (FATDISK_MULTI_FILE only)      |                   | 5s+ -- same never-vs-lost distinction, mirrored
+  //                                  |                   | onto the return link
+  //   linked, not paired             | solid RED         | both links healthy, no phone currently paired
+  //   resyncing (FATDISK_ALWAYS_      | slow-blinking     | live-serve cursor just jumped, bridging the
+  //   SERVE_LIVE only)                | BLUE (600ms,      | discontinuity with silence (see
+  //                                  | NOT an error)     |
+  //                                  |                   | SILENCE_BRIDGE_BYTES in fat_disk_shared.h) --
+  //                                  |                   | always brief, resolves on its own. Normal
+  //                                  |                   | playback should almost never show this --
+  //                                  |                   | if it does, it's currently also the expected
+  //                                  |                   | signature of the bench GUI's own startup
+  //                                  |                   | validity scan (unpaced, deliberately fast --
+  //                                  |                   | confirmed live, 2026-09-22), not a real fault
+  //   linked+paired, silent          | solid BLUE        | paired, but no real audio flowing (paused/idle --
+  //                                  |                   | mirrors LED2's solid-on meaning on the classic)
+  //   linked+paired, playing         | solid GREEN       | real audio is actually flowing right now
+  //                                  | (or rainbow with  |
+  //                                  | -DLED_RAINBOW_    |
+  //                                  | PLAYING)          |
+  //
+  // History: a hue-cycling "rainbow while playing" state existed 2026-09-21
+  // through early 2026-09-22 (plain fixed-speed animation, never made
+  // audio-reactive -- tried that, didn't feel meaningfully connected to the
+  // song when live-tested, dropped), was removed 2026-09-22 per the "one
+  // fixed color, no cycling" feedback above (replaced with solid GREEN),
+  // then brought BACK the same night as an opt-in build flag
+  // (LED_RAINBOW_PLAYING) after Muni missed it -- solid GREEN stays the
+  // default; pass the flag to get rainbow instead.
   {
     bool s3_connected = (g_link_last_frame_ms != 0) && (now_ms - g_link_last_frame_ms < 2000);
-    if (!s3_connected) {
-      status_led.setPixelColor(0, 0, 0, 0);
+    // REAL FEEDBACK (2026-09-21, Muni): the link being one-way is
+    // legitimately fine depending on what's actually built -- the return
+    // channel (S3->classic) only exists to serve RADIO_CMD_RELAY/C3's
+    // physical next/prev button relay (FATDISK_MULTI_FILE on this side).
+    // With that feature not compiled in, a dead/absent return path is
+    // completely harmless, not a fault -- only surface it as a problem
+    // when something actually depends on it.
+#ifdef FATDISK_MULTI_FILE
+    bool return_seen_ever = (g_return_ack_last_ms != 0);
+    bool return_confirmed = return_seen_ever && (now_ms - g_return_ack_last_ms < 5000);
+#else
+    bool return_seen_ever = true;
+    bool return_confirmed = true;
+#endif
+    if (!g_native_usb_connected) {
+      // Solid, non-blinking WHITE (2026-09-22, Muni: tried magenta first,
+      // rejected on sight -- "not good"). Blinking WHITE already exists
+      // below (forward-link-never-linked) -- SOLID vs blinking is already
+      // an established distinguishing axis elsewhere in this exact palette
+      // (solid BLUE vs slow-blinking BLUE), so reusing white as a solid
+      // variant here stays consistent with that convention instead of
+      // introducing a genuinely new hue every time a new state is added.
+      status_led.setPixelColor(0, 255, 255, 255);  // solid white -- native USB-OTG (car radio/PC) port disconnected
+    } else if (!s3_connected) {
+      // Muni's real-world observation (2026-09-22): the classic being
+      // fully powered off and one specific wire coming loose while the
+      // classic keeps running both look IDENTICAL from here -- either way
+      // the S3 simply receives nothing. That specific distinction needs a
+      // genuinely separate hardware signal (e.g. sensing the classic's own
+      // power rail on a spare GPIO) that doesn't exist yet. What IS real
+      // and detectable with what's already here: whether the S3 has EVER
+      // heard from the classic since its own boot (g_link_last_frame_ms
+      // still 0 -- consistent with "off/disconnected from the start") vs.
+      // it was genuinely talking to the classic and then went quiet
+      // (consistent with a mid-session crash, power loss, or a wire
+      // coming loose WHILE running) -- two different real situations that
+      // used to look identical (both just "blinking red").
+      //
+      // Colors deliberately NOT in the red/orange/yellow family used below
+      // for return-link-only faults (2026-09-22, Muni: live-unplugged the
+      // classic to test and got blinking MAGENTA -- too close to that other
+      // family to read as "the whole board is dark," which is genuinely
+      // what this branch always means: the return-ack channel physically
+      // CANNOT be confirmed without forward frames carrying it, so whenever
+      // this branch is taken, return is unconfirmed too, always -- this IS
+      // the "both links down" case, not just "one link down"). WHITE/CYAN
+      // instead, unmistakably distinct from every other state's palette.
+      bool on = ((now_ms / 250) % 2) == 0;
+      if (g_link_last_frame_ms == 0) {
+        status_led.setPixelColor(0, on ? 255 : 0, on ? 255 : 0, on ? 255 : 0);  // blinking white -- never heard from it at all
+      } else {
+        status_led.setPixelColor(0, 0, on ? 255 : 0, on ? 255 : 0);  // blinking cyan -- was talking, now silent
+      }
+    } else if (!return_confirmed) {
+      // Same never-vs-lost distinction as the forward link above, mirrored
+      // onto the return (S3->classic) channel (2026-09-22, Muni: "we have
+      // two way link... one is bad if it happens, the other completely
+      // breaks the functionality" -- forward-link loss is the RED/MAGENTA
+      // pair above and takes priority since it kills audio entirely; this
+      // return-link pair is checked next since losing it only breaks the
+      // physical-button track-skip relay, audio itself keeps working).
+      bool on = ((now_ms / 500) % 2) == 0;
+      if (!return_seen_ever) {
+        status_led.setPixelColor(0, on ? 255 : 0, on ? 140 : 0, 0);  // blinking orange -- never confirmed since boot
+      } else {
+        status_led.setPixelColor(0, on ? 255 : 0, on ? 255 : 0, 0);  // blinking yellow -- was confirmed, now lost
+      }
+    } else if (!g_s3_bt_connected) {
+      status_led.setPixelColor(0, 255, 0, 0);  // solid red -- not paired
+#ifdef FATDISK_ALWAYS_SERVE_LIVE
+    } else if (g_silence_bridge_remaining > 0) {
+      // Resyncing (2026-09-22, Muni's request): the live-serve cursor just
+      // jumped (see SILENCE_BRIDGE_BYTES's own comment in
+      // fat_disk_shared.h) and is bridging the discontinuity with clean
+      // silence instead of handing the reader a torn frame boundary.
+      // g_silence_bridge_remaining is shared straight from that header
+      // (no new variable needed). Originally a red+blue "violet" -- Muni
+      // correctly read that as an error/fault color at a glance (visually
+      // close to magenta/pink, easy to mistake for something broken).
+      // Slow-blinking BLUE instead: thematically tied to the other
+      // audio-state color (solid BLUE = paired+silent). Standing
+      // convention as of 2026-09-22 (Muni): FAST blink means a real fault
+      // (WHITE/CYAN/ORANGE/YELLOW above), SLOW blink means something
+      // transient/non-fault -- this state is genuinely never an error (a
+      // resync bridge always resolves on its own), so it must read slow.
+      bool on = ((now_ms / 600) % 2) == 0;
+      status_led.setPixelColor(0, 0, 0, on ? 255 : 0);  // slow-blinking blue -- resyncing (not an error)
+#endif
     } else if (g_s3_audio_live) {
-      // ~1.5s breathing period, floor at 15% so it never fully blacks out.
-      float phase = fmodf((float)now_ms, 1500.0f) / 1500.0f;
-      float pulse = 0.15f + 0.85f * (0.5f + 0.5f * sinf(phase * 2.0f * (float)M_PI));
-      status_led.setPixelColor(0, 0, (uint8_t)(255 * pulse), 0);  // green
+      // Default is solid GREEN (2026-09-22, Muni: "no multi-color-cycling,
+      // pick a color"). Muni later asked for the rainbow back specifically
+      // as an opt-in -- LED_RAINBOW_PLAYING makes it a real build flag
+      // instead of picking one or the other permanently.
+#ifdef LED_RAINBOW_PLAYING
+      uint16_t hue = (uint16_t)(((uint32_t)now_ms * 65536UL / 4000UL) & 0xFFFF);
+      status_led.setPixelColor(0, status_led.gamma32(status_led.ColorHSV(hue, 255, 255)));
+#else
+      status_led.setPixelColor(0, 0, 255, 0);  // solid green -- playing
+#endif
     } else {
-      status_led.setPixelColor(0, 0, 0, 255);  // solid blue
+      status_led.setPixelColor(0, 0, 0, 255);  // solid blue -- paired, silent
+    }
+    // Next/prev relayed to the phone: 3 bright white flashes over ~0.6s,
+    // overriding the state color (Muni: "flash a color or smth" -- a dim
+    // blink of the current color was hard to see against the rainbow).
+    if ((int32_t)(g_cmd_flash_until_ms - now_ms) > 0) {
+      bool on = ((now_ms / 100) % 2) == 0;
+      status_led.setPixelColor(0, on ? 255 : 0, on ? 255 : 0, on ? 255 : 0);
     }
     status_led.show();
   }
@@ -374,6 +721,19 @@ void loop() {
                   (unsigned long)g_total_written, (unsigned long)g_last_read_offset,
                   (unsigned)g_diag_write_byte, (unsigned long)g_diag_write_count,
                   (unsigned)g_diag_read_byte, (unsigned long)g_diag_read_count);
+    Serial.printf("[s3] mem: int_total=%u int_free=%u int_largest=%u int_min=%u psram_total=%u psram_free=%u psram_largest=%u\n",
+                  (unsigned)heap_caps_get_total_size(MALLOC_CAP_INTERNAL),
+                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+                  (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
+                  (unsigned)heap_caps_get_total_size(MALLOC_CAP_SPIRAM),
+                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
+#ifdef FATDISK_ALWAYS_SERVE_LIVE
+    Serial.printf("[s3] live: underruns=%lu lap_end=%lu cursor=%lu\n",
+                  (unsigned long)g_live_underruns, (unsigned long)g_ring_lap_end,
+                  (unsigned long)g_live_read_cursor);
+#endif
   }
 
   // Return channel: GPIO4 (physical wire to classic ESP32's GPIO19) --

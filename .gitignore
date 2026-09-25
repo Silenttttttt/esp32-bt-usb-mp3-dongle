@@ -12,5 +12,11 @@ esp32-s3-msc/crosscheck/realtime_concurrency_sim
 esp32-s3-msc/crosscheck/reader_stall_sim
 sim/s3_real_firmware_host
 sim/s3_real_firmware_host_fat16
+sim/s3_real_firmware_host_multi
 sim/.car_sim_resume_cache.json
 firmware/msc_test_client
+
+# local secrets and runtime logs
+sim/.sudo_password
+logs/*.log
+logs/__pycache__/

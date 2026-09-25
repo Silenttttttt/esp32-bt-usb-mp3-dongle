@@ -1,5 +1,5 @@
 import sys
-sys.path.insert(0, "/home/silent/Documents/Computarias/digispark-msc/sim")
+sys.path.insert(0, "./sim")
 from fat12_disk import GrowingFat12Disk, SECTOR_SIZE
 
 d = GrowingFat12Disk(capacity_bytes=117 * 8 * 512)

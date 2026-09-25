@@ -184,6 +184,39 @@ static int open_serial_resilient(const char *expected_serial, int baud) {
 
 // ===================== UART link to the classic ESP32 (mirrors link_task()) ========
 
+// Exposed so the FATDISK_MULTI_FILE file-switch callback (below) can write
+// back to the same classic ESP32 -- link_supervisor() sets this once the
+// port is open, clears it on disconnect. -1 means "not currently connected,
+// don't try to write."
+static std::atomic<int> g_esp32_fd{-1};
+
+#ifdef FATDISK_MULTI_FILE
+// Reuses the ALREADY-WORKING PC-typed command interface (handle_pc_command()
+// in esp32-bt-mp3-test.ino, gated behind AVRC_INVESTIGATION, confirmed live
+// tonight for next/prev/play/pause/vol) instead of building out a separate
+// RADIO_CMD-over-dedicated-return-channel message for this test -- that's
+// PLAN_NEXT.md C3's eventual real-hardware mechanism, but it needs the
+// physical S3's own GPIO4->classic-GPIO19 wire, which this PC stand-in has
+// no way to drive. Writing "next\n"/"prev\n" over the SAME serial connection
+// already used for the forward link validates the full end-to-end concept
+// (does a detected file-switch really make the classic send a real AVRCP
+// command) against the REAL classic hardware tonight, with zero changes to
+// its firmware -- the classic already understands these exact two words.
+static void send_radio_cmd_to_classic(int direction) {
+  int fd = g_esp32_fd.load();
+  if (fd < 0) {
+    fprintf(stderr, "[s3-host][RADIO_CMD] detected a switch (direction=%d) but the "
+                     "classic isn't connected right now -- dropped\n", direction);
+    return;
+  }
+  const char *cmd = (direction > 0) ? "next\n" : "prev\n";
+  ssize_t w = write(fd, cmd, strlen(cmd));
+  fprintf(stderr, "[s3-host][RADIO_CMD] car radio switched files (direction=%d) -- "
+                   "relayed '%s' to the classic (%zd bytes written)\n",
+          direction, (direction > 0) ? "next" : "prev", w);
+}
+#endif
+
 class SerialStaleError {};
 
 static void read_exact(int fd, uint8_t *buf, uint32_t n) {
@@ -229,6 +262,7 @@ static void receive_from_esp32(int fd) {
       continue;
     }
     if (length) read_exact(fd, payload, length);
+    g_link_last_frame_ms = FATDISK_MILLIS();  // mirrors link_task()'s own update (B1)
 
     if (frame_type == 'A') {
       bool ok = false;
@@ -275,12 +309,14 @@ static void receive_from_esp32(int fd) {
 static void link_supervisor() {
   while (true) {
     int fd = open_serial_resilient(g_expected_serial, g_baud);
+    g_esp32_fd.store(fd);
     try {
       receive_from_esp32(fd);
     } catch (...) {
       fprintf(stderr, "[s3-host][RECONNECTING] serial ingestion stopped -- "
                        "reconnecting automatically, no restart needed\n");
     }
+    g_esp32_fd.store(-1);
     close(fd);
   }
 }
@@ -483,6 +519,14 @@ int main(int argc, char **argv) {
   }
   memset(g_ring, 0, DECLARED_FILE_SIZE);
   disk_append(SILENCE_PRIMER, SILENCE_PRIMER_LEN, false);
+
+#ifdef FATDISK_MULTI_FILE
+  g_file_switch_callback = send_radio_cmd_to_classic;
+  fprintf(stderr, "[s3-host] FATDISK_MULTI_FILE enabled: presenting %u files "
+                   "(all aliasing the same live ring), relaying detected radio "
+                   "next/prev switches to the classic as PC-command-interface text\n",
+          NUM_FILES);
+#endif
 
   fprintf(stderr, "[s3-host] running the REAL esp32-s3-msc.ino disk logic "
                    "(fat_disk_shared.h) on this PC as a stand-in until the "

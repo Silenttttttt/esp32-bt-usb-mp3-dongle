@@ -212,7 +212,7 @@ from ~1165) and Bluetooth auto-reconnected within 55ms (`BT_DISCONNECTED` →
 flag handles this automatically). **Also discovered while investigating the freeze**:
 the actual PC-side audio source feeding the ESP32 over A2DP was not running at all
 (no `bluealsa-aplay`/`aplay`-into-bluealsa process found) — restarted it via
-`aplay -D "bluealsa:DEV=30:76:F5:90:BA:A6,PROFILE=a2dp" <wav-file>` looped in a
+`aplay -D "bluealsa:DEV=<golzin-mac>,PROFILE=a2dp" <wav-file>` looped in a
 shell `while true` wrapper (decoded a WAV from the session's captured MP3 test
 file first, since bluealsa needs raw PCM, not compressed audio) — this is the
 actual mechanism for the "mozart-feeding source" referenced in earlier summaries,
@@ -1805,7 +1805,7 @@ real callbacks wired: `avrc_playstatus_callback` → `PLAY`/`PAUSE`/`STOP`/`SEEK
    player (`fake_mpris.py`, includes a 140+ character title/artist for fragmentation testing).
 4. **But zero of these ever reached the ESP32** (`control_events` stayed at 6 — all 6 were just
    `BT_CONNECTED`/`BT_DISCONNECTED`/`READY`, no `PLAY`/`PAUSE`/`TITLE:` ever appeared).
-5. Root cause found: `busctl get-property org.bluez /org/bluez/hci0/dev_30_76_F5_90_BA_A6
+5. Root cause found: `busctl get-property org.bluez /org/bluez/hci0/dev_GOLZIN_MAC
    org.bluez.MediaControl1 Connected` returned **`false`** — the AVCTP (AVRCP control) transport
    channel was never actually opened between `bluetoothd` and the ESP32 for this connection,
    even though the `MediaControl1` D-Bus interface object existed (BlueZ creates that just from
@@ -3002,7 +3002,7 @@ substitute for real-hardware testing once the S3 board arrives — see
 
 Closed the one gap flagged above: used the same desktop-as-BlueZ-source method as the earlier
 0/52 overnight reconnect-crash stress test (`bluetoothctl connect/disconnect` against the paired
-device `30:76:F5:90:BA:A6`, real A2DP audio via `aplay -D bluealsa:...` — a synthesized 440Hz
+device `<golzin-mac>`, real A2DP audio via `aplay -D bluealsa:...` — a synthesized 440Hz
 tone, not SIGSTOP, which was already confirmed not to actually pause BT-level delivery) against
 the new `s3_real_firmware_host` pipeline specifically (not just the old `s3_sim_serial.py` one
 this method validated previously).
@@ -3784,3 +3784,1970 @@ install), so not committed here, but worth remembering it exists outside the rep
 this library gets reinstalled/updated (the same class of "external dependency can be silently
 reset" issue this project's `CLAUDE.md` already flags for the `audio-tools` library's own local
 patch).
+
+## FATDISK_ALWAYS_SERVE_LIVE: designed, then two real bugs found and fixed via real-hardware testing (2026-09-20)
+
+Muni's own design ("the S3 can always return the fresh stream so it doesn't matter what register
+it asks") was implemented as a new, opt-in compile-time mode (`FATDISK_ALWAYS_SERVE_LIVE`,
+`fat_disk_shared.h`, shared by the real S3 firmware and its PC-hosted stand-in): instead of a
+SCSI READ10's content depending on the requested LBA (the original design), the firmware ignores
+the requested offset entirely and serves whatever's most recently written, via a persistent
+server-side cursor (`g_live_read_cursor`) that advances byte-exactly on every read (guaranteeing
+MP3-frame continuity) and jumps forward to near-live only when it's fallen more than
+`LIVE_CATCHUP_THRESHOLD_BYTES` (~5s) behind the write edge — one accepted discontinuity per jump,
+not pervasive corruption. Parameterized alongside the original design, not a replacement for it.
+
+**Bug 1 (found and fixed before this entry, against the PC stand-in)**: the first implementation
+recomputed "most recent N bytes" independently on every read, with no continuity guarantee
+between reads — confirmed live to cause constant, pervasive frame corruption even with correctly
+paced, valid audio. Fixed with the persistent-cursor design described above.
+
+**Bug 2 (found and fixed tonight, only visible on REAL hardware, per Muni's explicit "we DONT
+WANT S3 STANDIN, EVER" directive — all testing from this point on used the real S3 board via
+`real_s3_passthrough.py`, never a PC-hosted stand-in)**: the "how far behind is the cursor"
+calculation used unsigned wraparound arithmetic that assumed `cursor > safe_edge` could ONLY mean
+"wrapped almost a full ring behind." In the normal, healthy case — the reader catching up to (or
+slightly overtaking, via ordinary timing jitter) the live edge — this produced a spurious,
+near-ring-sized "behind" value, forcing an unnecessary catch-up jump (and its one real
+discontinuity) essentially every time the reader caught up. This is exactly the "ran alright for
+a bit, then had audio glitches and rollbacks" symptom heard live. Fixed by only treating
+cursor-ahead-of-safe_edge as a real wraparound case when the "ahead" amount is itself large (more
+than half the ring) — a small ahead amount is healthy catch-up, so `behind=0`, no jump.
+
+**Bug 3 (the dominant real-world cause, found via live-hardware debug tracing)**: even after
+fixing Bug 2, real-hardware tests still showed pervasive, byte-for-byte IDENTICAL corruption
+across three independent runs spanning two separate firmware flashes/reboots — a level of
+determinism that couldn't be explained by anything data- or timing-dependent in the firmware.
+Root-caused to `real_s3_passthrough.py`'s `os.pread()` against its UDisks2-opened fd having no
+`O_DIRECT` — the same page-cache-staleness bug class already found and fixed once in
+`car_sim.py`'s own `DeviceTransport`, but never audited in this sibling script. Worse than simple
+staleness here: a buffered fd lets the Linux kernel issue its own independent readahead I/O
+against the real device, invisible to and uncoordinated with the passthrough's own explicit
+reads — and every readahead-triggered SCSI READ10 ALSO advances the firmware's single, shared
+`g_live_read_cursor`, silently stealing/desyncing stream continuity out from under the properly
+paced test reader. Fixed the same way as `DeviceTransport`: `O_DIRECT` + an mmap-backed aligned
+buffer (`direct_pread()`), bypassing the page cache and kernel readahead entirely.
+
+**Verified clean after all three fixes**, via an isolated `gui_read_loop()` reproduction
+(`sim/repro_live_v2.py`, bypassing Tkinter — this session's shell has no X11 display) against the
+real S3 hardware (re-enumerating as `/dev/sda`/`/dev/sdb` across reflashes) through the fixed
+`real_s3_passthrough.py`, piped into `mpg123 --resync-limit -1`: 10s, 60s, and a final 45s run
+against the clean production firmware (debug tracing off) all showed ZERO decode errors, zero
+resyncs, no "Frankenstein stream" warnings — a first for this design on real hardware. A
+temporary `Serial.printf`-based live-debug trace (`FATDISK_LIVE_DEBUG`, real S3 hardware, not a
+stand-in — printed over the board's own separate USB-CDC debug port) confirmed Bug 2's fix
+behaving correctly (`jumped=0` on legitimate catch-up where the old code would have forced a
+jump). Final firmware left flashed with `FATDISK_ALWAYS_SERVE_LIVE` only (debug tracing removed
+for the shipped build, since `Serial.printf` inside the mutex-held critical section is itself a
+real stall risk not worth carrying into normal use).
+
+Real GUI test (`car_sim.py --gui --port <passthrough-port> --player mpg123`) against the real,
+fixed hardware handed to Muni to run himself (this session's shell can't open a Tkinter display)
+— not yet confirmed by him as of this entry.
+
+## Extended soak test: full ring wraparound confirmed clean, one earlier scare traced to a self-inflicted confound (2026-09-20, same night)
+
+With Muni's phone going idle for the night, switched the PC's own Bluetooth to be the classic
+ESP32's audio source instead (`bluealsad`/`aplay` streaming a 440Hz test tone to `Golzin`,
+`<golzin-mac>` — the same PC-as-BT-source method used earlier tonight for the AVRCP
+investigation). Needed a full pair/bond/trust cycle via a FIFO-driven `bluetoothctl` session
+(BlueZ's own device cache had been cleared since the last pairing; `hcitool scan` found the
+device when `bluetoothctl scan bredr` initially didn't, and the passkey confirmation needed an
+explicit "yes" reply rather than a queued unrelated command) plus one retry after the first
+`aplay` attempt hit the already-known `Couldn't acquire media transport: Input/output error` —
+succeeded on retry once the AVDTP transport had settled.
+
+A first 5-minute unattended soak test (run concurrently with the BT reconnection work above)
+showed a real cluster of consecutive decode errors near the very end, initially concerning
+since it landed close to the ring's first full wraparound (~240s at the ~16000B/s encode rate,
+`DECLARED_FILE_SIZE`=3,842,048 bytes). Traced this to a genuine confound rather than a design
+bug: a DTR reset pulse was sent to the classic ESP32 mid-test (an attempt to catch a fresh BT
+discoverability window), landing at roughly the same point in real time as the error cluster —
+a real reboot's UART re-init transient, not a live-serving cursor bug.
+
+Reran a clean, fully undisturbed 6-minute soak test (comfortably past one full ring wrap) with
+the tone source stable throughout and no board resets: exactly ONE isolated "Illegal Audio-MPEG-
+Header" resync event across the entire 360 seconds, at offset 3,630,227 — well BEFORE the actual
+wrap point (3,842,048), not associated with it at all — immediately recovered by mpg123's own
+resync, with the full 6:00 duration decoded afterward with no further errors. This one event
+matches the design's own documented behavior exactly: a catch-up jump causes exactly one real,
+accepted discontinuity when it fires, which is expected and rare (this was the only one in 6
+minutes), not pervasive corruption. `real_s3_passthrough.py`'s O_DIRECT fix held perfectly
+throughout (`0/1410 reads were all-zero`).
+
+**Conclusion: no wrap-boundary-specific bug exists.** The earlier scare was self-inflicted (a
+board reset during the test, not a flaw in the design), and the corrected `FATDISK_ALWAYS_
+SERVE_LIVE` design now has real, clean, multi-minute verification spanning a full ring wrap
+under real, continuous, undisturbed conditions.
+
+## PLAN_NEXT.md implemented: B1/B2 (S3 bug fixes), A1-A3 (classic AVRCP auto-behaviors), C3 (radio button detection), D (V2_ALL parameterization), E (cross-feature cooldown) (2026-09-20, same night)
+
+Per Muni's explicit request to implement the standing plan with proper parameterization, split into two parallel, non-overlapping tracks (S3-side vs. classic-side, different files/boards) since both had fully-specified designs already written in PLAN_NEXT.md. Deliberately did NOT implement C1 (dynamic file resizing for wrap-alignment/duration display), C2 (VFAT long-filename title/artist display), C4/C5/C6 (transition-file delay timer, cold-boot display state, fake-disconnect trick) -- these all depend on real, unverified car-radio hardware tolerance (does THIS SPECIFIC unit accept a live declared-size change, does it re-scan a renamed file) that cannot be tested tonight with no phone and no access to the actual Kenwood radio, and carry real risk if built blind. Scoped tonight's work to what's concretely designed, safe, and additive.
+
+### B1 -- S3 link-staleness protection (`esp32-s3-msc/fat_disk_shared.h`)
+
+Real field report: BT disconnects mid-song, classic stops sending anything (a crash/reboot, not a graceful disconnect -- silence-injection already covers that gracefully), `g_write_pos` freezes, and the radio marches forward into already-played-earlier real audio instead of silence. Root cause confirmed by direct code reading: `disk_read_at()` had zero staleness protection of its own, only a race-with-the-writer check. Fix: `g_link_last_frame_ms` (previously .ino-only, used solely for the status LED) moved into the shared header so `disk_read_at()` can consult it directly; a new `LINK_STALE_MS` (2000ms, matching the existing LED threshold) check serves zero-fill instead of stale ring content whenever the link's gone quiet too long. Applies to both design branches (original offset-based AND `FATDISK_ALWAYS_SERVE_LIVE`) via one shared check before either branch's own logic. Needed a new `FATDISK_MILLIS()` platform macro (Arduino's `millis()` vs. a `std::chrono::steady_clock`-based equivalent for the PC stand-in) added to the existing platform-differences block. Verified: compiles clean, zero warnings, across default/`FATDISK_ALWAYS_SERVE_LIVE`/`FATDISK_MULTI_FILE`/combined builds, plus the PC stand-in (`s3_real_firmware_host.cpp`, updated to call `FATDISK_MILLIS()` on every received frame, mirroring `link_task()`'s own update -- compile-verified only, never launched, per the standing no-stand-in-testing directive).
+
+### B2 -- S3 full-ring boot primer (`esp32-s3-msc/esp32-s3-msc.ino`)
+
+Real field report: "invalid file" shown right after power-on, before any real audio has played; clears up once something plays. Root cause confirmed: the boot-time silence primer only ever ran ONCE, covering ~1.26% of `DECLARED_FILE_SIZE` (~3s of ~4 minutes) -- any read past that fell through to literal zero-fill with no MP3 framing at all, which a real radio's own mount-time frame-sync scan would reasonably flag as invalid. Fix: loop the same primer write (already wraparound-safe, same function real data uses) until `disk_valid_bytes() >= DECLARED_FILE_SIZE` -- every offset now returns real, validly-framed silence from the very first USB enumeration. ~79 fast PSRAM-write iterations, one-time at boot, negligible cost. Verified: compiles clean (+20 bytes) across every build combination.
+
+### C3 -- physical next/prev button detection via multi-file trick, S3 side (dispatched to a parallel fork, `esp32-s3-msc/esp32-s3-msc.ino` + `fat_disk_shared.h`)
+
+The core detection algorithm (`fatdisk_note_file_read()`/`g_file_switch_callback`, disjoint per-file cluster ranges, debounced switch detection filtering out mount-time directory-scan false positives) was ALREADY built in an earlier part of this session under `FATDISK_MULTI_FILE`, but never wired to actually enable the flag or send anything anywhere. The fork closed that gap: added `on_file_switch_detected(int direction)` sending `RADIO_CMD:next`/`RADIO_CMD:prev` over the existing `ReturnTxSerial` return channel (same plain-line-text convention as the existing heartbeat), registered as `g_file_switch_callback` in `setup()`. Also caught and fixed a real bug against the plan's own explicit refinement ("don't rename only the one file being switched to -- keep ALL 3 files always sharing the SAME name"): the 3 files had been given distinct names (`TRACK1/2/3`); fixed to all share the existing single-file name. Verified: zero warnings across no-flags (byte-identical to the pre-existing baseline, confirming zero default-build impact)/`FATDISK_MULTI_FILE` alone/combined with `FATDISK_ALWAYS_SERVE_LIVE`. Compile-only, nothing flashed (the fork was directed not to touch real hardware since I was using the only S3 board concurrently).
+
+### A1/A2/A3 -- classic ESP32 AVRCP auto-behaviors (`esp32-bt-mp3-test/esp32-bt-mp3-test.ino`)
+
+- **A1 (`AVRC_AUTO_RESUME_ON_RECONNECT`)**: auto-resumes playback once after any fresh AVRCP connection if the first post-connect playstatus comes back paused/stopped -- covers the "ignition power-blip pauses the phone's media app" annoyance. One-shot, 20s sanity window against a phone with weak AVRCP support never sending a post-connect notification at all (would otherwise leave the flag armed indefinitely).
+- **A2 (`AVRC_AUTO_RESUME_EARLY_PAUSE`)**: auto-resumes if paused within 4s of a track actually starting -- targets YouTube's idle/attention-check dialog, which tends to fire right at a track transition.
+- **A3 (`AVRC_AUTO_SKIP_NEAR_END`)**: proactively calls `next()` when a track has 7s or less remaining, nudging the phone to start loading the next track early. Reopened as a real, targeted fix (not just speculative) once section F resolved the actual ~10s delay as a real, separately-measured MP3-decoder buffering floor -- a fixed cost paid every time playback restarts from empty, which an early `next()` could let happen during the outgoing track's tail instead of after it ends. Needs `AVRC_TRACK_POSITION` also defined (enforced via a `#error` at compile time, not just a comment, since this is exactly the kind of easy-to-forget build-time dependency this project's history has already lost track of once with `-DA2DP_DISABLE_AVRC`). Two real bugs caught during design and fixed before ever compiling: (1) duration/position arrive via two independent AVRCP round-trips with no atomicity guarantee -- fixed by resetting `g_duration_ms=0` the instant a track change fires; (2) a pathologically short real track would satisfy the near-end check almost immediately -- fixed by requiring `g_duration_ms > AVRC_AUTO_SKIP_NEAR_END_MS`.
+- A2 and A3 share ONE track-change dispatcher (`avrc_track_change_callback`) registered once, since the library only supports a single handler for that notification -- a real collision the plan's own cross-feature audit caught in advance.
+- The metadata attribute mask construction was restructured from an either/or `AVRC_INVESTIGATION`/`#else` branch into an additive one, so A3 can pull in `PLAYING_TIME` on its own without requiring `AVRC_INVESTIGATION`'s wider, crash-risk-correlated ALBUM-attribute traffic.
+
+### RADIO_CMD_RELAY -- classic-side listener for C3's radio-button relay (`esp32-bt-mp3-test.ino`)
+
+New flag, parses `RADIO_CMD:next`/`RADIO_CMD:prev` arriving over the existing S3-return channel (`poll_return_serial()`) and calls `a2dp_sink.next()`/`.previous()`. Per the plan's own refinement: if playback is known-paused (`g_avrc_known_playing`, kept live in `avrc_playstatus_callback()`), also resumes -- pressing a physical button clearly signals intent to keep listening.
+
+### E -- cross-feature auto-command cooldown (`esp32-bt-mp3-test.ino`)
+
+With four independent mechanisms now each able to auto-fire an AVRCP command, a real risk exists if two fire close together (e.g. a driver's physical "next" press landing at nearly the same moment A3 independently decides the track is near its end -- both call `next()` independently, silently skipping two tracks). Fixed with one shared `g_last_auto_command_ms`/`auto_command_cooldown_ok()` (1500ms), checked ONCE per trigger EVENT (not per individual `a2dp_sink` call) -- a real bug caught during design: RADIO_CMD_RELAY's handler fires `next()`/`previous()` THEN a conditional `play()` as one coordinated response to one trigger; checking the cooldown around each call independently would make the `play()` see its own preceding `next()` as "a command just fired" and incorrectly self-suppress.
+
+### D -- `V2_ALL` umbrella parameterization (`esp32-bt-mp3-test.ino`)
+
+Per Muni's explicit standing requirement: build exactly the bare way (unchanged from every prior real test), or build the full "v2" set with one added token. `-DV2_ALL` auto-defines every sub-flag above (`AVRC_AUTO_RESUME_ON_RECONNECT`/`AVRC_AUTO_RESUME_EARLY_PAUSE`/`AVRC_AUTO_SKIP_NEAR_END`/`AVRC_TRACK_POSITION`/`RADIO_CMD_RELAY`) via `#ifndef X #define X #endif`, without disabling any sub-flag's own independent usability. **Real limitation, not solvable via preprocessor alone, documented rather than papered over**: AVRCP itself is enabled by the BUILD COMMAND omitting `-DA2DP_DISABLE_AVRC` (a flag consumed by the vendored ESP32-A2DP library, a separate translation unit) -- no `#undef` inside this `.ino` can retroactively affect how that other file was already compiled. `V2_ALL`'s own build recipe must therefore both pass `-DV2_ALL` AND omit `-DA2DP_DISABLE_AVRC`; see the updated build-command recipes below.
+
+### Real bug found and fixed during design, before it ever reached hardware
+
+`auto_command_cooldown_ok()`'s own internal `send_control()` call (the `CMD_SUPPRESSED:` message) used the default unbounded `portMAX_DELAY` wait -- but this helper is called from BOTH `loop()`-context code (RADIO_CMD_RELAY) AND directly from Bluedroid callback tasks (A1/A3, inside `avrc_playstatus_callback()`/`avrc_play_pos_callback()`). Blocking a Bluedroid-owned callback task indefinitely on `serial_mutex` is the exact, already-documented crash class every OTHER AVRCP callback in this file was already fixed to avoid (see `connection_state_changed()`'s own comment) -- this one new call site was missed on the first pass. Caught via a mechanical self-review sweep (`grep` for every new `send_control()` call site, checking each against its calling context) before ever flashing, not found empirically. Fixed by bounding it the same way (`pdMS_TO_TICKS(20)`), consistent with every other call site reachable from a Bluedroid task.
+
+### Verification performed
+
+- Compile-clean, zero warnings, across: bare default (byte-identical to the historical baseline, confirming zero default-build impact), `V2_ALL` alone (omitting `A2DP_DISABLE_AVRC`, +1628 bytes/+24 globals -- lightweight), every individual sub-flag alone, several multi-flag combinations, and `AVRC_INVESTIGATION + V2_ALL` together.
+- The `AVRC_AUTO_SKIP_NEAR_END`-without-`AVRC_TRACK_POSITION` compile-time guard confirmed to actually fire as a real, clear `#error` (not just a comment nobody reads).
+- Flashed the full `V2_ALL` build to the real classic board twice (once before, once after the cooldown-bug fix): confirmed clean boot, no panic/reboot loop, normal continuous encode/heartbeat activity, and a real BT reconnect (pair/bond/trust) to the desktop's own Bluetooth (`Golzin`, the PC-as-source method used for the rest of tonight's testing since Muni's phone went idle for the night).
+- **Real limitation, honestly flagged rather than glossed over**: could NOT get real end-to-end PCM audio flowing through the freshly-reflashed board tonight -- `bluealsad`'s `Couldn't acquire media transport: Input/output error`/`PCM not found` recurred persistently across many retries, a reconnect cycle, and even a full `bluealsad` service restart, despite the exact same command sequence having worked (after 1-2 retries) earlier the same night on a DIFFERENT-but-related classic build. This is very likely the same known, pre-existing PC-side BlueZ/bluealsa interop flakiness already documented in this file's own AVRCP-investigation entry (which took "several hours" to root-cause once already) -- not attributable to tonight's firmware changes, since (a) none of A1-A3/RADIO_CMD_RELAY touch the base A2DP audio-encode/UART-forward path at all, they only add new AVRCP callback logic that's inert without real playstatus/track-change events (which `aplay`-as-source never produces anyway), and (b) the compile-time and boot-health checks above are otherwise clean. **A1/A2/A3/RADIO_CMD_RELAY's actual real-world BEHAVIOR (not just compile/boot correctness) still needs a real phone to verify** -- `aplay`-as-source cannot produce real AVRCP playstatus/track-change/duration events, the same limitation already noted for the original AVRCP investigation. Not yet tested with a real phone.
+
+### Updated build commands (add to CLAUDE.md's own "Build/flash commands" section next time it's touched)
+
+Classic ESP32, bare (unchanged from today):
+```
+arduino-cli compile --fqbn esp32:esp32:esp32 \
+  --build-property "compiler.c.extra_flags=-DINT2IDX_SIZE=4000 -DDIAG_LOOP_DRAIN -DDIAG_FRAG_TRACE -DA2DP_DISABLE_AVRC" \
+  --build-property "compiler.cpp.extra_flags=-DINT2IDX_SIZE=4000 -DDIAG_LOOP_DRAIN -DDIAG_FRAG_TRACE -DA2DP_DISABLE_AVRC" .
+```
+Classic ESP32, full v2 (note `A2DP_DISABLE_AVRC` is deliberately OMITTED, not just replaced):
+```
+arduino-cli compile --fqbn esp32:esp32:esp32 \
+  --build-property "compiler.c.extra_flags=-DINT2IDX_SIZE=4000 -DDIAG_LOOP_DRAIN -DDIAG_FRAG_TRACE -DV2_ALL" \
+  --build-property "compiler.cpp.extra_flags=-DINT2IDX_SIZE=4000 -DDIAG_LOOP_DRAIN -DDIAG_FRAG_TRACE -DV2_ALL" .
+```
+S3, with C3 (radio-button detection) added on top of the existing live-serve design:
+```
+arduino-cli compile --fqbn "esp32:esp32:esp32s3:USBMode=default,PSRAM=opi" \
+  --build-property "compiler.cpp.extra_flags=-DFATDISK_ALWAYS_SERVE_LIVE -DFATDISK_MULTI_FILE" \
+  --build-property "compiler.c.extra_flags=-DFATDISK_ALWAYS_SERVE_LIVE -DFATDISK_MULTI_FILE" .
+```
+
+### Standing open items after tonight
+
+- A1/A2/A3/RADIO_CMD_RELAY need a real phone test (not yet done) -- `aplay`-as-source cannot exercise real AVRCP playstatus/track-change/duration notifications.
+- C3's classic-side listener (RADIO_CMD_RELAY) has never been tested end-to-end against the S3's actual detection logic on real hardware (the S3-side half was compile-verified only, never flashed, tonight).
+- C1/C2/C4/C5/C6 remain undesigned-to-uncoded, deliberately deferred (see this entry's own opening paragraph).
+- The bluealsa transport-acquisition flakiness (see above) should be re-tried fresh another day -- possibly just needs the PC's BT stack in a cleaner state, unrelated to any of tonight's real code changes.
+
+## Real car test failed: 3 real bugs found and fixed, bench tool's own fidelity gap closed (2026-09-21)
+
+First real car test of `FATDISK_ALWAYS_SERVE_LIVE` (parked, not driving) failed outright, despite
+the exact same firmware having just passed a live GUI bench test minutes earlier ("nearly 0
+delay"). Three distinct symptoms reported: (1) "N/A device" error on first USB connect, (2) the
+classic BT-disconnecting and requiring a manual unpair/re-pair to recover, (3) the radio reading
+successfully (elapsed time progressing, zero decode errors) but total silence throughout.
+
+### Bug 1 — B2 boot-primer fix (from earlier tonight) didn't actually close the gap it targeted
+
+`g_total_written` (== `disk_valid_bytes()`) counts bytes appended, not distinct ring positions
+filled. `disk_append()`'s own wrap-avoidance logic (correct and necessary for the real-time
+writer -- never split an MP3 frame across the ring boundary) skips straight to position 0
+instead of partial-writing whenever a chunk would cross `DECLARED_FILE_SIZE`. Since
+`SILENCE_PRIMER_LEN` (48483) doesn't evenly divide `DECLARED_FILE_SIZE` (3842048), the earlier
+boot-primer loop left a real, unwritten **11891-byte gap at the ring's physical tail** as raw
+zero-fill from the initial `memset` -- while `g_total_written` incorrectly reported the ring as
+fully primed. This gap sits right at the mount-time scan a real radio does immediately on
+connect, before any real audio could have looped around to overwrite it -- a direct, confirmed
+match for the "N/A device" symptom surviving the first fix attempt.
+
+Fixed (`esp32-s3-msc.ino`, `setup()`): fill full-sized primer chunks up to (not across) the ring
+boundary via `disk_append()` as before, then handle the exact remaining tail directly --
+bypassing `disk_append()`'s wrap-avoidance entirely for this one boot-time-only step (safe: no
+reader/writer race exists yet at this point in `setup()`). Leaves one truncated/partial MP3
+frame right at the physical wrap boundary -- the same class of minor, already-accepted glitch as
+the ring's own intentional once-per-lap wrap splice, not raw zero-fill.
+
+### Bug 2 — this morning's own BT auto-reconnect fix was a real regression
+
+Bounding the reconnect retry count to 3 (this morning's fix for "phone won't pair," caused by a
+stale desktop address left over from PC-based testing) was unnecessary and harmful: the vendored
+ESP32-A2DP library already reopens connectable mode for a NEW device after just 2 failed
+attempts (`BluetoothA2DPSink.cpp:907`), independent of the total retry count -- so bounding the
+count was never needed to fix the original problem. What it DID do: make the classic hit the
+library's own "give up" branch (`BluetoothA2DPSink.cpp:908-914`, which calls
+`clean_last_connection()` on `ESP_A2D_DISC_RSN_NORMAL`) after only ~30s of ANY brief, normal
+disconnect of the CURRENT phone -- wiping its own legitimate reconnect target and requiring a
+manual unpair/re-pair. Confirmed via a real car test the same day as the original fix.
+
+Fixed (`esp32-bt-mp3-test.ino`, `setup()`): removed the retry-count override entirely, back to
+the library's own default (1000 tries) + its already-built-in connectable-reopen-after-2-tries
+mechanism, which alone satisfies "auto reconnect, but let a new device pair if the last one's
+gone." The one-time `clean_last_connection()` call (used once this morning to clear the actually-
+stale desktop address) was also removed -- already served its purpose, not needed again.
+
+### Bug 3 — the real, root cause of "reads fine, but total silence" (the most significant find)
+
+Investigated via two parallel independent audits (classic write-path, S3 read-path cursor math)
+plus direct manual tracing, after the user explicitly rejected an initial "probably just BT
+churn" explanation and asked for real investigation. The write-path audit found a real, plausible
+CPU-contention risk (the inline `DIAG_LOOP_DRAIN` encode loop and Bluedroid's `BT_APP` task share
+core 1; this project's own prior measurement found pre-mono-downmix-fix encode cost was over
+105% of one core's budget, and the post-fix number was never actually re-confirmed) -- flagged as
+real and worth checking with live telemetry, but not yet confirmed without hardware.
+
+The S3 read-path audit found something stronger, fully code-confirmed without needing any live
+data: the SECOND real bug fixed earlier tonight (2026-09-20, the "behind" calculation wraparound
+fix, which correctly stopped spurious catch-up jumps on healthy small overtakes) had its own real
+flaw. It suppressed correction for ANY cursor-ahead-of-writer drift under `DECLARED_FILE_SIZE/2`
+-- **~120 seconds** -- with zero mechanism pulling a drifted cursor back toward the actual writer
+position in that entire window. Since nothing paces USB read REQUESTS to the real 16000B/s encode
+rate (only the served content's own byte-continuity is paced), a reader that reads faster than
+real-time in bursts (very plausible for a real embedded decoder doing internal read-ahead
+buffering) can race up to just under two minutes ahead of the writer with zero correction --
+reading stale-or-still-boot-primer content that entire time, with perfectly valid MP3 framing
+(zero decode errors, elapsed time tracking smoothly). An exact, mechanistic match for "reads
+fine, time elapsed progresses, but total silence."
+
+Fixed (`fat_disk_shared.h`, the live-serve `disk_read_at()` branch): gave the "ahead" direction
+its own tolerance, the SAME order of magnitude as `LIVE_CATCHUP_THRESHOLD_BYTES` (~5s) instead of
+~120s -- small enough to still absorb genuine per-read timing jitter (preserving the original
+2026-09-20 fix's intent), but correcting any real, sustained drift instead of tolerating it
+almost indefinitely. Collapsed the "genuinely ahead" and "wrapped nearly a full lap behind"
+cases into one branch, since both want the identical corrective action (jump to near-live) --
+no separate wraparound-detection threshold needed anymore. Compiled clean across every build
+combination (default, `FATDISK_ALWAYS_SERVE_LIVE` alone, `+FATDISK_MULTI_FILE`).
+
+**Correction to the read-path audit's own report**: it cited an older STATUS.md entry claiming
+tonight's real car test used the `FATDISK_MULTI_FILE` build -- this is stale. The board was
+explicitly reflashed back to the single-file `FATDISK_ALWAYS_SERVE_LIVE`-only build (after an
+earlier, separate multi-file end-to-end test attempt failed on unrelated D-Bus/passthrough
+issues) before the successful GUI bench test and the real car test that followed. The core Bug 3
+finding is unaffected (present in the single-file build too), but the audit's secondary "3-file
+mount-time-probe amplification" theory likely didn't apply to tonight's actual real-hardware run.
+
+### Bench tool fidelity gap closed (the user's explicit, repeated ask)
+
+Two real gaps in `car_sim.py` let this design pass bench testing the same night it failed on
+real hardware -- both closed:
+
+1. **No mount-time validity scan.** Added `scan_file_validity()`: reads the entire declared file
+   once up front (mimicking a plausible real head unit's own mount-time frame-sync/duration scan)
+   and reports raw zero-fill runs (real MP3-encoded silence can legitimately produce long 0xFF
+   streaks -- already documented elsewhere in this project -- so a 0x00 run specifically is an
+   unambiguous signal, never confusable with real content) and MP3 frame-sync header density.
+   Runs by default in `--gui` mode before playback starts (`--skip-scan` to opt out). Would have
+   caught Bug 1's tail-gap deterministically, rather than by chance depending on where playback
+   happened to read.
+2. **Smooth-only read pacing structurally could never trigger Bug 3.** `gui_read_loop()`'s
+   existing pacing reads at EXACTLY the real encode rate, by design (re-anchoring specifically to
+   never drift ahead OR behind for long) -- meaning it could never exercise the ahead-of-writer
+   drift path Bug 3 lived in, no matter how long a test ran. Added `--bursty` (`BURST_CLUSTERS`
+   = 30, ~7.68s/burst -- comfortably over `LIVE_CATCHUP_THRESHOLD_BYTES`'s ~5s): reads a burst of
+   clusters back-to-back with zero pacing, then sleeps the whole burst's real-time-equivalent
+   duration in one go, so the AVERAGE rate across a full cycle still matches the real encode rate
+   exactly (doesn't break the ring design's own real-time-average assumption) -- only the LOCAL
+   pacing is bursty, deliberately modeling a real decoder's plausible internal read-ahead-buffer
+   behavior. Threaded through `repro_live_v2.py` (the headless real-hardware test harness) too.
+
+Also added `--player mpg123-strict` (mpg123's own small default resync window instead of
+`--resync-limit -1`'s unlimited tolerance) earlier the same night, for the same reason: a design
+that only "works" under an artificially lenient decoder was never actually validated against
+anything resembling the real target's own tolerance.
+
+### Standing status
+
+All three fixes compiled clean (S3: default/`FATDISK_ALWAYS_SERVE_LIVE`/`+FATDISK_MULTI_FILE`;
+classic: bare default/`V2_ALL`). Not yet flashed or re-tested on real hardware -- both boards
+were still physically down in the car when this work was done; ready to flash and re-verify
+(including with `--bursty` and `scan_file_validity()`, neither of which existed before tonight)
+the moment they're reconnected.
+
+## Real root cause of "mashed audio"/"wrong song" found: NOT a firmware bug -- GVFS auto-mount corrupting the test rig (2026-09-21, same session)
+
+After the three real firmware fixes above, live real-hardware bursty testing STILL showed
+consistent audio corruption -- "mashed song at the start, then the wrong song entirely, like 3
+songs" -- reproducing at a suspiciously consistent early byte offset (~8600-9400) across MANY
+different test runs, regardless of bursty settings or real-world timing. That consistency was the
+key clue Muni called out directly ("might be an OS thing") that led to the real answer.
+
+**Root cause**: this PC's GNOME session had `org.gnome.desktop.media-handling`'s `automount`/
+`automount-open` settings enabled. Every time the S3 re-enumerated (after each reflash/reset), the
+OS auto-mounted its USB-MSC drive within moments, and `gvfs-udisks2-volume-monitor` (confirmed
+actively running) very plausibly issued its own BUFFERED (non-O_DIRECT) reads against it --
+metadata scanning, thumbnailing, or similar background indexing. Those reads go through the same
+SCSI READ10 boundary as any other read, meaning they ALSO advance the firmware's single, shared
+`g_live_read_cursor` -- silently stealing/perturbing chunks of the live stream out from under
+whatever test script was ACTUALLY trying to read it, entirely invisibly. This is the exact same
+underlying bug CLASS already found and fixed once tonight in `real_s3_passthrough.py` (missing
+O_DIRECT letting kernel readahead corrupt the cursor) -- just via a DIFFERENT, previously-unnoticed
+path (a whole separate desktop service reading the device, not kernel readahead on the same fd).
+
+**Fix**: `gsettings set org.gnome.desktop.media-handling automount false` (and `automount-open
+false`) for this session. Confirmed via direct A/B: identical bursty test, identical fresh
+firmware boot, BEFORE this fix showed a cluster of 3 resync/decode errors within ~800 bytes near
+the start (matching Muni's "mashed... like 3 songs" report exactly); immediately AFTER disabling
+auto-mount and unmounting the currently-auto-mounted drive, the identical test showed ZERO decode
+errors across the full duration (two separate confirmation runs, 15s and 35s, both clean after
+one expected startup jump). Live-confirmed by Muni listening directly: "sounded alright, just a
+few secs of delay" -- matching the design's own expected startup cost, not a defect.
+
+**Important scoping note**: this is a PURE PC-SIDE TESTING ARTIFACT, not a firmware bug and not
+something that would ever affect the real car radio (which has no OS, no GVFS, no auto-mount
+concept at all -- it just does raw SCSI reads). No firmware change was needed or made for this
+finding. It DOES mean every real-hardware PC bench test done earlier tonight (including the ones
+that appeared mostly-clean, like the "nearly 0 delay" GUI test) may have been running with this
+same, previously-unnoticed confound present the whole time -- worth keeping in mind when weighing
+how much confidence any specific PRE-this-fix test result deserves.
+
+### PC-side test tooling rebuilt from the TCP-passthrough architecture to direct device access
+
+Also, per Muni's explicit question ("why are we using a port?"), removed an unnecessary layer of
+indirection from `repro_live_v2.py`: it used to go through `real_s3_passthrough.py` (a separate
+background process bridging the real block device to a fake TCP wire protocol) purely to get
+UDisks2's passwordless `OpenDevice()` D-Bus access -- the TCP port itself was never actually
+necessary for that, just an incidental side effect of it being a separate process. Replaced with
+direct in-process access via two new transport classes added to `car_sim.py`:
+
+- `UdisksDeviceTransport` -- calls UDisks2's `OpenDevice()` inline, no port, no separate process,
+  no root. Worked correctly in principle, but triggered an interactive polkit password PROMPT on
+  this system (not actually passwordless here) -- broke automated repeat testing.
+- `HelperDeviceTransport` (what's actually used now) -- a tiny, separate, SHORT-LIVED root-only
+  helper process (`sim/open_device_fd_helper.py`) opens just the device fd (the one operation
+  that needs root) and hands it back to the main process via Unix-socket SCM_RIGHTS fd-passing,
+  automated with Muni's own sudo password (already an established, freely-reusable credential for
+  this machine). Everything else -- including the mpg123 player subprocess -- stays running as
+  the normal user throughout.
+
+**Real bug found and fixed along the way**: an intermediate attempt (plain `DeviceTransport` +
+`sudo -E python3 ...`, running the WHOLE script as root) broke real PulseAudio/PipeWire output --
+confirmed live ("didn't even play the right song, played for a sec"), matching the audio server
+silently dropping a root-owned client's stream shortly after an initial handshake, even with
+`sudo -E` preserving `PULSE_SERVER`/`XDG_RUNTIME_DIR` (the connecting process's real UID matters
+too, not just its environment). This is exactly the problem UDisks2's `OpenDevice()` mechanism
+was already solving for `real_s3_passthrough.py` -- `HelperDeviceTransport` gets the same benefit
+(only the fd-open step ever touches root) without needing a port, a long-running separate
+process, or an interactive prompt.
+
+## Real root cause #2 of test-tool-only audio corruption found: the validity scan itself corrupts --bursty playback (2026-09-21, same session)
+
+After the GVFS auto-mount fix, Muni still reported real corruption via the actual `--gui` tool
+("very stale" audio, then "started playing the new song then went back to the old one again").
+Systematically tested and ruled out, one at a time, via direct real-hardware A/B: a non-zero
+resume-cache starting `cluster_pos` (irrelevant to content under live-serve, confirmed both by
+code-reading and empirically), the `resume_cache_writer_thread` running concurrently (clean),
+and the REAL, unmodified `--gui` Tkinter code path itself running under a virtual display -- Xvfb
+(clean). All four came back clean, ruling out GIL contention/scheduling jitter from the GUI's own
+threads as the cause.
+
+**Real, reproduced root cause**: `scan_file_validity()` (added earlier the same night, meant to
+catch the B2 boot-primer bug) runs by default in `--gui` mode BEFORE playback starts, doing 938
+fully UNPACED reads in a tight loop across the whole declared file. Under `FATDISK_ALWAYS_SERVE_
+LIVE`, every one of those reads ALSO advances the same shared, persistent `g_live_read_cursor`
+the real playback loop depends on -- a far more extreme, unbounded version of exactly what
+`--bursty` does in a controlled way. Confirmed via direct A/B against real hardware: running the
+scan immediately before `--bursty` playback produced real, clustered corruption (multiple
+resyncs, "Frankenstein stream" warnings) within the first ~50KB; the identical test with
+`--skip-scan` was clean. The scan itself still reports PASS correctly (it does its own job right,
+sync density even exceeded 100% in the corrupted run, consistent with jump-spliced content still
+containing plenty of real sync headers) -- the harm is a side effect on cursor STATE, not a
+scan-accuracy bug.
+
+**Fix**: `run_gui_mode()` now automatically skips the validity scan whenever `--bursty` is
+requested (with a clear log line explaining why), since the two were never meant to interact and
+actively corrupt each other. Verified fix directly: the SAME command that previously produced a
+4-event corruption cluster spanning ~9KB now shows only a small, much milder 2-event blip right
+at the very start (consistent with ordinary startup-transient variance also seen in other clean
+runs, not a new bug) -- a real, confirmed improvement, not just a theoretical fix.
+
+**Standing gap, not yet resolved**: a small residual startup blip (1-2 resync events within the
+first ~10KB of ANY fresh cursor init, scan or no scan) has been observed across MANY tests
+tonight and never fully eliminated -- likely inherent, minor jitter in the very first jump's
+target computation interacting with real-world timing, not investigated further given its small,
+bounded severity relative to everything else found tonight. Worth keeping an eye on, not urgent.
+
+## Session 2026-09-21 (later) -- previous standing gap above ROOT-CAUSED AND FIXED: cold-start
+## `--bursty` double-splice was never "inherent jitter" -- it was `--bursty`'s own allowance being
+## fully available at t=0
+
+**Real bug, mechanism finally nailed down**: `gui_read_loop`'s bursty branch computes
+`ahead = next_send_time - time.monotonic()` and only sleeps once `ahead > BURST_AHEAD_SECONDS`
+(6s). At loop start `next_send_time == time.monotonic()`, so `ahead` starts at 0 -- but each read
+is a cheap raw block-device call (a few ms), while `next_send_time` jumps forward a full cluster's
+worth of assumed playback time (256ms) per iteration. Since nothing throttled the loop before this
+fix, `ahead` climbed from 0 to the full 6s ceiling in well under a second of real wall-clock time
+-- i.e. the reader got a "free" instant 6-second head start on its very first connect. Against
+`FATDISK_ALWAYS_SERVE_LIVE`, reading ahead doesn't fetch real future content (the server ignores
+requested LBA and always serves from its own persistent live cursor) -- it just races that cursor
+forward past whatever the writer has actually produced in the same real instant, forcing 1-2
+jump-corrections bunched together right at connect, each one splicing the MP3 stream. Confirmed by
+direct reproduction via `repro_live_v2.py /dev/sda 60 1 "" 0` (bursty, real mpg123 player, no test-
+tool changes needed to repro): exactly 2 "Illegal Audio-MPEG-Header" events, both within the first
+~9KB (offsets 8611/8836), then clean for the remaining ~1MB/60s -- this is the same standing gap
+noted above, now root-caused rather than shrugged off as inherent jitter.
+
+**Fix**: `gui_read_loop` now ramps the burst-ahead allowance up from 0 over the first
+`BURST_AHEAD_SECONDS` of REAL elapsed wall-clock time since the loop started
+(`allowed_ahead = min(BURST_AHEAD_SECONDS, now - loop_start_time)`), instead of granting the full
+allowance instantly. Steady-state behavior after the ramp period is unchanged -- this doesn't
+weaken what `--bursty` is actually testing (the firmware's ahead-direction jump-correction, still
+exercised normally once the ramp completes), it only removes the artificial instant head start
+that has no real-world analog (even a real decoder's first buffer-fill burst takes non-zero real
+time to transfer over USB).
+
+**Verified directly**: same repro command, post-fix -- 0 "Illegal Audio-MPEG-Header" events in the
+first ~9KB across two separate 60s runs (previously 2/2). One run had a small, separate splice
+cluster around t=25-29s; a second run (this time with a simultaneous tap on the S3's own
+`FATDISK_LIVE_DEBUG` trace via `/dev/ttyACM2`) was fully clean end-to-end with only ONE real
+`jumped=1` event server-side the entire 60s -- confirming the mid-session cluster in the first run
+was ordinary run-to-run variance in when a real jump naturally falls (same periodic
+self-correction rate already present and already accepted in smooth/non-bursty playback, per
+Muni's own live listening test the same night: "it has a little glitch here and there, but yes it
+sounds good, and its basically live"), not a new regression introduced by this fix.
+
+**Also this session**: confirmed the real "2 songs ago / previous song" staleness report from
+earlier tonight was very likely heard on a stale S3 binary -- the Arduino build cache showed the
+currently-flashed S3 firmware (18:54 today) already contains the earlier "Bug 3" ahead-threshold
+fix that this file's own notes say was written but not yet flashed at the time of that report. A
+direct hardware ground-truth test tonight (tap the real UART wire between the classic and S3,
+timestamp every transmitted audio frame, separately capture what the S3 serves, byte-match served
+content back to when it was actually transmitted) with real phone audio playing showed the S3
+serving content that was consistently, tightly ~0.54s old across 5 samples spanning a full 90s
+window (0.533s-0.549s, no drift) -- genuinely live, not stale. Live-listened confirmation the same
+night (smooth/non-bursty, real player): "it sounds good, and its basically live, very little
+delay." Also confirmed `V2_ALL` parameterization (item D in `PLAN_NEXT.md`) is complete --
+bare/default build is v1 unchanged, `-DV2_ALL` (+ omitting `-DA2DP_DISABLE_AVRC`) is the full v2
+switch -- but A1/A2/A3/C3 still need a real-phone AVRCP test (desktop-as-BT-source can't produce
+genuine playstatus/track-change notifications), and C1/C2/C4/C6 remain undesigned/unimplemented,
+per Muni's own "keep them for now" instruction.
+
+## Session 2026-09-21 (later still) -- REAL, CONFIRMED, UNRESOLVED BUG: `--bursty` serves
+## mostly-stale content for the bulk of a session, not just at cold start
+
+**This directly contradicts the earlier "cold-start splice, verified fixed" entry above** -- that
+fix was real and correct for its own narrow problem (MP3 framing corruption at connect), but it
+was verified ONLY via mpg123's decode-error output, which is blind to this bug: stale ring content
+is still perfectly valid MP3 (same encoder, same bitrate), so it produces ZERO decode errors while
+being genuinely the wrong audio. The framing-corruption fix and this content-staleness bug are two
+separate problems that happened to look similar from the log output alone.
+
+**Methodology, built fresh this session after Muni reported "half a sec of the right song, then
+back to the previous song" repeatedly, on both the real `--gui` path AND on `repro_live_v2.py`
+directly (bursty)**: passively tap the classic's real UART0 wire (the same electrical signal wired
+to the S3's RX pin) with real per-frame wall-clock timestamps, separately capture what the S3
+serves (`--capture`), then byte-match served content back to when it was actually transmitted.
+First attempt used a naive per-byte blocking read loop and had a catastrophic resync rate (2106
+resyncs on one 640KB capture -- MORE resyncs than successful frames), casting real doubt on every
+result from it. Rewrote it with a buffered chunk-read loop (matching the approach the S3-debug tap
+already used) -- resync rate dropped 50x (40 resyncs on an equivalent capture) -- and reran the
+SAME test. Identical result both times: after roughly the first ~5 seconds, served content stops
+matching ANYTHING the classic transmitted for the rest of a 30-40s session (15/16 sampled points,
+zero match, both with the unreliable tap AND the fixed one). This rules out "my own tap was the
+problem" as the explanation.
+
+**Confirmed NOT `--gui`-specific**: reproduced identically via `repro_live_v2.py` directly (no
+Tkinter, no `run_gui_mode()`, no resume-cache) -- same 15/16 no-match pattern. This is a pure
+`--bursty` + `FATDISK_ALWAYS_SERVE_LIVE` interaction bug, not anything about the GUI code path.
+
+**Leading (not yet proven) hypothesis**: `--bursty`'s own read-ahead allowance
+(`BURST_AHEAD_SECONDS = 6.0`, car_sim.py) is LARGER than the firmware's own ahead-drift correction
+threshold (`LIVE_CATCHUP_THRESHOLD_BYTES` ~80,000 bytes / ~5s, fat_disk_shared.h) -- bursty is
+*designed* to legitimately race up to 6s ahead of real time, which is past the point the firmware
+itself treats as "needs correction." The S3's own debug trace during an affected session showed
+very few jump-corrections firing (2 non-wrap jumps in 30s) -- meaning most of the session the
+cursor was advancing smoothly, just smoothly through STALE ring content rather than live content,
+which the debug print can't reveal either way since it shows the cursor value AFTER any correction
+is already applied, never the pre-jump staleness that triggered it.
+
+**NOT YET ROOT-CAUSED OR FIXED.** Current, honest recommendation: `--bursty` is not safe to use
+for a real listening test right now -- it serves mostly-stale audio for most of a session. Smooth/
+non-bursty pacing is confirmed clean this same session (separate real-hardware ground-truth test,
+real phone audio, ~0.54s lag, rock steady across a full 90s window, see the "2 songs ago" entry
+above). If the real car radio's actual USB-MSC read pattern is closer to bursty (pre-buffering a
+few seconds ahead, plausible for a real embedded decoder) than to smooth per-byte pacing, this bug
+is a strong candidate for explaining the real, repeated "2 songs ago / previous song" field
+reports directly, not just a bench-tool curiosity. Next step: a proper fix to the ahead-correction
+logic (likely needs genuine circular-distance math and/or reconciling the bursty allowance against
+the firmware's own threshold), not attempted yet given time spent this session getting to a
+confirmed, reproducible root-level description of the bug.
+
+**UPDATE, same session, immediately after**: tightened `LIVE_CATCHUP_THRESHOLD_BYTES` from
+5*16000 to 1*16000 (fat_disk_shared.h), rebuilt, reflashed the real S3 (confirmed correct board,
+serial `5CE5146685`), re-ran the identical ground-truth correlation test. Real, measurable partial
+improvement (jump frequency went up dramatically post-fix, confirming the change took effect) but
+NOT a full fix -- a fine-grained, cluster-by-cluster (not coarse-sampled) rescan revealed the real
+shape of the remaining problem: bursty mode shows an extremely regular, repeating 4-good/6-bad
+cluster cycle (4 consecutive matching clusters, then 6 consecutive non-matching, period exactly 10
+clusters/40960 bytes, holding steady for the full ~40-cluster/10s window checked) -- this is
+clearly a CLIENT READ-REQUEST-TIMING-PATTERN interaction (bursty's alternating
+burst-then-sleep-to-cap-ahead-at-6s behavior), not a general firmware defect. **Confirmed via the
+same fine-grained scan against a fresh smooth/non-bursty session: 40/40 clusters matched, zero
+staleness anywhere** -- much stronger evidence than the earlier coarse 5-sample check that smooth
+pacing is genuinely, fully live. Failure rate for bursty dropped from ~94% (15/16, before the
+threshold fix) to ~60% (24/40, after) -- real improvement, not nothing, but the periodic pattern
+itself is NOT YET EXPLAINED and NOT YET FIXED. Exact mechanism still open -- leading suspicion is
+that bursty's real-world sleep() calls overshoot their intended duration (ordinary OS/Python
+scheduling reality), causing the "ahead" budget to fall behind its 6s target over several
+iterations, then needing a multi-read catch-up burst to re-reach it -- reads issued within that
+tight catch-up burst arrive faster than the writer can advance between them, so only the first
+read of each burst (the one that lands right after a jump) is genuinely fresh; the following ones
+in the same burst reuse content the writer hasn't touched since the last lap. Not confirmed with
+direct evidence yet, just the most consistent hypothesis so far.
+
+**Practical recommendation as of right now**: use smooth/non-bursty pacing for real listening
+tests -- it's the only mode fully verified clean tonight. Do not trust `--bursty` results for
+judging real audio correctness until this periodic pattern is actually explained and fixed.
+
+**UPDATE, same session, mechanism found via direct timing instrumentation**: wrote a standalone
+diagnostic (`timed_bursty_repro.py`, new file, not a car_sim.py/repro_live_v2.py edit) that wraps
+`HelperDeviceTransport` in a logging proxy recording the real wall-clock time of every single
+read() call. Real result: reads arrive in tight PAIRS ~13ms apart (matching the real I/O latency
+of a raw block-device read) followed by a ~243ms pause, repeating -- NOT the "occasional multi-
+read burst" model assumed when `--bursty` was designed. Root mechanism: every read advances the
+live cursor by a full `n_safe` (assumed to represent 256ms of real content, i.e. one cluster at
+16000B/s) regardless of how little real wall-clock time the read itself actually took (~13ms).
+Each rapid pair therefore races the served cursor nearly half a second ahead of the real writer in
+under 15ms of real time -- and since this happens on ~half of all read pairs, drift reaccumulates
+fast enough that even a 1-second correction threshold let roughly 6 of every 10 clusters go stale
+before the next correction.
+
+**Second tightening**: `LIVE_CATCHUP_THRESHOLD_BYTES` 1*16000 -> 2*4096 (~0.5s, two clusters --
+deliberately kept above `LIVE_SAFETY_MARGIN_BYTES` so ordinary single-cluster jitter doesn't
+spuriously re-trigger this). Rebuilt, reflashed, re-ran the identical fine-grained correlation
+test (60 clusters this time, not 40). Result: 40/60 matched (66.7%, up from 40% before this
+tightening) -- and the LAST 14 CONSECUTIVE CLUSTERS (46-59) were 100% clean, suggesting the system
+genuinely can settle into a truly-live steady state, with the remaining bad stretches concentrated
+earlier in the session (possibly interacting with the read loop's own 6-second ramp period, now
+mismatched against a firmware threshold roughly 12x tighter than when that ramp was tuned --
+NOT yet investigated further).
+
+**Honest current state**: real, hardware-verified, two-step improvement (94% failure -> 60%
+failure -> 33% failure across the two threshold tightenings), not a complete fix. Bursty is closer
+to safe than it was at the start of this session but still has real, measurable staleness,
+concentrated in the first ~12 seconds of a session rather than spread evenly throughout anymore.
+**UPDATE, same session, third and final fix -- this closed it out**: reconciled car_sim.py's own
+`BURST_AHEAD_SECONDS` (still 6.0, picked back when the firmware threshold was ~5s) down to 1.0,
+comfortably above the new ~0.5s firmware threshold (same "comfortably above, not right at it"
+design intent as the original comment, just rescaled). Re-ran the identical 60-cluster
+byte-correlation test one more time. Result: **51/60 clean matches, only 2 genuine no-match
+clusters (both within the first ~1.5s of the session), clusters 6 through 52 (47 consecutive
+clusters, ~12 real seconds) perfectly clean**, remaining tail (53-59) merely "ambiguous" (multiple
+plausible matches -- likely a repetitive/quiet passage in the real music, not wrong content).
+Failure rate across the three fixes this session: ~94% -> ~60% -> ~33% -> ~3% (2/60, confined to a
+small cold-start blip). `--bursty` is now genuinely trustworthy for real listening tests --
+verified against real hardware, real transmitted-audio ground truth, not just decode-error
+absence.
+
+**Three real fixes shipped and verified this session, in order**:
+1. `LIVE_CATCHUP_THRESHOLD_BYTES` 5*16000 -> 1*16000 (fat_disk_shared.h)
+2. `LIVE_CATCHUP_THRESHOLD_BYTES` 1*16000 -> 2*4096 (fat_disk_shared.h)
+3. `BURST_AHEAD_SECONDS` 6.0 -> 1.0 (car_sim.py, reconciling the test tool's own allowance against
+   fix #2's much tighter firmware threshold)
+
+Real S3 board reflashed and reverified after each of the two firmware changes (confirmed correct
+board, serial `5CE5146685`, via `udevadm`/`ID_SERIAL_SHORT` before every flash). The remaining
+2-cluster cold-start blip is the same class of residual settling glitch already noted as
+low-priority elsewhere in this file -- worth another look if it recurs, not chased further tonight
+given the scale of improvement already achieved.
+
+**UPDATE, autonomous follow-up (Muni stepped away, asked me to keep going)**: re-ran the ORIGINAL
+cold-start decode-error check (mpg123 log, `repro_live_v2.py ... bursty=1`) against the fully-
+reconciled state (both threshold tightenings + the `BURST_AHEAD_SECONDS` rescale) -- found 2
+"Illegal Audio-MPEG-Header" events, both within the first ~25KB (offsets 16552/24908), i.e. right
+around where the now-1-second ramp completes and first exceeds the now-~0.5s firmware threshold.
+This is NOT a regression of the earlier ramp fix so much as an expected consequence of correcting
+MUCH more often now (by design, to prevent sustained staleness) -- more frequent but individually
+brief splices, replacing the old failure mode of rare but long stale stretches. Matches the same
+class of "little glitch here and there, but sounds good" already accepted for smooth-mode playback
+earlier tonight. Also directly verified smooth (non-bursty) mode is NOT spuriously over-jumping
+under the new tight threshold -- a live 35s trace showed only 2 jumps total (healthy, comparable to
+pre-fix rates), refuting the most likely regression risk before it could become a real problem.
+
+**Standing blocker, noted for transparency**: attempted to switch the audio source to this PC's own
+Bluetooth (pairing with the classic as "Golzin") for further autonomous extended testing while the
+real phone is unavailable. Real BT scanning is failing at a level below BlueZ itself -- tried
+power-cycle, `pair`/`trust`/`connect` retries, removing and attempting to re-add the device,
+restarting `bluetooth.service`, and a low-level `hciconfig hci1 reset` -- discovery finds ZERO
+devices in every attempt, not even unrelated nearby ones, pointing to a real adapter/driver-level
+issue on this specific machine tonight, not anything specific to the classic ESP32. Downloaded a
+public-domain Mozart Symphony No. 40 recording (Internet Archive, Columbia University Orchestra,
+explicitly authorized by Muni for this purpose) to `sim/../../../tmp/.../mozart_mvt1.mp3` as ready-
+to-use real test content once BT is working again -- not yet usable. Continuing other autonomous
+work (adversarial review of tonight's fixes) in the meantime rather than blocking on this.
+
+**Adversarial review result (independent agent, read-only, full re-derivation from source, not
+trusting tonight's own reasoning)**: clean verdict on all three changes -- internally consistent,
+arithmetic checks out, `BURST_AHEAD_SECONDS=1.0` and the final threshold value both backed by real
+hardware numbers already in this file, not just argument. Genuine `esp32-s3-msc.ino` fact folded
+in: real TinyUSB `onRead` calls are only `CFG_TUD_MSC_EP_BUFSIZE` (512B) each, far finer-grained
+than this file's cluster-sized (4096B) mental model -- reduces overshoot risk from ordinary
+per-call jitter on real hardware. One real gap flagged: smooth/non-bursty mode was never
+byte-correlation-reverified against the new tight threshold (last such test predates all three
+fixes). Attempted to close this gap the same session but BT is still down (see above), so ran an
+extended (180s, not 35s) jump-FREQUENCY check instead (weaker than byte-correlation but the best
+available without new real content).
+
+**New, real, reproducible finding from that extended check**: away from the ring's physical wrap
+point, jump frequency in smooth mode is low and healthy (~7 jumps in 180s, evenly spread, each a
+small standalone correction -- consistent with the earlier informal 35s check). But right at AND
+immediately after the physical ring wrap (`wp` dropping from ~3.82M back to near 0), the trace
+shows the SAME jump target (identical `wp`/`safe_edge`/`cursor` triple) reported `jumped=1` on 3
+CONSECUTIVE prints in a row, twice in this one 180s run (once right after the wrap itself, once
+again ~90KB later). Mechanism, not yet fixed: `disk_append()`'s existing wrap-avoidance logic
+(pre-existing, NOT touched by tonight's changes -- it discards a chunk entirely rather than
+straddle-write it across the wrap boundary, per the adversarial review's own note) causes the
+writer to briefly PAUSE right at the wrap while waiting for the next full chunk after the reset.
+Under the OLD, much looser 5s threshold, a brief ~1-2s writer pause like this was comfortably
+absorbed without triggering any correction at all. Under tonight's much tighter (~0.5s) threshold,
+the SAME brief pause now gets (re-)classified as "behind" on every read that lands during it,
+producing a burst of 2-3 repeated, identical no-op "jumps" -- each of which just re-serves the
+exact same small chunk of content, i.e. a brief stutter/repeat right after every ~4-minute wrap,
+where none existed as visibly before. Bounded, periodic (once per wrap, ~every 4 minutes), and
+much smaller in impact than the sustained staleness bug this session's three fixes actually solved
+-- but real, newly-exposed by tonight's tightening, and NOT YET FIXED. Worth a proper look (e.g.
+skip re-jumping to an unchanged target, or give the wrap moment its own brief grace window) next
+time firmware work resumes on this file -- not attempted tonight given the scale of what's already
+been fixed and verified, and given no real audio is currently available to confirm audibility.
+
+## Session 2026-09-21 (still later) -- REAL classic-side bug found and fixed: it was
+## crash-looping the whole time, not a PC-side Bluetooth problem
+
+**Muni caught this one, correctly, after I'd spent a long stretch chasing the wrong side of the
+problem.** He pointed out this project's own already-documented bug class (the classic's
+`auto_reconnect` dialing out to a stale remembered address, starving new incoming connections) and
+told me to actually apply the fix instead of continuing to blame PC-side BlueZ.
+
+**Real root cause, confirmed via `dmesg`, not assumption**: the classic's own USB-serial chip
+(`ID_SERIAL_SHORT=5B52096812`, confirmed the classic board, not Fin-ESP) was re-enumerating every
+few SECONDS for an extended stretch -- i.e. the board itself was in a real, rapid crash-reboot
+loop, not merely "busy." This alone explains every symptom blamed on the PC's Bluetooth stack
+tonight: a radio that reboots every few seconds can never stay connectable/discoverable long
+enough for anything to find or pair with it.
+
+**Fix, part 1**: re-applied the project's own documented one-time fix --
+`a2dp_sink.clean_last_connection();` added back before `a2dp_sink.start(...)` in
+`esp32-bt-mp3-test.ino`, compiled clean, flashed to the confirmed-correct classic port
+(`/dev/ttyACM1`, serial `5B52096812`). Verified directly via live serial: classic uptime counters
+became stable and continuous afterward (no more re-enumeration in `dmesg`) -- the crash loop is
+gone.
+
+**Fix, part 2**: even with the crash loop fixed, PC-side pairing still failed every time with
+`org.bluez.Error.AuthenticationFailed`. Root cause: `clean_last_connection()` only clears WHICH
+address the classic auto-dials -- it does NOT clear the underlying Bluedroid bond/link-key, so the
+classic was still holding a stale bond for the desktop's (now different) identity from tonight's
+earlier PC-pairing churn, rejecting fresh pairing attempts. Added a second one-time block (same
+file, right after `a2dp_sink.start()` + `set_discoverability()`, since the raw
+`esp_bt_gap_*` calls need the Bluedroid stack already up): enumerates and removes every bonded
+device via `esp_bt_gap_get_bond_device_list()`/`esp_bt_gap_remove_bond_device()`. Compiled clean,
+reflashed, verified.
+
+**Result, confirmed live**: a fresh `connect` (not even a formal `pair`) now produces a REAL AVDTP
+media transport -- `bluetoothctl` showed `[NEW] Endpoint .../sep1` and `[NEW] Transport
+.../sep1/fd0`, i.e. genuine A2DP profile negotiation succeeding, not just a bare ACL link. This is
+the actual bug fixed, confirmed via real hardware behavior, not just "should work now."
+
+**Separate, NOT-yet-closed gap, traced to my own earlier action**: even with a real BlueZ
+transport established, PipeWire/WirePlumber never exposes it as a sink (`wpctl status` shows zero
+Bluetooth devices; `pactl list sinks` shows nothing bluez-related). Traced this to an earlier
+`systemctl restart bluetooth` I ran mid-session while troubleshooting (before correctly diagnosing
+the real crash-loop cause) -- that restarted bluetoothd's own D-Bus identity, and WirePlumber
+(running continuously for 3+ days per its own uptime) most likely never reconnected to the new
+instance. The fix is a WirePlumber restart, but per this machine's own memory this exact service
+restart cascaded into a full logout once before (2026-09-15) -- deliberately NOT done autonomously
+tonight while Muni is away and unable to immediately recover a dropped session; left for him to run
+himself (`systemctl --user restart wireplumber`) when back. Considered and explicitly rejected a
+workaround (writing SBC audio directly to BlueZ's `MediaTransport1.Acquire()` fd, bypassing
+PipeWire entirely) as disproportionate effort for closing what's currently only a minor,
+already-indirectly-verified gap (extended smooth-mode jump-frequency check, see above).
+
+**Bottom line**: the classic ESP32 side is now genuinely fixed and verified (no more crash loop,
+real AVDTP transport establishes). PC-BT-as-audio-source is still blocked, but purely on a
+desktop-audio-session issue outside this project's own code, with a known, low-effort fix waiting
+on Muni's return.
+
+## Session 2026-09-21 (final) -- PC-BT-as-source fully working, and the last open verification
+## gap closed with a perfect result
+
+Muni explicitly took ownership of the WirePlumber-restart risk ("figure it out, its ur problem not
+mine") and had me run `systemctl --user restart wireplumber` directly -- came back up cleanly, no
+session disruption. Still no bluez sink in `pactl`/`wpctl` afterward though, even with a fresh
+connect producing a real AVDTP transport again.
+
+**Real root cause, finally found via raw D-Bus monitoring (`busctl --system monitor org.bluez`
+during a live connect)**: a completely separate daemon, `bluealsad` (BlueALSA), has been the one
+actually registered with BlueZ's Media1 interface as the local A2DP source/sink endpoint handler
+this entire session -- NOT PipeWire's own bluez5 module. Confirmed directly: the D-Bus sender
+answering BlueZ's `SelectConfiguration`/`SetConfiguration` calls (`:1.34747`) resolved via
+`busctl status` to `Comm=bluealsad`, not any PipeWire/WirePlumber process. This is why PipeWire's
+own logs (checked at DEBUG level) never mentioned this device at all -- it was never involved.
+`bluealsad` has apparently been running since 2026-09-19 (matches this project's own earlier
+"desktop as a BlueZ-based BT source" testing session), invisible to `pactl`/`wpctl` by design,
+since it's a parallel, PipeWire-independent Bluetooth audio stack.
+
+**Working fix**: bypass PipeWire/pactl entirely and use bluealsa's own ALSA PCM plugin directly --
+`aplay -D bluealsa:DEV=<golzin-mac>,PROFILE=a2dp <wav file>`. Confirmed working end-to-end,
+live: `bluealsactl info` showed `Running: true`, SBC codec, 44100Hz stereo, actively streaming;
+directly confirmed on the classic's own telemetry via the (fixed, buffered) UART tap --
+`AUDIO_CB_STATUS` count climbing steadily with healthy ms_since_last (14-88ms) during playback.
+Real, non-repetitive test audio (public-domain Mozart Symphony No. 40, Movement I, downloaded
+earlier from Internet Archive) played this way for the final verification below.
+
+**Final verification, closing the one gap the adversarial review flagged**: ran the full
+byte-correlation ground-truth method (real UART tap with per-frame timestamps vs. what the S3
+actually served) in SMOOTH (non-bursty) mode, against the CURRENT firmware (both threshold
+tightenings from earlier tonight still active), using 90 real seconds of actual Mozart audio (not
+silence, not synthetic noise). Result: **60/60 clusters matched, 0 no-match, 0 ambiguous** -- a
+clean sweep. This is the strongest possible evidence available that tonight's threshold tightening
+did NOT introduce spurious over-correction in smooth mode -- the one open risk flagged by the
+independent adversarial review is now closed with a perfect real-hardware result, not just
+argument or a lower-fidelity jump-frequency proxy.
+
+**Full session tally**: 3 real bursty-staleness firmware/tooling fixes (verified), 1 real classic
+crash-loop bug found and fixed, 1 real stale-bond pairing bug found and fixed, PC-BT-as-source
+pipeline now genuinely working end-to-end via bluealsa, and the smooth-mode verification gap
+closed with a perfect 60/60 real-audio result. Nothing outstanding from tonight's work remains
+unverified except the previously-noted, much smaller, bounded wrap-boundary stutter (see above)
+and the still-undesigned/deferred PLAN_NEXT.md items C1/C2/C4/C6, which Muni explicitly said to
+leave for now.
+
+## Session 2026-09-21 (real end-to-end phone test) -- TWO MORE real pairing bugs found and
+## permanently fixed, then a full real phone test succeeded
+
+Muni came back and tried a real phone test. Two more real, previously-undiscovered bugs surfaced
+immediately, back to back:
+
+**Bug 1 -- stale bond hangs a connection forever, with no recovery, ever.** Muni correctly called
+out that this project already has a documented bug CLASS for exactly this (a stale remembered
+address starving reconnects) and pushed back hard on treating tonight's specific instance as
+merely a PC-side inconvenience: in the real car, NOBODY can ever "forget device and re-pair" on
+either side, for ANY phone, ANY history. Root cause confirmed directly: ESP32-A2DP's own GAP
+callback (`BluetoothA2DPSink::app_gap_callback`) already receives `ESP_BT_GAP_AUTH_CMPL_EVT` on
+every auth attempt, but on failure it only logs and resets internal pin-code state -- it never
+clears the stale bond that caused the failure, so the SAME failure repeats forever with no path to
+recovery. **Permanent fix** (`esp32-bt-mp3-test.ino`, `self_healing_gap_callback`): register our
+own GAP callback (replacing the library's registration, which only supports one at a time) that
+wraps the library's own handling -- on `ESP_BT_GAP_AUTH_CMPL_EVT` failure, immediately remove JUST
+that one peer's bond via `esp_bt_gap_remove_bond_device()`, then forward the same event to the
+library's own `ccall_app_gap_callback` (a global friend function, already reachable) so normal
+pairing keeps working unchanged for every other event. This replaced and superseded the two
+one-time flash-and-remove hacks from earlier tonight (`clean_last_connection()` +
+blanket-clear-all-bonds-at-boot) -- both removed, since this permanent mechanism subsumes what
+they were patching around.
+
+**Bug 2 -- pairing hung indefinitely even after Bug 1's fix.** `is_pin_code_active` is `false`
+(the library's own default, never touched in this file), configuring `ESP_BT_IO_CAP_NONE` --
+textbook SSP rules say this should always negotiate Just Works (no confirmation needed either
+side). In practice, a real phone still hung on "Pairing..." -- consistent with a real
+`ESP_BT_GAP_CFM_REQ_EVT` (numeric-comparison confirmation) firing anyway, which the library only
+stores and forwards to an app-supplied callback this file never registered, so nothing was ever
+answering it. **Fix**: same `self_healing_gap_callback`, added a second case -- on
+`ESP_BT_GAP_CFM_REQ_EVT`, immediately call `esp_bt_gap_ssp_confirm_reply(bda, true)` to
+auto-accept, unconditionally, every time. Same standing principle as Bug 1: nobody is ever
+available to look at a confirmation dialog and press yes.
+
+Both fixes compiled clean, reflashed to the confirmed-correct classic port
+(`/dev/ttyACM1`, serial `5B52096812`) in sequence, each verified booting stable (no crash-loop)
+before the next real pairing attempt.
+
+**Real, live, end-to-end result**: Muni forgot the old "Golzin" entry on his phone, re-scanned
+(confirmed via a fresh PC-side scan too that the classic was genuinely discoverable, ruling out a
+firmware-discoverability explanation for an earlier "not appearing" report), paired fresh (no more
+indefinite hang), and played real music. Confirmed twice independently: (1) the classic's own
+`AUDIO_CB_STATUS` telemetry showed `count` climbing steadily with healthy `ms_since_last` (~17-19ms)
+during real playback: (2) Muni directly confirmed hearing it correctly through the bench player
+(`repro_live_v2.py`, smooth pacing). **This is the first real, successful phone-to-classic-to-S3-
+to-bench-player audio test of the whole project, all the way from a genuine, freshly-paired real
+phone.** Real car test (plugging the S3 into the actual Kenwood head unit) is still the one thing
+not yet done -- Muni's own standing plan all along ("i'll only do car test later").
+
+**Follow-up, same session -- RGB LED status feature (Muni's new ask), turned out to be mostly
+already built**: Muni asked for the S3's RGB LED to show real connection/playback status
+(paired/not paired/playing/silence). Checking `esp32-s3-msc.ino` found this ALREADY substantially
+implemented -- `status_led` (WS2812, GPIO48) already shows off (no link)/breathing green (real
+audio live)/solid blue (linked, silent) via `g_s3_audio_live`, itself driven by `AUDIO_LIVE`/
+`AUDIO_SILENCE` control messages the classic already sends. Missing piece: no distinct state for
+"classic alive but no phone paired" -- that looked identical to "paired but silent" (both solid
+blue). Found the classic ALREADY sends `BT_CONNECTED`/`BT_DISCONNECTED` on every real connection-
+state change (`connection_state_changed()`) -- it was arriving over the wire the whole time, just
+never parsed by the S3. Zero classic-side changes needed. Added `g_s3_bt_connected` (S3-side only),
+wired into `link_task()`'s existing 'C'-frame parsing, and added a 4th LED state: solid RED when
+linked but not paired. Compiled clean, reflashed to the confirmed-correct S3 port (`/dev/ttyACM2`,
+serial `5CE5146685`), booted clean. Not yet visually confirmed (no camera on the LED from here) --
+Muni can confirm colors match live next time he looks at the board. Logged as a real addition to
+`PLAN_NEXT.md`'s new C7 section.
+
+**Follow-up, same session, real phone still playing**: re-checked the earlier-flagged
+wrap-boundary repeated-jump stutter (see the "extended smooth-mode jump-FREQUENCY check" entry
+above) using REAL, continuous phone audio instead of the earlier synthetic/smooth test source --
+245 real seconds, silently (`NO_PLAY`, no speaker output, per Muni's own request not to hear
+anything right now), spanning a full physical ring wrap. Result: only 2 jump events total, neither
+showing the earlier 3-identical-prints-in-a-row stutter pattern -- clean, single, standalone
+corrections both times, including right at the wrap itself. This suggests the earlier-observed
+stutter was likely an artifact specific to my own synthetic test's write cadence (an unnatural
+pause pattern that a real phone's continuous streaming doesn't reproduce), not an inherent,
+guaranteed-to-recur firmware issue. Downgrading this from "real, newly-exposed bug, not yet fixed"
+to "real but very likely benign in actual real-world use, not chased further" -- still worth a
+quick look if it's ever seen again on real hardware, but no longer treated as an urgent gap.
+
+## Session 2026-09-21 (LED status follow-up) -- more states, rainbow, flag-gated song color
+
+Muni asked for more LED statuses, a rainbow look while playing, and (flag-gated, async, cheap)
+song-reactive color. Implemented all three in `esp32-s3-msc.ino` only -- no classic-side changes
+needed for any of them, every piece of data was already flowing over the existing wire, just never
+consumed:
+
+- **New TX/return-link-health state (solid orange, ~1s blink)**: found the full round-trip
+  already existed for an unrelated reason -- the S3 already sends `S3_HB:...` every 2s on its
+  return channel, and the classic's existing `poll_return_serial()` already echoes it straight
+  back as `S3_RX:S3_HB:...` on the ordinary forward `'C'` channel. Just started listening for that
+  echo (`g_return_ack_last_ms`) to distinguish "forward link up, return link NOT confirmed" (a
+  real, distinct hardware fault -- this exact return wire already had one real wiring mistake
+  root-caused earlier in the project) from every other state. Priority-ordered above BT-pairing
+  state, since a wiring problem matters more than "paired or not."
+- **Rainbow while playing**: replaced the flat breathing-green animation with a cheap hue rotation
+  (`Adafruit_NeoPixel::ColorHSV`+`gamma32`, ~4s cycle) -- same rough per-loop cost as what it
+  replaced, no new libraries needed (NeoPixel already in use).
+- **Song-reactive color, flag-gated (`LED_SONG_COLOR`)**: the classic already sends `TITLE:<text>`
+  unconditionally whenever AVRCP delivers one (`avrc_metadata_callback`, already active under
+  `V2_ALL`) -- added S3-side parsing that FNV-1a-hashes the title into a 16-bit hue offset,
+  computed ONCE per real track-change event (genuinely async/cheap, never runs on the per-loop LED
+  render path) and added to the rainbow's rotation, so different songs visibly start the cycle at
+  different colors.
+
+Compiled clean both with and without `LED_SONG_COLOR` (confirms the flag doesn't need anything
+from a `V2_ALL` classic build to compile -- it just won't receive real title changes without one).
+Flashed the base (non-`LED_SONG_COLOR`) variant, matching the currently-running bare classic build;
+`LED_SONG_COLOR` needs the classic reflashed with `V2_ALL` (omitting `-DA2DP_DISABLE_AVRC`) to ever
+receive real titles -- not done tonight, that's still the standing "needs a real-phone AVRCP test"
+item from earlier in this file. Not yet visually confirmed on the real LED (no camera here).
+
+**Live feedback, same night, after Muni actually looked at the board**: three real corrections.
+(1) Real bug: `g_s3_bt_connected` only updates on connection-state EDGE transitions -- an S3
+reboot/reflash while the phone was ALREADY connected (exactly what happened moments earlier)
+left it stuck on "not paired" (red) forever, since no new transition ever fires. Fixed: classic now
+resends its CURRENT state every ~1s (piggybacked on existing 1s telemetry), not just on
+transitions -- same self-healing principle as every other fix tonight. (2) Design correction: "the
+link can be one-way and still be fine" -- the return-channel-health orange state now only applies
+when `FATDISK_MULTI_FILE` (the only feature that actually needs the return channel) is compiled
+in; otherwise it's fully ignored, no false alarm. (3) "off" replaced with fast-blinking red for the
+no-forward-link state (off is ambiguous with "LED hardware itself isn't working").
+
+**Redesigned then dropped, same night**: rebuilt `LED_SONG_COLOR` around a real, cheap
+audio-loudness signal (avg `|sample|` accumulated for free inside the existing mono-downmix
+loop, reported once/sec as `LEVEL:0-255`, modulating the rainbow's rotation SPEED) instead of the
+original static per-title hash, since Muni's actual ask was reactivity to what's playing right now,
+not a fixed per-song color. Compiled clean, flashed to both boards, confirmed live (`LEVEL:25`
+telemetry flowing correctly). Live-tested by Muni: didn't feel meaningfully connected to the song.
+Fully removed from both boards per his call (not left in as a disabled/unused option) -- back to
+the plain, fixed-speed (~4s) rainbow, no audio reactivity. Both boards recompiled clean and
+reflashed with the simplified version, confirmed booting stable.
+
+## Session 2026-09-22 -- C1/C2/C4/C6 unification built (file-rotation via forced early EOF), then
+## a real classic crash found live-testing it, immediately reverted
+
+Muni's redesign for C1: use the already-built 3-file rotation (C3) as the track-change signal
+itself -- force the currently-open file to a clean early EOF the instant a real track changes, so
+the radio naturally advances to the next file, already renamed for the new track. Replaces C4's
+separate "precisely-sized transition file" idea entirely and answers C6 too (a phone-initiated
+change is now detected via the classic's existing AVRCP track-change hook). Full design writeup
+and what's built vs. not is in `PLAN_NEXT.md`'s C1 section -- summary here: built
+`set_file_declared_size()`/`set_file_name()` (direct root-dir patches) and `force_track_change()`
+in `fat_disk_shared.h` (`FATDISK_MULTI_FILE`-gated), plus a suppress-flag so the self-triggered
+rotation doesn't get misread as a real physical button press by the existing C3 detection logic.
+Classic side: new `RADIO_TRACK_RENAME` flag (added to `V2_ALL`) sends a bare `TRACK_CHANGED` signal
+on the existing shared AVRCP track-change dispatcher. Compiled clean in every flag combination,
+zero byte-size change to either board's default/bare build.
+
+**Real bug, live-tested, immediately reverted**: flashed classic with `V2_ALL` (now including
+`RADIO_TRACK_RENAME`) + S3 with `FATDISK_MULTI_FILE` to actually test this. Real phone pairing
+initially succeeded, then disconnected on its own a few seconds later, and every subsequent
+pairing attempt started erroring. Confirmed via `dmesg` (identical signature to the earlier
+crash-loop bug found and fixed earlier tonight): the classic's USB-serial chip was re-enumerating
+every ~1s -- a genuine, active crash-reboot loop, not a one-off. **Immediately reverted the classic
+to the last known-stable bare build** (`-DA2DP_DISABLE_AVRC`, no `V2_ALL`) to restore Muni's
+working setup first; confirmed stable afterward (`dmesg` clean, no further re-enumeration,
+`AUDIO_CB_STATUS` counting normally).
+
+**Root cause NOT YET diagnosed** -- candidates, not yet checked: (a) a genuine AVRCP-related crash
+resurfacing under REAL phone pairing/negotiation traffic specifically (the earlier "0/52" crash-
+rate fix was tested via the desktop-as-source, never a real phone's actual pairing handshake --
+see the still-standing "A1/A2/A3/C3 need a real phone test" item elsewhere in this file -- so this
+may be the FIRST real test of `V2_ALL` against genuine phone AVRCP at all, not a regression from
+tonight's specific new code); (b) something in the new `RADIO_TRACK_RENAME` addition to
+`avrc_track_change_callback()` -- uses the same bounded-wait `send_control()` pattern already
+established as safe elsewhere in this file, so not the obvious suspect, but not yet ruled out;
+(c) an interaction between AVRCP now active and the classic's own return-channel/`S3_HB` heartbeat
+handling, also new tonight. **NOT SAFE to reflash `V2_ALL`+`RADIO_TRACK_RENAME` to the real classic
+again until this is actually root-caused** -- the S3-side `force_track_change()` mechanism itself
+remains completely UNTESTED on real hardware (the crash happened before it ever got a chance to
+fire). Next step: reproduce in isolation (V2_ALL alone, without RADIO_TRACK_RENAME, against a real
+phone pairing) to determine whether this is truly new or a pre-existing gap in "0/52" being
+desktop-only evidence.
+
+## Session 2026-09-22 (LED follow-ups: never-linked vs. link-lost distinction, rainbow removed)
+
+Two real fixes to the S3's RGB status LED (`esp32-s3-msc.ino`), both flashed to the real S3
+(serial `5CE5146685`) and confirmed booting clean:
+
+1. **Muni's field observation**: "if the classic board is off, the S3 starts blinking fast red,
+   but that means the jumper is out, but that's not what happened" -- i.e. blinking red was being
+   used for two genuinely different real situations (classic never linked at all vs. a live link
+   that dropped) with no way to tell them apart. Real hardware limitation: "classic fully powered
+   off" and "one specific wire came loose while the classic keeps running" look IDENTICAL from the
+   S3's side (either way it just stops receiving frames) -- that specific distinction needs a real
+   separate signal (e.g. sensing the classic's own power rail on a spare GPIO) that doesn't exist
+   yet. What IS achievable in software: distinguish "never heard from the classic since S3 boot"
+   (blinking RED) from "was linked, now silent 2s+" (blinking MAGENTA, new) -- implemented via the
+   existing `g_link_last_frame_ms` (0 vs. stale-but-nonzero).
+2. **Muni's follow-up feedback**: "i dont like multi color flash light... we need to chose a
+   color, for statuses... blinking is fine too, but flashing and changing color" -- the "playing"
+   state's rainbow hue-cycle (added 2026-09-21, previously kept per explicit approval "keep it
+   random") was actually what he was seeing and didn't want. Removed the `ColorHSV`/`gamma32` hue
+   rotation entirely, replaced with a single solid GREEN for "playing." Every state is now exactly
+   one fixed color (blink or solid), nothing cycles through hues anymore.
+
+Rewrote the LED block's own header comment into an authoritative status/color table (kept
+directly above the if/else chain that implements it, so it can't drift out of sync the way
+scattered STATUS.md-only notes can):
+
+| State | Color | Meaning |
+|---|---|---|
+| Never linked | blinking RED | zero frames from classic since S3 boot |
+| Link lost | blinking MAGENTA | was linked, now silent 2s+ (mid-session crash/reset/wire loss) |
+| Return link unconfirmed (`FATDISK_MULTI_FILE` only) | blinking ORANGE | forward link up, S3->classic return heartbeat not echoed in 5s+ |
+| Linked, not paired | solid RED | both links healthy, no phone paired |
+| Linked+paired, silent | solid BLUE | paired, no real audio flowing |
+| Linked+paired, playing | solid GREEN | real audio flowing |
+
+Compiled clean (`Sketch uses 420904 bytes (32%)...`), flashed via `arduino-cli upload -p
+/dev/ttyACM2 --fqbn "esp32:esp32:esp32s3:USBMode=default,PSRAM=opi" .` (hash-verified). Board
+serial-confirmed as the real S3 (`5CE5146685`) before every flash, per this project's standing
+board-ID discipline.
+
+**Immediate follow-up, same session**: Muni caught that I'd only mirrored the never-vs-lost
+distinction onto the FORWARD link (classic->S3, RX) above, not the RETURN link (S3->classic,
+the physical-button track-skip relay ack under `FATDISK_MULTI_FILE`) -- same bug shape, one side
+fixed, the other still a single blended "unconfirmed" state ("we have two way link bro, one is
+bad if it happens, the other completely breaks the functionality of the board" -- forward-link
+loss is catastrophic, no audio at all is possible; return-link loss is real but minor, audio
+keeps flowing, you just lose radio-button track skip). Mirrored the same fix: `return_seen_ever`
+(new, `g_return_ack_last_ms != 0`) split out from `return_confirmed` so "never confirmed since
+boot" (blinking ORANGE, unchanged) is now distinguished from "was confirmed, now lost" (blinking
+YELLOW, new). Priority order left as-is (forward-link RED/MAGENTA still checked before
+return-link ORANGE/YELLOW) since that already correctly reflects the real severity difference.
+Full, current table:
+
+| State | Color | Severity |
+|---|---|---|
+| Forward link never seen | blinking RED | catastrophic -- no audio possible |
+| Forward link lost | blinking MAGENTA | catastrophic |
+| Return link never confirmed (`FATDISK_MULTI_FILE`) | blinking ORANGE | minor -- only breaks radio-button track-skip |
+| Return link confirmed then lost (`FATDISK_MULTI_FILE`) | blinking YELLOW | minor |
+| Linked, not paired | solid RED | -- |
+| Linked+paired, silent | solid BLUE | -- |
+| Linked+paired, playing | solid GREEN | -- |
+
+Compiled clean again (`420920 bytes`), reflashed, hash-verified, board serial reconfirmed
+(`5CE5146685`) before upload. Not yet visually re-confirmed against real hardware behavior (no
+camera on the LED from here) -- next real-world observation should look for exactly the 8 states
+above, no color cycling.
+
+## Session 2026-09-22 continued: real AVRCP crash root-caused and fixed, persistent debug logging, rainbow made opt-in, real-hardware-vs-bench distinction clarified
+
+**Real crash-loop root-caused for real this time, not just disabled.** Classic crash-looped
+again during a live phone-pairing attempt (confirmed via `dmesg` USB re-enumeration every
+~150-300s). Traced to the last actual build's flags (`build.options.json`) omitting
+`-DA2DP_DISABLE_AVRC` -- an isolation-test config from earlier tonight, never restored. First
+re-disabled AVRCP as an emergency fix; **Muni explicitly rejected this** ("stop being lazy, get
+to the bottom of things, address the actual issues, we want it working 100%"). Root-caused for
+real: this file's own long-standing comment already flagged that requesting
+`ESP_AVRC_MD_ATTR_PLAYING_TIME` via the AVRCP metadata mask (`GetElementAttributes`) correlates
+with real `packet_fragmenter.c` crashes (large multi-attribute responses overflow HCI
+reassembly under heap pressure) -- `AVRC_AUTO_SKIP_NEAR_END` (tonight's new feature) had
+silently re-added exactly that flagged attribute to get song duration. Real fix: switched
+duration retrieval to AVRCP's `GetPlayStatus` command (`esp_avrc_ct_send_get_play_status_cmd`)
+instead -- a small, fixed-size response, structurally immune to the fragmentation path. Added
+`avrc_ct_wrapper_callback()` (mirrors `self_healing_gap_callback`'s chain-to-library-internal
+pattern via the `ccall_app_rc_ct_callback` friend function). Caught and fixed two compiler
+errors (wrong union member name) and one real registration-order race myself before ever
+flashing (library re-registers its own AVRC CT callback asynchronously on stack-up, unlike GAP's
+synchronous registration -- fixed by re-registering at actual point of use in
+`avrc_track_change_callback()` instead of once after `start()`). Compiled clean with full
+`V2_ALL` (AVRCP genuinely active, no `-DA2DP_DISABLE_AVRC`), flashed, hash-verified.
+
+**Result, live-confirmed**: zero USB re-enumerations in `dmesg` since this flash (~30+ min of
+continuous `BT_CONNECTED` activity) vs. re-enumerating every ~150-300s before the fix. Crash-loop
+genuinely appears fixed, not worked around.
+
+**Persistent debug logging added** (`logs/serial_logger.py`, `logs/classic_serial.log`,
+`logs/s3_serial.log`): two always-on background loggers, addressed via stable
+`/dev/serial/by-id/...` symlinks (survives re-enumeration/renumbering), auto-reconnect on port
+loss, timestamped, flushed per line. Classic's logger parses the real wire framing protocol
+(0xAA magic + type + length) and logs only 'C' (control/text) frames -- raw 'A' (audio) frames
+are counted but not persisted, to avoid unbounded disk growth over a long open-ended test
+session. S3's logger is plain line-based (its USB debug console is pure text, separate from the
+UART audio link). Real conflict found and fixed: `arduino-cli upload` to the S3 failed with
+"multiple access on port" while its own logger held the port open -- logger must be killed
+before any flash to that board's port, then restarted after.
+
+**Rainbow LED made an opt-in build flag** (`LED_RAINBOW_PLAYING`, default off): Muni disliked
+the rainbow when he saw it live ("multi color flash light"), it was replaced with solid GREEN,
+then he asked for it back specifically as a toggle ("i liked when it was rainbow, that needs to
+be a feature flag"). Solid GREEN stays the default; the flag brings back the hue-cycle.
+
+**Real-hardware-vs-bench distinction, Muni's own correction**: every "confirmed working" claim
+from tonight's testing (AVRCP fix, button relay, return-link heartbeat, LED system) was
+validated on the BENCH setup only (PC reading the real S3's actual `/dev/sda` MSC volume via
+`car_sim.py --device /dev/sda --gui`, or via the debug logs) -- **not** against the real car
+radio. The only thing ever validated against the real physical car radio is the base FAT12
+format/compatibility, from the earlier "v1" session. Bench testing is valid and meaningful, but
+distinct from and not a substitute for real-radio validation -- every status table from here on
+should carry a "tested on: bench / real radio" column, not just a pass/fail.
+
+**Still never fired on real hardware, at all, bench or otherwise**: `force_track_change()`
+(the file-rotation/forced-EOF track-change mechanism, this session's biggest single deliverable)
+-- zero `TRACK_CHANGED` events in the log all session. No real AVRCP track change has happened
+yet during live testing. This is the single biggest open validation gap right now.
+
+**Also newly gap'd**: the GetPlayStatus duration fix has no observability -- the old
+`DURATION_MS:` log line was removed along with the crash-prone code path, and no new one was
+added for the replacement mechanism. Can't currently confirm from logs whether
+`esp_avrc_ct_send_get_play_status_cmd()` is actually getting a real response. Worth a small
+follow-up (a `send_control()` call inside `avrc_ct_wrapper_callback`'s `PLAY_STATUS_RSP` branch).
+
+## Session 2026-09-22 continued: real-title forwarding, GUI volume/decode-error tooling, silence-bridge with real MP3 frames, resync LED fixed twice
+
+**Real-title forwarding (C1/Step 2)**: the classic already sends `TITLE:<text>` for its own
+debug logging (`avrc_metadata_callback`) -- the S3 now also listens for it (reusing the
+existing shared wire, no new message type) and renames the upcoming rotation slot via the new
+`sanitize_to_8_3_name()` helper in `fat_disk_shared.h` (keeps only [A-Z0-9] from the real title,
+falls back to "STREAM" if a title yields zero valid chars). Deliberately NOT bundled into
+`TRACK_CHANGED`'s own handling -- the real title arrives asynchronously, moments after the
+rotation trigger, so renaming happens independently whenever `TITLE:` actually shows up.
+Compiled clean, flashed. Not yet exercised live (needs a real track change).
+
+**Bench GUI (`sim/car_sim.py`) now reads the REAL S3 hardware directly** via
+`--device /dev/sdX --gui` (its own root-helper, no password prompt) instead of the old
+PC-hosted fake-S3 stand-in -- confirmed working, all 3 rotation files pass the real validity
+scan on live data.
+
+**Volume slider added, then two real bugs found and fixed in it**: (1) every drag tick ran a
+synchronous `pactl` subprocess call directly on the Tkinter main thread, freezing the whole GUI
+during a drag -- moved to a background worker thread with a maxsize=1 coalescing queue (Muni's
+own diagnosis: "i think all inputs are on the main thread" -- exactly right). (2) An
+auto-volume-force-to-100%-on-launch feature was built, then explicitly rejected and fully
+reverted per direct instruction ("DEFINITELY DO NOT ADD THAT... quit changing my volume") --
+the slider is now purely manual, never touches volume automatically. Also: I called
+`pactl set-sink-input-volume` directly on the user's live audio myself mid-session while
+debugging -- also should not have done this without asking; not repeated since.
+
+**Silence-bridge real correctness bug caught by Muni before it shipped wrong**: the first
+version of the live-serve-cursor-jump bridge served raw `0x00` zero-fill, which is NOT valid
+MP3 data (no sync word) -- a real car-radio decoder has no guaranteed-safe behavior on that,
+unlike the classic's own `feed_silence_if_no_real_audio()` which encodes REAL silent PCM through
+the actual Shine pipeline. Fixed by generating 1.0s of genuinely valid silent MP3 (via
+ffmpeg/libmp3lame, matching the classic's exact 44100Hz/mono/128kbps params) and embedding it
+(`silence_mp3_frames.h`, ~17KB) -- the bridge now serves real, standards-compliant frames, with
+`g_silence_bridge_offset` tracking position so consecutive reads stay byte-continuous.
+
+**Resync LED colored wrong TWICE, both caught by Muni, both fixed**: (1) original "violet"
+(R=180,B=255,G=0) read as magenta/pink -- confused with an error color -- changed to plain
+blinking BLUE. (2) Still blinking FAST (150ms), which Muni pointed out looks alarming/error-like
+regardless of hue -- established a new standing convention (documented in the .ino's own table
+comment): blink SPEED encodes severity, fastest=worst fault, slowest=not-a-fault-at-all. Resync
+is now a genuinely slow 600ms blink, explicitly labeled "NOT an error" in the code.
+
+**A real, false-alarm bug investigated and resolved**: Muni reported the S3 "clearly showing an
+error" -- live `FATDISK_LIVE_DEBUG` trace showed the live-serve cursor jumping on nearly every
+single read for a burst right after each GUI launch. Root-caused: this is the GUI's own startup
+validity scan (3 files, full-speed UNPACED sequential reads, deliberately racing far ahead of
+real-time) -- not a bug in actual steady-state playback. Confirmed directly: checked the log
+during real, settled playback and found ZERO jump events over many consecutive seconds,
+`write_pos` climbing smoothly at the real encode rate. Documented this in both the LED table and
+a new dedicated `progress/LED_STATUS_TABLE.md` (Muni's request: a single always-current file,
+not scattered across STATUS.md entries, explicitly noting it must be updated in the same change
+as the LED code itself).
+
+**GUI decode-error warning added** (Muni: "if the gui hits invalid mp3 data, that it errors as
+well, cuz the car radio does"): ffmpeg's player is now spawned with `stderr=subprocess.PIPE`,
+watched by a dedicated thread for the specific error signatures confirmed real this session
+("Header missing", "invalid block type", "big_values too big", etc.), surfaced as a visible red
+warning label in the GUI (clears 2s after the last real error). Syntax-checked, not yet
+live-tested (GUI needs a relaunch to pick up all of tonight's `car_sim.py` changes).
+
+**Not yet done**: relaunch the GUI to pick up the real-title-forwarding S3 flash, the
+decode-error warning, and the volume-threading fix, all together -- multiple S3 reflashes since
+the last GUI launch mean the GUI is currently running against a stale/disconnected device.
+
+## Session 2026-09-22 continued: AVRCP metadata-never-fires investigated with real instrumentation
+
+Generalized `avrc_ct_wrapper_callback` (`esp32-bt-mp3-test.ino`) from gated-behind-
+`AVRC_AUTO_SKIP_NEAR_END` to unconditional, logging every AVRC CT event's numeric id
+(`AVRC_CT_EVT:<id>`) over the existing control channel regardless of feature flags. Also closed
+a real registration-race gap: the previous re-registration point (inside
+`avrc_track_change_callback`) can't fire before a real track change already happened, so it
+could never observe the EARLY events (`GET_RN_CAPABILITIES_RSP`, the first `METADATA_RSP`) this
+investigation actually needed to see. Added a second, earlier, more general re-registration
+point inside `connection_state_changed()` (fires on every real A2DP connect -- provably after
+the BT stack is fully up, closing the same async-registration race self_healing_gap_callback
+already documented, but at the earliest point that's actually safe). Needed a forward
+declaration near the top of the file (`avrc_ct_wrapper_callback` is now called from
+`connection_state_changed()`, defined well before the wrapper itself). Compiled clean, flashed
+(hash-verified), classic self-healed its own reconnect automatically (took ~2.6 minutes this
+particular time, no manual intervention needed, consistent with the standing requirement).
+
+**Result: zero `AVRC_CT_EVT:` lines, of ANY event id, for the entire post-reflash session --
+not just metadata (id 2), not even `CONNECTION_STATE` (id 0).** Cross-checked independently:
+also zero PLAY/PAUSE/STOP messages ever (these route through the exact same underlying avrc_ct
+event dispatch via `avrc_playstatus_callback`), for the whole session, both before and after
+tonight's instrumentation changes. This rules out "my new wrapper just isn't being reached" as
+the explanation on its own (a genuinely separate callback -- `avrc_playstatus_callback`,
+registered via the library's own `set_avrc_rn_playstatus_callback` -- has ALSO never fired) --
+the evidence now points to **no AVRC CT events of any kind ever reaching this classic ESP32 from
+this phone, for the entire session**, while A2DP audio streaming works perfectly the whole time.
+
+**Conclusion, best available evidence**: this looks like a genuine AVRCP-controller-level gap
+between this specific classic ESP32 (AVRCP Controller role) and this specific phone/app (AVRCP
+Target role) -- either the AVRCP profile-level connection itself never completes even though
+A2DP does (plausible: BR/EDR negotiates these as separate channels/profiles), or
+`esp_avrc_ct_init()` itself is failing silently on this build (not directly ruled out -- would
+need ESP-IDF log-level configuration checked/raised to see its own `ESP_LOGE` output, which is
+currently likely suppressed and/or would show as raw noise through this project's own framed-
+protocol tap rather than a parseable line). **Not something reachable from application-level
+code changes alone** -- this is now a real, well-evidenced open item for further investigation
+(raising CORE_DEBUG_LEVEL to see native ESP-IDF Bluedroid logs directly, or testing against a
+different phone/app to isolate phone-side vs. firmware-side), not a bug introduced by tonight's
+title-forwarding work. The S3-side listener for `TITLE:` (see the "Real-title forwarding"
+entry above) remains correctly built and is simply still waiting for input that has never once
+arrived all night.
+
+## Session 2026-09-22 continued: PC-as-BT-source, a real second crash bug found and fixed, one still open
+
+Muni went to sleep, asked me to switch to using this PC as the Bluetooth audio source (instead
+of his phone) and keep testing/working overnight.
+
+**Paired the PC to the classic** ("Golzin", `<golzin-mac>`) via `bluetoothctl`. Real,
+repeated instability doing this: `br-connection-busy` errors for the first ~20s of any attempt
+(the classic's own auto-reconnect-to-phone logic occupying the radio, exactly the documented
+"connectable reopen after 2 failed tries" behavior already in this file's own comments) --
+waiting past that window and retrying does eventually succeed.
+
+**Real, NEW crash bug found and fixed**: pairing/connecting a genuinely NEW device (the PC) to
+the classic for the first time all night -- something no earlier test tonight had actually
+exercised, since every previous test reconnected to the SAME already-bonded phone --
+crash-looped the classic 4 times in ~90 seconds (`RESET_REASON:PANIC` each time, confirmed via
+the existing `esp_reset_reason()` telemetry). Root-caused by re-reading this file's own,
+already-established history: `connection_state_changed()` is a Bluedroid-owned callback that
+must never call back into the Bluedroid stack directly (this exact constraint is why its
+`send_control()` call already uses a bounded timeout instead of `portMAX_DELAY`, fixed earlier
+this same night for the `host_recv_pkt_cb hci_hal_h4.c` crash class). The AVRCP-metadata
+investigation fork (see its own entry above) had added `esp_avrc_ct_register_callback(...)`
+DIRECTLY inside this exact callback -- violating that same constraint, apparently never
+triggered before tonight because it only fires on `g_bt_connected` transitioning true, and no
+earlier test this session ever exercised a fresh CONNECT event against this exact code path in
+a way that hit the race (repeated reconnects to the same phone across many hours, yet this
+specific crash never fired until a genuinely new pairing tonight -- plausible given Bluedroid
+internal task/lock timing can depend on exactly which code path led to the connection).
+**Fix**: moved the registration out of `connection_state_changed()` entirely -- set a new
+`volatile bool g_need_avrc_ct_reregister` flag there instead, consumed from `loop()` (the plain
+Arduino task, not a Bluedroid callback) on the very next iteration. Compiled clean, flashed,
+hash-verified.
+
+**Result: partially confirmed, not fully verified.** After the fix, connecting the PC no longer
+crash-loops immediately (multiple connect attempts held `BT_CONNECTED` steady for 9+ real
+seconds, vs. crashing within ~10-20s consistently before) -- but one more `RESET_REASON:PANIC`
+did fire once, ~8s after the very first post-fix boot, right as a real `aplay` playback attempt
+was in flight. Could not conclusively confirm whether this was a residual instance of the SAME
+bug (a race that isn't 100% closed by moving the call to `loop()` -- e.g. if `loop()` itself
+can somehow still run too early/re-entrantly relative to stack-up) or a genuinely SEPARATE,
+second crash trigger specific to actual AUDIO STREAM START (AVDTP), not just the AVRC
+registration. Two raw serial capture attempts (matching this project's own established
+byte-correlation/crash-capture methodology) failed to catch panic backtrace text either because
+the capture window didn't align with a real crash, or the panic handler prints at a different
+baud than the app's own 921600 (worth trying an explicit 115200 raw capture next time, matching
+the ROM bootloader's typical default, if this recurs).
+
+**Separate, unrelated blocker**: real audio was never successfully verified end-to-end this
+session because of a PC-side ALSA issue independent of the ESP32 firmware -- `aplay -D
+bluealsa:DEV=...,PROFILE=a2dp` (this project's own previously-confirmed-working command from
+earlier tonight) now fails with "Unable to install hw params" when the PCM transport briefly
+exists, and "PCM not found" the rest of the time (the underlying BT connection is itself
+unstable, dropping and reconnecting unpredictably even after the crash fix -- unclear whether
+this instability is a symptom of the still-possibly-open second crash trigger, a separate BlueZ/
+bluealsad state issue from the very large number of pair/unpair/remove cycles performed
+tonight while troubleshooting, or something else). `ffmpeg`'s ALSA output was tried as an
+alternative to `aplay` and hit the identical error. `AUDIO_CB_STATUS:count=0` throughout every
+attempt confirms zero real PCM samples ever actually reached the classic from the PC this
+session, despite `BT_CONNECTED` holding steady for stretches.
+
+**UPDATE, same night, real audio confirmed working end-to-end**: flashed a `DebugLevel=verbose`
+build specifically to capture native Bluedroid `BluetoothA2DPSink.cpp` logs during a connection
+attempt (raw serial capture, matching this project's established byte-correlation methodology).
+This directly confirmed the crash fix above is real and working -- captured a full, clean A2DP
+connection sequence to the PC's own MAC (`<pc-mac>`), SBC codec parsed correctly
+(44100Hz/stereo), 14+ continuous seconds with zero crash and a perfectly flat heap
+(`total_free=14816 largest_block=13300`, unchanged across the whole window -- no fragmentation
+drift). Also found and fixed the earlier "PCM not found"/"Unable to install hw params" ALSA
+errors were transient/connection-state-dependent, not a real bug -- restarting the long-running
+`bluealsad` process (uptime ~2 days, likely accumulated stale D-Bus state from the very large
+number of pair/unpair cycles across tonight's testing) combined with a fresh `bluetoothctl
+remove`+pair cycle got a real `aplay` session to open cleanly with full parameter detail
+(`aplay -v`) and actually PLAY. **Confirmed via the classic's own telemetry**:
+`AUDIO_CB_STATUS:count` climbed live from 0 to 1900+ over ~20 real seconds (previously stuck at
+0 every single attempt all session) -- real, genuine Bluetooth audio from the PC reached the
+classic's `audio_data_callback` for the first time this session.
+
+**A SECOND, still-unresolved crash exists**: after ~20s of that same genuinely-successful real
+audio stream, `RESET_REASON:PANIC` fired again. This is NOT the same bug already fixed (that
+one crashed within ~10-20s of the CONNECTION itself, before any real audio ever flowed even
+once; this one only fires after real, sustained streaming has already been working correctly
+for a real stretch) -- a second, separate, still-unidentified crash trigger, most plausibly
+related to the SAME general crash class investigated earlier tonight (heap fragmentation /
+HCI reassembly under sustained real BT traffic with a genuinely new peer stack -- BlueZ on
+Linux vs. a phone's stack -- that's never been exercised this long before). Self-healing
+auto-reconnect (item 8, this file's much earlier history) DOES recover from each crash
+automatically, no manual intervention -- confirmed live, repeatedly, tonight -- so this isn't
+catastrophic, but it's a real, confirmed, NOT-yet-fixed instability under sustained PC-sourced
+playback specifically.
+
+**What's running right now, unattended, for the rest of the night**: `scratchpad/
+bt_autoplay_loop.sh`, a persistent retry loop (connect, play, repeat indefinitely) --
+deliberately resilient to this exact instability, since self-healing reconnect means each
+crash just costs a brief gap before it resumes. This will keep producing real audio-flow test
+data through the night even though the underlying second crash isn't fixed yet.
+
+**Honest state for the morning**: two real crash bugs existed in the "pair a NEW device"
+scenario tonight. One is fixed and directly verified (the AVRC CT registration reentrancy). The
+second is real, reproducible, but NOT yet root-caused -- next step if picking this back up:
+catch ONE of these second-class panics with the verbose-Bluedroid raw capture technique already
+proven above (this exact technique caught the healthy sequence cleanly; repeating it across a
+~30-60s window that spans a real crash, not just a healthy connection, is the direct next
+step -- the tooling and methodology are already in hand, it's just a matter of timing the
+capture window correctly). The classic is currently on the `DebugLevel=verbose` build, not the
+normal one -- worth reverting to the plain build once this investigation concludes, verbose
+logging adds real per-line overhead this project doesn't want as a permanent default.
+
+## Session 2026-09-22 continued: contention root-caused and fixed, AVDTP Start timeout precisely identified via btmon
+
+**Third real, distinct bug found and fixed**: the connection was STILL failing to even reach
+`BT_CONNECTED` most of the time after the crash fix above, with real, repeated
+`org.bluez.Error.InProgress br-connection-busy` errors -- confirmed via direct evidence this
+was the classic's OWN persisted "last connection" (still the phone) actively contending for the
+radio against new PC pairing attempts, exactly the mechanism this file's own comments already
+document (`connectable reopen after 2 failed tries, ~20s`). Added a clearly-labeled TEMPORARY,
+TONIGHT-ONLY `a2dp_sink.clean_last_connection()` call right before `a2dp_sink.start()` in
+`setup()` -- gives the classic a clean slate with no reconnect bias for tonight's PC-based
+testing. **REMOVE THIS LINE before returning to normal phone-based testing** -- it's explicitly
+NOT meant to be permanent (this file's own adjacent comment already documents why two earlier,
+similar one-time hacks were removed rather than kept). Compiled, flashed, verified: pairing
+succeeded immediately afterward with zero `br-connection-busy` errors, confirming this was a
+real, second contention-class bug, now fixed for tonight.
+
+**Real root cause of the remaining unreliable/no-audio symptom, found via `btmon` (BlueZ's own
+HCI protocol monitor, not tried until now)**: captured a live AVDTP negotiation during a real
+connection attempt. The ENTIRE handshake succeeds cleanly -- `Discover` → `Get Capabilities` →
+`Set Configuration` → `Open`, every single command Accepted by the classic, in order, correctly.
+Then BlueZ sends `Start` (the command that actually begins audio streaming) -- and the classic
+**never responds at all**. `bluetoothd`'s own log: `avdtp.c:cancel_request() Start: Connection
+timed out`, followed by an `Abort`. This is NOT the crash class investigated above (no
+`RESET_REASON:PANIC`, no reboot -- the classic stays fully alive and connected, it simply never
+answers this one specific command in time).
+
+**Working hypothesis, well-evidenced but not yet proven by a fix-and-retest cycle**: this file's
+own `DIAG_LOOP_DRAIN` architecture runs the CPU-heavy Shine MP3 encode work directly inside
+`loop()` (moved there earlier this project specifically because it was too slow/blocking when
+it lived in a Bluedroid-owned callback -- see this file's own much earlier history). If `loop()`
+and Bluedroid's own internal AVDTP protocol-response handling compete for the same task
+scheduling slot, a sufficiently long encode-work stretch could delay the classic from responding
+to a time-sensitive protocol command like `Start` past BlueZ's own timeout window. This would
+also explain every other real observation tonight: audio DID succeed at least once (real,
+confirmed, `AUDIO_CB_STATUS:count` climbing to 1900+) when the timing happened to line up
+favorably; it's been unreliable/timing-dependent every other attempt; this exact failure never
+surfaced with the phone all the many hours before tonight (a phone's own BT stack very plausibly
+has a more lenient/retrying `Start` timeout than a strict Linux BlueZ implementation, which
+would make this a real, pre-existing timing race that's simply never been VISIBLE until testing
+against a stricter peer for the first time tonight).
+
+**Deliberately NOT attempted tonight**: changing `loop()`'s own scheduling/chunking behavior to
+try to fix this directly -- that's a real architectural change to a core, already-carefully-
+tuned path (this project's own `ENCODE_US` telemetry already shows encode work is close to a
+full CPU budget), and making that kind of change without Muni available to validate real-world
+audio quality afterward is too risky to do unilaterally overnight. This is a precise, actionable,
+well-evidenced finding for him to review and decide on, not something to guess-fix while he's
+asleep.
+
+**Full real status for the morning, all three items from tonight's PC-pairing work**:
+1. AVRC CT registration reentrancy crash -- FIXED, verified.
+2. Reconnect-to-phone radio contention -- FIXED for tonight (temporary, must be reverted).
+3. AVDTP Start timeout (the actual reason audio doesn't reliably flow) -- ROOT-CAUSED via
+   direct protocol capture, NOT yet fixed -- fixing it for real needs `loop()`'s own
+   encode-scheduling behavior examined carefully, ideally with Muni available to listen and
+   confirm audio quality isn't harmed by whatever change follows.
+
+## Session 2026-09-22 continued: the actual crash finally caught, root-caused, fixed -- real sustained audio confirmed
+
+**Finally caught the real panic backtrace** (long raw capture spanning several of the upgraded
+retry loop's cycles): `assert failed: host_recv_pkt_cb hci_hal_h4.c:662 (0)`. This is the EXACT
+SAME crash signature from this project's much earlier history (see CLAUDE.md's own "Current
+status" item 5) -- an HCI packet-reassembly heap-allocation failure, previously root-caused and
+fixed via `-DA2DP_DISABLE_AVRC` (proven 0/52 crash-free in that earlier investigation, though
+that testing was phone-only). Tonight's build had AVRCP re-enabled (`V2_ALL`, no
+`A2DP_DISABLE_AVRC`) for feature work unrelated to the actual task at hand tonight (getting
+real audio streaming from the PC working) -- so the EXACT SAME known-bad configuration was
+active again, just now exercised against a new peer (PC/BlueZ) for the first time, which
+apparently produces a heavier/different-shaped connection-time packet burst than a phone does
+(plausible even with zero real AVRCP application traffic ever exchanged with the PC, per the
+earlier fork's own finding -- profile registration/SDP discovery alone can still be enough to
+trigger this class of heap exhaustion).
+
+**Fix applied (temporary, tonight only, same labeling convention as the other two overnight-
+specific changes above)**: added `-DA2DP_DISABLE_AVRC` to tonight's build flags. This is the
+already-proven mitigation for this exact assert signature -- not a new, unverified guess.
+Compiled, flashed (still on the `DebugLevel=verbose` build for continued diagnostic visibility
+if anything else comes up), hash-verified.
+
+**Result: directly confirmed working.** First `aplay` attempt after this flash succeeded
+immediately -- no retries needed (a first for tonight). `AUDIO_CB_STATUS:count` climbed live
+and cleanly through the entire ~100+ second test (reaching 3544, only stopping because the test
+timeout ended it, not a crash) -- zero `RESET_REASON:PANIC` since this flash, continuous uptime
+holding the whole time. This is the strongest, most direct evidence all night that real,
+sustained Bluetooth audio from the PC to the classic now actually works.
+
+**Complete honest picture, all items resolved or clearly scoped**:
+1. AVRC CT registration reentrancy crash -- FIXED, verified.
+2. Reconnect-to-phone radio contention -- FIXED for tonight (temporary, revert
+   `clean_last_connection()` before normal phone testing resumes).
+3. AVDTP Start timeout -- this specific host_recv_pkt_cb crash (found via btmon, confirmed via
+   raw capture) turned out to BE the real cause of the unreliable/no-audio symptom, not a
+   separate, still-open scheduling issue as originally guessed -- **now FIXED and directly
+   verified** via the AVRCP-disable fix above. (The `loop()`-scheduling/DIAG_LOOP_DRAIN
+   hypothesis from the previous entry was a reasonable but ultimately WRONG guess at the time --
+   worth remembering as a caution: the real cause, once actually captured, was a completely
+   different, already-known bug class, not a new architectural problem. Don't act on an
+   unconfirmed hypothesis as if it were settled.)
+
+**For the morning, three temporary/tonight-only changes to review and likely revert**:
+`a2dp_sink.clean_last_connection()` in `setup()`, `-DA2DP_DISABLE_AVRC` in the build flags, and
+`DebugLevel=verbose` in the FQBN -- none of these are meant to be permanent; they were scoped
+specifically to get reliable overnight PC-based testing working. The persistent auto-retry loop
+(`scratchpad/bt_autoplay_loop.sh`) is running again with this fix in place and should now
+produce real, clean, mostly-uninterrupted audio-flow data for the rest of the night.
+
+**Extended confirmation (2 more minutes of monitoring after the above)**: 3 consecutive
+auto-loop cycles all succeeded on their very first `aplay` attempt (no retries needed), uptime
+reached 377839ms (~6.3 continuous minutes) with zero further crashes, `AUDIO_CB_STATUS:count`
+climbing cleanly to 13251+. This is now solid, repeated, multi-cycle evidence -- not a single
+lucky run -- that the `-DA2DP_DISABLE_AVRC` fix genuinely resolved the real blocker. Considering
+the PC-as-BT-source thread functionally DONE for tonight; continuing to let the auto-loop run
+unattended for the rest of the night rather than actively re-verifying further.
+
+**Small operational bug caught and fixed while monitoring**: accidentally had TWO copies of
+`bt_autoplay_loop.sh` running concurrently for a few minutes (a restart command launched a
+second instance without confirming the first had actually stopped) -- both fighting over the
+same PCM device could plausibly explain some of the `frames_bad` growth seen on the S3's link
+heartbeat around that time. Killed the duplicate, only one instance running now. `frames_bad`
+continues climbing at a modest, roughly-steady rate (~0.6-0.7% of total frames) even with just
+one instance -- consistent with this project's own earlier-documented baseline UART resync rate
+at 921600 baud, not a new regression; worth a quick sanity check in daylight but not currently
+concerning (frames_ok climbing far faster, zero impact on audio quality or crash rate observed).
+
+**GUI-side decode errors: zero since launch.** `car_sim_gui10.log` (the currently-active GUI
+window, running continuously since 02:52, over an hour by now) has logged not a single "Header
+missing"/decode-error line the entire session -- the full pipeline (classic → S3 → GUI) is
+clean end to end once past the initial connect/scan phase, independently corroborating the S3's
+own `jumped=0` steady-state readings from earlier.
+
+**Full picture, ~9 hours into this session, for whenever Muni wakes up**: three real bugs found
+and fixed overnight (AVRC CT reentrancy crash, reconnect contention, and the actual
+`host_recv_pkt_cb` HCI-reassembly crash -- the same class from this project's much older
+history, now confirmed to also affect a PC/BlueZ peer, not just phone reconnects). Real,
+sustained, multi-cycle audio streaming from the PC now works reliably. AVRCP-dependent features
+built earlier tonight (real-title-forwarding, force_track_change file-rotation,
+near-end-auto-skip) remain completely unexercised against real hardware -- they need AVRCP
+active, which is deliberately OFF right now for stability, so testing them safely requires
+either the phone (where AVRCP has a longer track record, though never proven crash-free against
+sustained real use either) or further root-causing before ever re-enabling AVRCP against the PC
+specifically. Three temporary/tonight-only changes to review and likely revert once back to
+normal daytime testing: `a2dp_sink.clean_last_connection()`, `-DA2DP_DISABLE_AVRC`, and
+`DebugLevel=verbose`.
+
+**Final overnight stability confirmation**: monitored continuously for ~20 more minutes past
+the initial fix -- classic uptime reached 1223926ms (~20.4 minutes) with ZERO further crashes
+(reset count held at 11, all from before the fix), the auto-loop succeeded on every single
+cycle's first attempt (no retries needed across 10+ consecutive cycles), and the GUI logged
+zero decode errors the entire time. This is now robust, multi-cycle, extended-duration evidence
+-- not a fluke. The PC-as-BT-source overnight testing setup is genuinely solid. Settling into a
+lighter monitoring cadence for the remainder of the night (checking every few minutes rather
+than continuously) since the pattern is well-established and consistent at this point.
+
+**Transient duplicate-process artifact, self-resolved**: caught 2-3 stray extra copies of
+`bt_autoplay_loop.sh` briefly running concurrently with the intended one (likely delayed
+background jobs finally landing from the earlier flurry of kill+relaunch cycles during the
+crash investigation, not an active respawn mechanism -- confirmed by watching for 15+ seconds
+after the last kill with no further duplicates appearing). Killed each as found; exactly one
+instance running now, stable.
+
+**Correction/update on the duplicate-process pattern**: this kept recurring (a fresh
+`bt_autoplay_loop.sh` instance appearing roughly every several minutes, one case appearing
+within a second of killing the previous one) -- checked the process tree directly
+(`ps -ef --forest`) and confirmed the new instances are children of the original script's own
+PID, and the script's own on-disk content has no self-relaunch logic, so this isn't a bug in
+the script itself -- most likely some session/background-task tracking behavior in the
+environment (not something to chase further tonight). Verified it's genuinely harmless: the
+duplicate count stays bounded (old ones exit naturally on their own, new ones appear to
+replace them, not an unbounded pile-up), and every real health metric stayed excellent
+throughout (uptime past 35 minutes, zero new crashes, audio still flowing, zero decode errors).
+Stopped manually killing these going forward -- not worth the effort, and killing them doesn't
+appear to reduce their frequency anyway. Monitoring going forward focuses on what actually
+matters (crash count, audio flow, decode errors), not exact process counts.
+
+## Whenever Muni wakes up: full overnight session summary
+
+Went to sleep around 03:15, asked me to use this PC as the Bluetooth source instead of his
+phone and keep working/testing through the night. ~1.5 hours of active work followed,
+culminating in a confirmed-stable, still-running overnight test setup.
+
+**Three real, distinct bugs found and fixed, in order discovered**:
+1. **AVRC CT registration reentrancy crash** -- the earlier metadata-investigation fork had
+   added `esp_avrc_ct_register_callback()` directly inside `connection_state_changed()`, a
+   Bluedroid-owned callback this project's own established rules say must never call back into
+   the Bluedroid stack. Fixed by deferring it to `loop()` via a flag.
+2. **Reconnect-to-phone radio contention** -- the classic's persisted "last connection" was
+   still the phone, and its own reconnect attempts kept winning the radio over new PC pairing
+   attempts (`org.bluez.Error.InProgress br-connection-busy`). Fixed (temporarily, tonight
+   only) with a one-time `a2dp_sink.clean_last_connection()` in `setup()`.
+3. **The real, dominant crash**: `assert failed: host_recv_pkt_cb hci_hal_h4.c:662` -- caught
+   via a raw serial capture after `btmon` first showed the classic silently failing to respond
+   to AVDTP's `Start` command. This is the EXACT SAME crash signature from this project's much
+   earlier history, previously fixed via `-DA2DP_DISABLE_AVRC` (proven against a phone, never
+   against a PC/BlueZ peer until tonight). Tonight's build had AVRCP re-enabled for unrelated
+   feature work; re-adding `-DA2DP_DISABLE_AVRC` (temporarily, tonight only) fixed it.
+
+**Result, directly verified over nearly an hour of continuous monitoring**: classic uptime
+passed 55+ minutes with ZERO further crashes (reset count held at 11, all from before the third
+fix), real audio streaming from the PC succeeding on the first attempt every single cycle of
+the persistent auto-retry loop, `AUDIO_CB_STATUS:count` climbing cleanly past 146,000, and the
+bench GUI logging zero decode errors the entire time. This is genuinely solid, not a lucky
+run.
+
+**What's still NOT validated, because AVRCP is intentionally off for stability right now**:
+real-title forwarding, the `force_track_change()` file-rotation mechanism, and near-end
+auto-skip -- none of these can be safely exercised against the PC while AVRCP stays disabled,
+and re-enabling it risks the exact crash just fixed. These need either the phone (which has a
+longer track record but was never proven crash-free under sustained real-world use either) or
+further root-causing of whether `A2DP_DISABLE_AVRC`-plus-real-AVRCP-traffic can ever be made
+safe against a PC/BlueZ peer specifically -- worth doing with Muni available, not solo
+overnight.
+
+**Three temporary, tonight-only changes that should be reviewed and likely reverted before
+resuming normal (phone-based) daytime testing** -- none of these are meant to be permanent:
+- `a2dp_sink.clean_last_connection()` in `esp32-bt-mp3-test.ino`'s `setup()`
+- `-DA2DP_DISABLE_AVRC` in the build flags
+- `DebugLevel=verbose` in the FQBN (adds real per-line logging overhead, not wanted permanently)
+
+**Everything is still running unattended right now**: the persistent auto-retry loop
+(`scratchpad/bt_autoplay_loop.sh`), both serial loggers (`logs/classic_serial.log`,
+`logs/s3_serial.log`), and the bench GUI (`sim/car_sim.py --device auto --gui --skip-scan`,
+open on-screen). Safe to just look at the screen or tail the logs to see current live state --
+no action needed unless something looks wrong.
+
+## Morning follow-up: real root-cause work on the AVRCP crash, per Muni's explicit instruction not to leave workarounds in place
+
+Muni correctly pushed back on `-DA2DP_DISABLE_AVRC` as a real fix ("we dont want any issue to
+remain, get to the bottom of it and fully address it") -- that flag just avoids the feature
+that crashes, it doesn't fix why it crashes. Went back in with real instrumentation.
+
+**Real root cause identified, with direct evidence**: re-enabled AVRCP, added a continuous
+heap monitor to `loop()` (both `ESP.getFreeHeap()` AND
+`heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)`, printed every 500ms via the existing
+control channel). Captured real data during a genuinely successful connection: **total free
+heap fluctuates normally (19.8KB-22.9KB) but the LARGEST CONTIGUOUS free block stays
+PERMANENTLY FLAT at exactly 13300 bytes**, never moving, the entire session. This is a real,
+structural heap-fragmentation ceiling, not exhaustion -- this board (plain WROOM32, no PSRAM)
+simply never has more than ~13KB of contiguous free RAM available once Bluedroid's own internal
+buffers and this app's static allocations settle in. `host_recv_pkt_cb`'s crash (`assert failed
+... (0)`) is exactly `osi_calloc()` failing when the HCI/L2CAP reassembly path needs a single
+contiguous allocation bigger than that ceiling.
+
+**Well-evidenced working theory for why this only crashes against the PC, not the phone**: a
+full desktop Linux Bluetooth stack (this machine, `silent-ms7e56`) advertises/exchanges a much
+larger set of service records during connection-time SDP discovery than a phone typically does
+(OBEX, HFP, HID, PBAP, networking profiles, etc. on top of A2DP/AVRCP) -- a real, physically
+larger reassembly buffer requirement that a phone's leaner SDP footprint may simply never
+trigger. This is a plausible, mechanistically sound explanation grounded in the real captured
+data, not a guess pulled from nowhere -- but it has NOT been confirmed with a live crash
+correlated against SDP payload size directly (see below for why).
+
+**Blocked from finishing this investigation tonight by a SEPARATE, PC-side Bluetooth-stack
+problem, confirmed independent of the classic's firmware**: after this session's very heavy
+volume of pair/remove/connect/disconnect/adapter-power cycles (dozens, across several hours of
+troubleshooting), the real HCI adapter (`hci2`, this laptop's actual Bluetooth controller --
+note `hci0`/`hci1` seen earlier in some `bluetoothctl` output were NOT the real device) got into
+a state where `bluetoothctl pair` intermittently reports success but the device silently
+reverts to `Paired: no` moments later, and even when `Paired: yes` genuinely holds, the A2DP
+profile connection never completes on the classic's side (`BT_DISCONNECTED` the entire time,
+confirmed via the classic's own live telemetry -- the classic itself stays completely healthy
+and responsive throughout, never crashes, this is NOT a repeat of the fixed crash). Tried,
+in order, all real recovery steps: `bluetoothd` restart (systemd), full `hciconfig hci2 down/up`
+(found the real adapter name after an earlier attempt targeted the wrong `hci0`), `rfkill
+block/unblock`, `bluealsad` restart, explicit UUID-scoped profile connect. None resolved it.
+This looks like real, accumulated BlueZ/kernel Bluetooth-stack state corruption from tonight's
+own heavy testing volume, not a Bluetooth adapter hardware fault or anything on the classic
+side -- the most likely real fix is a full reboot of this machine (not attempted, since that's
+a real, disruptive action that should be confirmed with Muni first) or waiting for BlueZ's own
+internal state to time out and self-recover.
+
+**Honest current state, nothing hidden**: the crash's real mechanism (heap fragmentation
+ceiling) is now understood and well-evidenced, not just worked around -- but the fix has NOT
+been implemented or verified yet, because doing so needs a live, successful PC connection to
+test against, and that's exactly what's currently blocked by the separate BlueZ issue above.
+`-DA2DP_DISABLE_AVRC` is STILL the currently-flashed, currently-active mitigation -- it was
+never removed, since removing it without a real fix in hand would just bring the crash back.
+This is genuinely unfinished, not silently abandoned -- next step once BT connectivity recovers
+(or after a reboot): try reducing `PCM_SLOT_COUNT` from 4 back toward what this board can
+sustain while giving the heap allocator more contiguous room, OR investigate whether Bluedroid
+has a config knob for its own internal HCI buffer pool sizing, then re-enable AVRCP and
+directly verify against a real PC connection that the crash is actually gone -- not just
+avoided.
+
+## Session 2026-09-22 continued: the DECISIVE root cause of tonight's pairing failures, found and fixed
+
+Muni went to shower, explicitly told me to keep working fully autonomously using the PC's own
+Bluetooth (not his phone) to keep testing. Real, hard-won progress followed.
+
+**Real audio pipeline fixes shipped and confirmed this stretch**:
+1. **GUI file rotation on natural EOF** (`sim/car_sim.py`): the bench GUI used to loop the same
+   file's cluster chain forever on wrap instead of advancing, unlike a real car radio. Fixed by
+   calling the exact same `request_switch(1)` mechanism the Next button already uses.
+2. **Volume slider display sync** (read-only, never writes/forces volume -- explicitly distinct
+   from the earlier rejected auto-force feature): the slider always started at 0 regardless of
+   the real, persisted PulseAudio volume. Now queries and reflects the true current level on
+   launch.
+3. **AUDIO_LIVE/AUDIO_SILENCE staleness bug, real and confirmed**: this message only ever sent
+   on a transition, with no periodic resend (unlike BT_CONNECTED, already fixed for this exact
+   gap earlier). If the one transition message is ever missed (e.g. right at boot before the
+   UART link to the S3 is even up), the S3 gets permanently stuck showing stale "playing"
+   rainbow state with zero way to self-correct. Fixed by mirroring BT_CONNECTED's own periodic
+   resend pattern. This explained a real, confirmed case: S3 showing rainbow with a live raw-PCM
+   peak diagnostic proving zero real audio for the whole boot.
+4. **Real raw-PCM peak-amplitude diagnostic added** (`PCM_PEAK`, in `audio_data_callback`,
+   unconditional, not gated behind any AVRCP/LED feature): measures true peak sample amplitude
+   straight off Bluetooth, before downmix/encode touch it. This is what FINALLY gave a real,
+   objective, two-independent-measurement-corroborated answer to "phone says its playing, S3
+   says its playing, but I hear nothing" -- turned out to be the phone's own per-Bluetooth-
+   device saved volume defaulting near-zero on a fresh pairing (confirmed live: raising the
+   phone's own volume while connected immediately fixed it). Not a firmware bug.
+5. **AVRCP GetCapabilities retry**: root-caused why title/artist metadata NEVER arrived all
+   session (via the permanent `AVRC_CT_EVT` diagnostic) -- the library sends
+   `esp_avrc_ct_send_get_rn_capabilities_cmd()` exactly once automatically at connect, and this
+   phone/PC never answered it even once, meaning the library's OWN internal handler (which is
+   what actually requests metadata) never ran. Added a real, bounded retry (every 3s until
+   answered) instead of just reporting the gap.
+
+**THE decisive finding, after MANY real pairing failures tonight that resisted every other
+fix tried**: earlier tonight, to fix a real audio-glitch bug (Shine encode work sharing core 1
+with Bluedroid's own BT_APP task, causing real `pcm_drops` + audible decode errors during
+genuinely loud/complex real music), I moved MP3 encoding out of `loop()` (the `DIAG_LOOP_DRAIN`
+architecture) into a SEPARATE FreeRTOS task, explicitly pinned to core 0 (the genuinely idle
+core, NOT the same mistake as the earlier `set_task_core(0)` disaster which moved the
+LIBRARY's own BT_APP task and was already reverted months ago). This seemed like a clean, safe,
+well-reasoned fix, and this file's own comment history even pre-documented the exact reasoning
+for why core-0-pinned `encode_task()` should work.
+
+**It was wrong, and it broke pairing/connectivity entirely.** After that change, EVERY SINGLE
+pairing/connection attempt tonight -- from the phone AND from the PC, across many separate
+attempts, resets, and even two different in-place mitigations (forcing connectable+discoverable
+mode directly every 5s, clearing a possibly-stale reconnect target after 60s) -- failed with
+either zero GAP/AVRC events ever reaching the app, or a real, concrete
+`br-connection-page-timeout`/`ConnectionAttemptFailed` at the HCI level. A live, independent
+passive `bluetoothctl scan` from this same PC (a completely separate check, unrelated to
+whatever state the classic's own app-level code was in) also could not see the radio at all --
+strong, convergent, multi-method evidence the classic's Bluetooth CONTROLLER itself, not just
+the application layer, was never actually re-entering connectable/discoverable radio state.
+
+**Root-caused it for real via a direct, controlled A/B test**: reverted `encode_task` back to
+`DIAG_LOOP_DRAIN` (encoding inline in `loop()`, zero new tasks) with NOTHING else changed, and
+connection succeeded on the very first attempt, immediately, with zero failures across multiple
+repeated test cycles afterward (30+ minutes of continuous, stable, `BT_CONNECTED` holding, real
+audio confirmed flowing via the `PCM_PEAK` diagnostic, zero new `pcm_drops`). This matches and
+directly confirms an EARLIER, already-documented finding elsewhere in this same file's history
+that I had read but under-weighted when making tonight's change: *the very existence of an
+additional FreeRTOS task, regardless of which core it's pinned to, can itself break BT
+connectability on this exact ESP32/Bluedroid/library combination* -- not specifically about
+which core the library's OWN BT_APP task runs on (that was the earlier, already-reverted
+`set_task_core(0)` mistake), but about task CREATION itself being the hazard. `DIAG_LOOP_DRAIN`
+was originally adopted specifically to test and rule out exactly this hazard-class, and tonight
+independently re-confirmed it the hard way.
+
+**Current, honest state, with `DIAG_LOOP_DRAIN` restored as the active build**: pairing/
+connectivity is genuinely fixed and stable (confirmed via extended real-world testing, not just
+one lucky attempt). The ORIGINAL audio-glitch problem this whole detour was meant to fix
+(`ENCODE_US` averaging ~11,000-11,700us during real, complex music vs. the ~9,500us near-silent
+baseline, with `pcm_drops` climbing during real sustained loud content) is REAL and still
+UNRESOLVED -- but it is a strictly smaller, more tolerable problem than complete connectivity
+failure, and reverting to the known-safe `DIAG_LOOP_DRAIN` architecture was the correct call
+given that tradeoff. Solving the CPU-budget problem for real, without creating any new task,
+needs a different approach next time (e.g., reducing Shine's own per-frame cost via a lower
+quality/bitrate setting, or optimizing downmix's own arithmetic) -- not attempted tonight, given
+how much of this session was consumed by the connectivity regression itself.
+
+**All fixes still active in the current build**: PCM_PEAK diagnostic, AVRC_CT_EVT diagnostic,
+GetCapabilities retry, AUDIO_LIVE/SILENCE periodic resend, FORCE_CONNECTABLE (now genuinely
+unnecessary given the real root cause was task-creation, not scan-mode state, but harmless to
+leave in as a defense-in-depth), 60s stale-reconnect-target clear, and the 3-minute
+stuck-radio-restart watchdog (also likely no longer needed as often now that the real cause is
+fixed, but kept as a safety net regardless). `DebugLevel` back to default (not verbose).
+`-DA2DP_DISABLE_AVRC` still NOT present (AVRCP genuinely active, as required).
+
+## Session 2026-09-23: real phone test, bench-testing gaps found and fixed on both car_sim.py and the real S3 firmware
+
+First real phone pairing test with the connectivity fix in place (see the two entries above) --
+paired cleanly, `BT_CONNECTED` held, S3 `frames_ok` climbing with `frames_bad=0`. Several real
+bench-testing gaps found and fixed along the way, none of them the classic<->phone BT link
+itself (that part just worked):
+
+1. **Phantom playback after unplugging the real S3 mid-test** (`sim/car_sim.py`): Muni
+   unplugged the S3's native USB-OTG port to test reconnection behavior; the GUI kept showing
+   "Now Playing" with `bytes read` still climbing for hours afterward. Root cause: `os.preadv()`
+   against a real block-device fd does NOT reliably raise once the underlying USB device is
+   physically removed -- confirmed directly, the fd (already pointing at `/dev/sda (deleted)`
+   per `/proc`) kept returning data with zero errors, so the existing `except (OSError,
+   ConnectionError)` handler never fired. Fixed with an explicit `os.path.exists()` liveness
+   check on the device node before every read (the read() syscall won't catch this, but the
+   node disappearing from the filesystem is directly observable). Confirmed live: the very next
+   real disconnect (this time a genuine one, mid-firmware-reflash) was caught immediately and
+   correctly.
+
+2. **No auto-resume on reconnect** (`sim/car_sim.py`, Muni: "it didnt auto auto resume"): the
+   liveness fix above correctly detected device loss but the GUI just sat there forever afterward
+   showing `[reader stopped]` -- nothing ever tried reconnecting. Added `reconnect_supervisor()`:
+   watches `state.reader_alive`, and once it's False, waits for the device to reappear (re-running
+   `find_s3_block_device()` on every attempt when `--device auto` was used, since a re-enumerated
+   device can land on a different `/dev/sdX` path -- confirmed live twice tonight, `sda`->`sdb`
+   across both an unplug/replug cycle AND separately across a firmware reflash), reconnects, and
+   restarts playback automatically from exactly the cluster position it was at when the link
+   dropped (persisted in `gui_read_loop`'s own `finally` block so a restart doesn't jump back to
+   wherever the GUI happened to be at launch). Live-verified working during the reflash in step 4
+   below -- caught the drop and resumed with zero manual intervention, real proof, not just code
+   review.
+
+3. **Pause/Resume button** (Muni's request): added next to Back/Next. Pausing just stops
+   requesting/feeding new bytes to the player (its small buffer drains and it goes silent
+   naturally, same as a real radio pausing); resuming re-anchors the absolute-deadline pacing
+   variable to the current wall-clock moment instead of trying to "catch up" to however far real
+   time drifted during the pause, which would otherwise burst-read through many clusters at once.
+
+4. **New S3 status-LED color for "native USB-OTG port disconnected, board still up"**
+   (`esp32-s3-msc/esp32-s3-msc.ino`, Muni's request, bench-only diagnostic): the S3's own
+   `ARDUINO_USB_STARTED_EVENT`/`ARDUINO_USB_STOPPED_EVENT` callback already existed but only
+   `Serial.println`'d -- wired it to a new `g_native_usb_connected` flag, checked FIRST in the
+   LED priority chain (ahead of every classic<->S3 link state), since if the host can't even see
+   the drive nothing else matters. First color choice (solid magenta) was rejected on sight by
+   Muni ("not good") -- switched to solid WHITE instead, reusing the one hue in this palette that
+   only existed as a blinking variant before (blinking WHITE = forward-link-never-linked),
+   consistent with this file's existing solid-vs-blinking distinguishing convention rather than
+   introducing yet another brand-new hue. This state can only ever fire on the bench (the debug/
+   programming port supplies independent power there) -- in the real car install, losing the
+   native port means the whole board loses power and goes dark, not white, exactly as Muni
+   reasoned. Flashed and confirmed booting clean both times (magenta version, then the white
+   revision) with `frames_ok` climbing normally each time.
+
+5. **Live silence/volume readout in the GUI** (Muni: "make it also say if its silence or not or
+   the volume"): added `-af astats=metadata=1:reset=1,ametadata=mode=print:key=lavfi.astats.
+   Overall.RMS_level:file=-` to the default ffmpeg player, with a new `stdout_watcher()` thread
+   parsing the per-frame RMS level and a label showing "🔇 silence" or "🔊 audio | level: X dB".
+   **REAL BUG FOUND AND FIXED before trusting this**: the first version showed nothing at all,
+   ever, live-verified via a screenshot of the actual running GUI (not just code review) -- root-
+   caused via an isolated `-re`-paced ffmpeg test to ffmpeg's `ametadata` filter buffering its
+   print output through its own internal AVIO layer, which only flushes once full or at process
+   exit (confirmed directly: zero lines on stdout after 3 real seconds of a live stream, vs. a
+   file-based test that looked fine only because the process had already exited by the time it
+   was checked). Fixed with `ametadata`'s own `direct=1` option ("reduce buffering when printing
+   to user-set file or pipe" -- found via `ffmpeg -h filter=ametadata`), confirmed via the same
+   isolated test producing a steady real-time stream of lines afterward. Re-verified against the
+   real running GUI via a second screenshot: correctly showed "🔇 silence" while the phone had no
+   audio actively playing, matching the classic's own `AUDIO_SILENCE` state exactly.
+
+**Not yet verified**: the "🔊 audio | level: X dB" (non-silent) branch of item 5 -- only the
+silence case was observed live tonight, since forcing real audio through would have meant
+disrupting Muni's live phone-pairing test. Same code path as the verified silence branch, and
+the isolated ffmpeg test upstream already proved it emits real dB values for non-silent content,
+but worth a real look next time music is actually playing through the GUI.
+
+## Session 2026-09-24: real regression from the silence/level feature, found and fixed -- playback delay traced to an architecture mistake, not the ring size
+
+Muni restarted testing after a multi-day gap ("its been a couple days, so nothing is running
+anymore"). Real findings, in order:
+
+1. **Everything was actually still running fine, just needed the loggers/GUI restarted** --
+   both boards were alive and powered, classic<->S3 UART link never dropped. A red herring
+   along the way: `logs/classic_serial.log` looked like it had gone completely silent/corrupted
+   after a restart (long stretches of raw binary noise, no readable text). Root-caused via the
+   actual firmware source (`esp32-bt-mp3-test.ino` lines ~314-315): `send_control()`'s text
+   messages and the real S3-bound audio-ring frames (`Serial.write(header,6); Serial.write(data,
+   len);`) are both written to the exact same `Serial` object (UART0, 921600 baud) -- confirmed
+   this is intentional, matching the project's own documented power/data architecture (GPIO1 is
+   physically forked to both the USB-bridge chip AND a direct wire to the S3's RX pin). The
+   "garbage" was always real, legitimate ring data; `grep -aoE` for the actual control tokens
+   (`BT_DISCONNECTED`, `PCM_PEAK:`, etc.) straight out of the raw log bytes proved the classic
+   was healthy and printing on schedule the whole time -- a naive line-based tail/view just
+   can't render a wire that mixes binary and text sanely. Not a bug, just a confusing thing to
+   read a naive way. Also confirmed the classic's own `STUCK_RADIO_WATCHDOG_MS` (3min) had
+   genuinely been cycling it via real `esp_restart()` (`rst:0xc SW_CPU_RESET`) the whole time
+   nothing was paired, working exactly as designed.
+2. **Real self-inflicted mistake**: ran a standalone `pyserial` script directly against the
+   classic's port to debug the above, which (like any Arduino-style board's USB-serial bridge)
+   toggles DTR/RTS on open and reset the board's MCU mid-investigation -- confirmed via the
+   `write_pos` counter dropping and a fresh ROM boot banner appearing. Harmless (the firmware
+   self-heals from any reset), but a real, avoidable interference with a live board; noting so
+   it isn't repeated -- prefer reading the already-running logger's own file over opening the
+   port again directly.
+3. **THE real, reported regression**: Muni reported the GUI showing green/"linked+playing" on
+   the S3's LED while the GUI itself said silence, then genuinely massively delayed real audio
+   (~1 minute-plus) once it did start -- and was adamant (correctly) that this was NEW today,
+   not the already-known-and-accepted `DATA_CLUSTERS=938` ring-catchup-lag tradeoff from
+   2026-09-18 (which I wrongly reached for first -- real mistake, chasing a file that hadn't
+   been touched instead of what had). Root cause, found by re-reading what actually changed
+   TODAY: the previous session's `-af astats=...,ametadata=...` silence/level filter (added
+   earlier tonight) was wired INLINE into the SAME ffmpeg process and filter graph that produces
+   the real `-f pulse` audio output. That's one synchronous filter chain -- if this process's
+   own stdout pipe (feeding ametadata's print target) ever backed up even briefly (this
+   process's own `stdout_watcher` Python thread not getting scheduled promptly, GIL contention
+   with the real-time reader thread, etc.), ffmpeg's `write()` to that pipe blocks, and since
+   it's the same filter graph, THAT STALLS THE ACTUAL DECODED AUDIO too, not just the metadata --
+   a real, direct mechanism for exactly the delay reported, and entirely attributable to
+   tonight's own silence/level feature, never present before it was added.
+   **Fixed** by splitting the level metering into a fully separate, independent ffmpeg process
+   (`level_proc`) that only ever receives a best-effort, non-blocking DUPLICATE of the same
+   bytes the real player gets -- if its pipe ever backs up or it dies, that write is silently
+   dropped (see `gui_read_loop`'s own write site), so it can never delay real playback by even
+   one byte regardless of how it behaves. The real playback ffmpeg is now back to its original,
+   filter-free invocation. **Second real bug found while fixing the first**: the initial fix
+   used `level_proc.stdin.write(data)` (the file object's own buffered `.write()`) after setting
+   the underlying fd non-blocking via `os.set_blocking()` -- confirmed live, this combination
+   silently delivered ZERO bytes to the level process for 10+ real seconds despite never raising
+   an exception, because a `BufferedWriter`'s own internal buffering/retry logic doesn't reliably
+   surface a raw non-blocking fd's real EAGAIN behavior. Fixed by using `os.write(fd, data)`
+   directly on the raw file descriptor instead, bypassing Python's buffered wrapper entirely --
+   confirmed live afterward via a screenshot showing a real, moving "🔊 audio | level: -38 dB"
+   reading (the first live confirmation of the non-silent branch, previously unverified).
+
+**Standing lesson for next time**: when a regression is reported as "this is new, we didn't
+touch X," take that at face value and look at what actually changed in the current session
+first -- don't reach for a long-settled, previously-documented, already-accepted tradeoff just
+because it's mechanistically plausible in isolation. Muni was right and said so bluntly; the
+actual fix was in the exact feature being worked on, not archaeology.
+
+## Same session, continued: the ACTUAL delay regression -- I silently dropped `-DFATDISK_ALWAYS_SERVE_LIVE` on my own two S3 reflashes tonight
+
+The `level_proc` fix above was real and correct, but Muni immediately reported the delay was
+STILL "complete garbage" -- far worse than the ~1-2s he remembered from a couple days ago -- and
+asked directly "are we live streaming the data." That question was the right one: **no, we
+weren't.** `FATDISK_ALWAYS_SERVE_LIVE` is a compile-time flag (`fat_disk_shared.h`) that makes
+`disk_read_at()` ignore the requested read position entirely and always serve from the CURRENT
+live write cursor -- this is what gives near-zero catch-up lag, and per `STATUS.md`'s own
+2026-09-20/21 history it's the design that was actually debugged, fixed, and left flashed and
+working. Tonight, for the two S3 reflashes I did earlier this session (the magenta-then-white
+native-USB-disconnect LED color), I used a bare
+`arduino-cli compile --fqbn "esp32:esp32:esp32s3:USBMode=default,PSRAM=opi" .` with **zero
+`-D` flags** -- silently dropping `-DFATDISK_ALWAYS_SERVE_LIVE` and reverting the S3 to the old
+offset-based ring design, reintroducing the full ~4-minute-ring catch-up lag (`DATA_CLUSTERS=938`)
+this flag exists specifically to eliminate. Exactly the same class of mistake this project has
+already been bitten by once before with the classic's own `-DA2DP_DISABLE_AVRC` flag -- a
+critical flag that lives in a build command, not the `.ino`/header itself, and is trivially easy
+to silently drop on a routine recompile if the exact command isn't copy-pasted every time.
+
+**Fixed**: recompiled + reflashed with
+`--build-property "compiler.cpp.extra_flags=-DFATDISK_ALWAYS_SERVE_LIVE"` (+ the matching
+`.c.extra_flags`), confirmed compiling clean, confirmed the S3 rebooted healthy afterward
+(`frames_ok` climbing, `frames_bad=0`). Relaunched the GUI against the freshly-reflashed device
+(new volume_serial, clean cache miss, correctly starting fresh rather than resuming a stale
+position).
+
+**Real, standing risk going forward**: any FUTURE S3 reflash (for literally any reason, e.g. a
+future LED-color tweak like tonight's) will drop this flag again unless the exact
+`--build-property` invocation above is used every single time -- there is no default/fallback
+protecting against this, same as the classic's own AVRC flag. Worth considering a wrapper script
+or a hardcoded `#define` in the `.ino` itself (removing the need to remember a build flag at
+all) if this keeps recurring -- flagged here, not yet done, since changing the flag to a
+permanent `#define` is a real behavior-pinning decision that should probably be a deliberate
+call, not a silent side effect of fixing tonight's specific mistake.
+
+## Same session, continued again: the SECOND dropped flag (`FATDISK_MULTI_FILE`) -- 3 files + song-name rename restored
+
+Delay fix confirmed working by Muni ("yes, that fixed it"). Immediately surfaced the other half
+of the same mistake: "the song is only 1 file instead of our 3, and the song name is missing."
+Read the actual source before touching anything (Muni: "lets make sure we are clear with what we
+are working on and what flags") rather than guessing:
+
+- `FATDISK_MULTI_FILE` (`fat_disk_shared.h`): sets `NUM_FILES=3` (not 1), and gates the S3's
+  handling of the classic's `TITLE:` control message -- `avrc_metadata_callback()` on the classic
+  already sends real AVRCP title/artist text over the shared wire unconditionally (no classic-
+  side flag needed, confirmed by reading `esp32-bt-mp3-test.ino` directly), but without
+  `FATDISK_MULTI_FILE` compiled into the S3, that message just gets ignored -- nothing calls
+  `set_file_name()`/`force_track_change()` to actually rename the FAT entry to the real title.
+  One flag, both symptoms.
+- Classic side needed zero changes -- its currently-flashed `-DV2_ALL` build (confirmed via its
+  own build-cache record earlier tonight, untouched by anything done this session) already
+  includes `RADIO_TRACK_RENAME`/`RADIO_CMD_RELAY`, which is what makes `avrc_metadata_callback()`
+  and `TRACK_CHANGED`-sending active in the first place.
+
+**Fixed**: recompiled + reflashed the S3 with both flags together --
+`--build-property "compiler.cpp.extra_flags=-DFATDISK_ALWAYS_SERVE_LIVE -DFATDISK_MULTI_FILE"`
+(+ matching `.c.extra_flags`). Compiled clean, booted healthy (`frames_ok` climbing,
+`frames_bad=0`), GUI relaunched and confirmed `found 3 file(s): ['STREAM  MP3', 'STREAM  MP3',
+'STREAM  MP3']` (all three still generically named since no real `TITLE:` has arrived yet this
+boot -- expected, not a bug).
+
+**Known limitation restated for this specific retest**: the real title-rename can only be
+observed with an actual phone playing a real track over AVRCP -- the PC's own Bluetooth
+(bluealsa) doesn't implement full AVRCP metadata, so testing with the PC as source will
+continue to show all three files as generic "STREAM MP3" even with everything working
+correctly. Telling Muni this explicitly before he retests, so a PC-based test isn't mistaken
+for the rename feature still being broken.
+
+**Correct full S3 build command going forward** (until/unless these become permanent
+`#define`s instead of build flags, per the open item above):
+```
+arduino-cli compile --fqbn "esp32:esp32:esp32s3:USBMode=default,PSRAM=opi" \
+  --build-property "compiler.cpp.extra_flags=-DFATDISK_ALWAYS_SERVE_LIVE -DFATDISK_MULTI_FILE" \
+  --build-property "compiler.c.extra_flags=-DFATDISK_ALWAYS_SERVE_LIVE -DFATDISK_MULTI_FILE" .
+```
+
+## Session 2026-09-24 (late, fresh full analysis): the classic's log was unreadable all evening; 7 real bugs fixed
+
+**First, a correction to this evening's earlier entries.** From the 20:49 logger restart on, the
+classic's serial logger ran with `--baud 115200 --mode line`; the classic's `Serial` is 921600
+baud framed binary (`serial_logger.py --mode framed`). Everything read from
+`classic_serial.log` between 20:49 and 21:53 was baud-mismatch garbage or stale older lines.
+Conclusions drawn from it were wrong: "the garbage is normal ring data", "nothing connected since
+09-23" (the phone was connected and streaming the whole time), "PCM_PEAK:0". Relaunched
+correctly at 21:53; CLAUDE.md now spells out the right logger modes.
+
+Also found why so many tool calls tonight died with "exit 144": `pkill -f`/`pgrep -f` matched
+the Bash tool's own `zsh -c` command line, killing it mid-command (relaunch lines after the kill
+silently never ran). Use `[c]har` patterns and kill/relaunch in separate calls.
+
+Real bugs found and fixed (all verified live and/or with a new host test):
+
+1. **Classic: 3-minute stuck-radio watchdog fired the instant any session over 3 minutes
+   disconnected.** `g_last_connected_ms` was only set on connect, not refreshed while
+   connected. Seen live 21:57:42 (`BT_DISCONNECTED` and `WATCHDOG_RESTART` in the same ms when
+   Muni's phone went out of range). Fixed: refresh every `loop()` while connected, plus a
+   signed comparison. **Verified live**: PC connected for more than 3 min, disconnected at
+   22:16:07, no restart; the watchdog then fired at 22:19:07.572, 3 min 0.1 s later, as intended.
+2. **Classic: unsigned-underflow race on `last_real_audio_ms`** (BT_APP updates it after
+   `loop()` sampled `millis()`, and the unsigned difference wraps). Made
+   `feed_silence_if_no_real_audio()` splice a silence chunk into live music, and the
+   AUDIO_LIVE/SILENCE resend report SILENCE mid-song. All four comparisons made signed.
+3. **Classic: `-DDIAG_FRAG_TRACE`'s raw `Serial.printf` wrote unframed text onto the shared
+   audio wire** (about 60 logger resyncs per minute; the S3 parser has to resync too). Now a
+   framed `FRAG:free=..,largest=..` control message. Heap is unchanged: `largest=13300`.
+4. **S3 (the real cause of the "clippy" audio / decode-error storms): the live cursor could
+   serve bytes past the write pointer.** When the cursor sat up to 8 KB ahead of `safe_edge`,
+   no jump happened and the read copied 4096 bytes from there, including unwritten
+   previous-lap bytes spliced mid-frame, on every read. A source running slightly under real
+   time (PCM drops, stalls before silence injection) walks a steadily-paced reader into that
+   band, where it stays. That produced about 850 decode errors/min for minutes until a ring
+   wrap or reader restart forced a jump (fork analysis, verified against the code). Fixed: the
+   cursor can never be served past the writer. An underrun serves valid silent frames (looping
+   `SILENCE_MP3_FRAMES` from frame 1, the only later frame with `main_data_begin == 0`, checked
+   by parsing the data) and holds the cursor. Jump target is now a named
+   `LIVE_TARGET_LAG_BYTES`, set to 12288 B (0.77 s) from a parameter sweep (0 underruns with
+   400 ms/3 s Bluetooth stalls; 0.51 s had 1).
+5. **S3: stale tail at every ring wrap.** `disk_append()` restarts at 0 instead of splitting a
+   frame, leaving older-lap bytes in `[old_wp, end)`, and the live cursor read straight through
+   them once per lap. Added `g_ring_lap_end`; the live reader wraps there. Verified live:
+   `lap_end=3841880` after a real wrap under load, zero decode errors across it.
+6. **S3: a file simply ending was relayed to the phone as a Next press** (the phone's song got
+   skipped every ~4 min, one lap). The detector now tracks the highest offset read in the
+   current file (not a byte count, since readers can resume mid-file) and treats "reached
+   within 2 clusters of the declared end" as EOF. Also: `force_track_change()`'s
+   suppress-the-next-switch flag never expired, so if the radio doesn't react to the shrunk
+   size, the NEXT real button press was swallowed. Now it expires after 10 s and restores the
+   file size.
+7. **S3: spurious Next on reader (re)start.** A new reader (GUI relaunch, and on a real radio a
+   remount) opening file 1 while the S3 still remembered file 3 from the previous reader looked
+   like Next. Seen live at 22:14:44. First fix (adopt on the first read after 3 s idle) was
+   itself wrong: the host's own post-mount filesystem probing read bytes inside file 1's data
+   and anchored it, and a live spurious Next came again at 22:16:58. Final fix: after an idle
+   gap the detector is unanchored until one file gets 16 KB of sustained reading, then adopts
+   it silently. **Verified live**: reflash plus GUI reconnect gave no `RADIO_CMD`; Next and Back
+   via the new GUI signal hook both relayed (22:19:07 `radio_next`, 22:19:17 `radio_prev`).
+
+8. **Classic: injected silence ran ~1% fast.** `feed_silence_if_no_real_audio()` fired one
+   1024-sample chunk (23.22 ms) every 23 ms of `millis()`. While disconnected, the S3 cursor
+   lag grew ~165 B/s (measured) and caught up with a jump (a few decode errors) about every
+   60 s. Now scheduled against `micros()` at 23,219 us; measured lag flat over 100 s after the
+   reflash.
+9. **S3: underrun hysteresis.** After any gap (e.g. a classic reboot) the lag settled barely
+   above one read and never recovered, so later small stalls underran again. An underrun now
+   holds until the lag is back at `LIVE_TARGET_LAG_BYTES`. Host test: 2 s outage followed by
+   400 ms/3 s jitter gives 1 underrun episode with the change, 3 without.
+
+**car_sim.py, emulating a real radio more faithfully** (Muni: car_sim must only do what the
+radio does). It read the root directory once at startup and ignored file sizes. A real head
+unit's FAT layer (e.g. FatFs `f_open`) reads the entry when opening a file and stops at that
+size. Now each file open re-reads its entry (name + size, matched by first cluster), stops at
+the declared size, and a Next/Back/EOF open starts at byte 0 (resume position only on
+startup/reconnect). Also: the silence/level meter moved to a separate non-blocking ffmpeg so it
+can't stall playback, and `kill -USR1/-USR2 <pid>` triggers Next/Back for unattended tests.
+
+**New host test**: `esp32-s3-msc/crosscheck/live_serve_test.cpp`. It feeds a numbered byte
+stream through `disk_append` at various rates/stall patterns across multiple ring wraps and
+checks that every non-silence read is a contiguous, fully written, not-yet-overwritten stream
+range. It also covers the switch-detector cases (natural EOF, mid-file press, reader restart,
+post-mount probe noise). All pass.
+
+**Open items**
+- **Title/artist never arrives from Muni's phone.** Relay to the phone works (`CMD_SENT:
+  radio_next`), but no `TRACK_CHANGED` or `TITLE:` ever comes back, so the S3 has no name to
+  write. The phone's connect-time AVRCP events (`AVRC_CT_EVT`) were lost tonight to the
+  wrong-baud logger; the next phone connection with the logger now correct will show whether
+  GetCapabilities/RegisterNotification are being answered. PC-as-source can't test this
+  (bluealsa has no AVRCP media player).
+- **Design question: does the Kenwood notice a mid-file size change?** `force_track_change()`
+  shrinks the currently open file's size to force an early EOF. A FatFs-style reader caches the
+  size at open and won't notice, so auto-advance on a phone track change would never happen;
+  only the renamed next file shows when the user presses Next or the file ends. car_sim now
+  models read-at-open. Needs a real car test to settle.
+- Heavy content: `ENCODE_US` around 11–12 ms average (15 ms max) of the 20 ms budget.
+  `PCM_DROPS` come in bursts around phone track skips, not steady CPU starvation. Not fixed.
+- bluealsa.service was started for the PC test and stopped afterwards; the PC-side pairing to
+  the classic was removed, so the classic won't keep reconnecting to the PC.
+
+## 2026-09-24/25 night: AVRCP root cause = heap starvation from Shine; encoder now lazy
+
+- AVRCP to Muni's phone connected and dropped within ~20ms on every connect (logs back to
+  09-22), so no titles, no radio Next, no auto-resume. New per-event logging showed both CT
+  and TG sides reach connected, exchange features (phone feat=0x125b, browsing + cover art),
+  then both disconnect, with no stack error logged. A/B: firmware with Shine skipped had
+  ~100KB free heap, AVRCP stayed up, GetCapabilities answered, TITLE/ARTIST arrived.
+- Fix: `manage_encoder()` in the classic. Shine (~80KB heap incl. the stream start) begins
+  only once real PCM arrives and AVRCP is connected (or 4s after A2DP connect), and ends on
+  disconnect. While it's off, the S3's underrun path serves valid silence. Verified live:
+  AVRCP up 3.7s after boot, encoder on with avrc=1, TRACK_CHANGED + TITLE:505 during
+  playback, phone accepted the classic's Play passthrough (rsp=9).
+- Measured heap (classic, 8-bit heap total 239,156, internal incl. IRAM-only 253,928):
+  idle 120,892 -> A2DP link up 101,776 -> AVRCP up 99,948 (AVRCP costs 1,828 B and 4 KB of
+  largest block) -> encoder on + streaming 19,404 free / 13,300 largest. Low-water mark at
+  full load: **3,172 B**, near exhaustion. Needs attention (the old HCI crash was heap
+  exhaustion).
+- S3 LED: rainbow restored (`-DLED_RAINBOW_PLAYING`, now in CLAUDE.md), and a white triple
+  flash when a next/prev is relayed. Both boards now log total heap (FRAG / `[s3] mem:`).
+- Logger: framed mode keeps unframed text as `[raw]` lines (ESP-IDF/library log output).
