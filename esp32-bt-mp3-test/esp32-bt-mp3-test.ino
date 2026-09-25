@@ -847,6 +847,13 @@ volatile uint32_t g_reconnect_ts_ms = 0;
 // as above applies identically: there is no one available to look at a
 // confirmation dialog and press yes, ever -- so auto-accept immediately,
 // unconditionally, the instant this event fires.
+// Open ACL links (any device mid-pairing or connecting) and the last GAP
+// activity: the stuck-radio watchdog below must never restart the board
+// while a device is talking to it. Seen 2026-09-25 on the bench: with the
+// phone off, the watchdog restarted every ~3 min and killed pairings.
+volatile int g_acl_links = 0;
+volatile uint32_t g_last_gap_activity_ms = 0;
+
 void self_healing_gap_callback(esp_bt_gap_cb_event_t event,
                                 esp_bt_gap_cb_param_t *param) {
   // Pairing diagnostics (2026-09-25: a second device can't pair). One
@@ -895,11 +902,41 @@ void self_healing_gap_callback(esp_bt_gap_cb_event_t event,
       send_control(g, pdMS_TO_TICKS(20));
     }
   }
+  switch (event) {
+    case ESP_BT_GAP_ACL_CONN_CMPL_STAT_EVT:
+      if (param->acl_conn_cmpl_stat.stat == ESP_BT_STATUS_SUCCESS) g_acl_links++;
+      g_last_gap_activity_ms = millis();
+      break;
+    case ESP_BT_GAP_ACL_DISCONN_CMPL_STAT_EVT:
+      if (g_acl_links > 0) g_acl_links--;
+      g_last_gap_activity_ms = millis();
+      break;
+    case ESP_BT_GAP_AUTH_CMPL_EVT:
+    case ESP_BT_GAP_PIN_REQ_EVT:
+    case ESP_BT_GAP_CFM_REQ_EVT:
+    case ESP_BT_GAP_KEY_NOTIF_EVT:
+    case ESP_BT_GAP_KEY_REQ_EVT:
+      g_last_gap_activity_ms = millis();
+      break;
+    default:
+      break;
+  }
   if (event == ESP_BT_GAP_AUTH_CMPL_EVT &&
       param->auth_cmpl.stat != ESP_BT_STATUS_SUCCESS) {
     esp_bt_gap_remove_bond_device(param->auth_cmpl.bda);
   } else if (event == ESP_BT_GAP_CFM_REQ_EVT) {
     esp_bt_gap_ssp_confirm_reply(param->cfm_req.bda, true);
+  } else if (event == ESP_BT_GAP_PIN_REQ_EVT) {
+    // Legacy PIN pairing (2026-09-25): some hosts pair the old way even
+    // though we support SSP -- the laptop does, every time. The library
+    // only records the address and never replies, so the host times out
+    // (AuthenticationTimeout after ~30 s). Answer with the fixed PIN every
+    // car kit uses, 0000 (16 digits if the host asks for a 16-digit PIN);
+    // most hosts try 0000 on their own for audio devices.
+    esp_bt_pin_code_t pin;
+    uint8_t len = param->pin_req.min_16_digit ? 16 : 4;
+    memset(pin, '0', sizeof(pin));
+    esp_bt_gap_pin_reply(param->pin_req.bda, true, len, pin);
   }
   ccall_app_gap_callback(event, param);
 }
@@ -1783,6 +1820,11 @@ void loop() {
   // giving the in-place reconnect a chance. Refresh it every pass while
   // connected, so the window measures time SINCE disconnect.
   if (g_bt_connected) g_last_connected_ms = millis();
+  // A device linked or pairing, or any recent pairing/link event, means the
+  // stack isn't wedged (the wedge this watchdog exists for produces no GAP
+  // events at all): hold off.
+  if (g_acl_links > 0) g_last_connected_ms = millis();
+  if ((int32_t)(g_last_gap_activity_ms - g_last_connected_ms) > 0) g_last_connected_ms = g_last_gap_activity_ms;
   // Signed for the same reason as last_real_audio_ms: the connect callback
   // can store a newer timestamp than the millis() sampled here.
   if (!g_bt_connected &&
