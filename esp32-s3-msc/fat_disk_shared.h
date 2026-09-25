@@ -425,6 +425,42 @@ static volatile uint32_t g_live_read_cursor = 0;
 static volatile bool g_live_read_cursor_init = false;
 static volatile bool g_live_underrun = false;      // currently serving underrun silence
 static volatile uint32_t g_live_underruns = 0;     // reads served as underrun silence, for the heartbeat
+
+// How a radio OPENS a file (real Kenwood, car trace 2026-09-25): it reads the
+// start, a 2 KB probe every 512 KB, the last 2 KB (ID3v1), ~40 KB of the head,
+// then re-reads from 0 with a ~58 KB read-ahead burst, then plays at real
+// time. Served naively from the live cursor, all of that races ~100 KB past
+// the newest audio and comes back as seconds of underrun silence at every
+// file change (seen on the bench: +45..55 underrun reads per open). So, with
+// FATDISK_MULTI_FILE:
+// - probe reads (not at 0, not continuing the previous read) get silent
+//   frames and don't move the cursor;
+// - a read at offset 0 places the cursor at the file's start ("base"):
+//     after a natural end: where playback left off (seamless);
+//     after Next/Back/mount: RADIO_READAHEAD_BYTES earlier, since the radio
+//     dropped its read-ahead unplayed -- so the burst has real audio;
+//   a re-read from 0 of the same open gets the same base again, like a file.
+// - after an open, the catch-up jump tolerates the base's lag until the
+//   burst has pulled the cursor back near the live edge (or a grace period).
+#ifndef FATDISK_RADIO_READAHEAD
+#define FATDISK_RADIO_READAHEAD (60 * 1024)  // Kenwood: ~58 KB burst at open
+#endif
+static const uint32_t RADIO_READAHEAD_BYTES = FATDISK_RADIO_READAHEAD;
+static const uint32_t LIVE_REREAD_WINDOW_MS = 10000;
+static const uint32_t LIVE_REREAD_MAX_OFF = 128 * 1024;
+// Grace after an open, in bytes the radio reads (not time: the burst is a
+// fixed amount of data): twice the read-ahead.
+static const uint32_t LIVE_OPEN_GRACE_BYTES = 2 * RADIO_READAHEAD_BYTES;
+static volatile uint32_t g_open_file = 0xFFFFFFFF, g_open_base = 0, g_open_ms = 0, g_open_max_off = 0;
+static volatile uint32_t g_live_max_lag = 0, g_live_grace_left = 0;
+static volatile uint32_t g_live_opens = 0, g_live_probe_reads = 0;  // for the heartbeat
+
+static inline uint32_t live_ring_back(uint32_t pos, uint32_t k, uint32_t lap_end) {
+  return pos >= k ? pos - k : lap_end - (k - pos);
+}
+static inline uint32_t live_behind(uint32_t cursor, uint32_t wp, uint32_t lap_end) {
+  return (cursor <= wp) ? (wp - cursor) : ((lap_end - cursor) + wp);
+}
 #endif
 
 // TEMP DIAGNOSTIC (2026-09-18): investigating a real bug where content at a
@@ -964,6 +1000,12 @@ static void disk_read_at(uint32_t abs_pos, uint8_t *buffer, uint32_t len,
         pos += n; out_off += n; remaining -= n;
         continue;
       }
+#if defined(FATDISK_MULTI_FILE) && defined(FATDISK_ALWAYS_SERVE_LIVE)
+      // Classified BEFORE the detector sees this read (it updates both).
+      bool playback_read = fatdisk_read_is_playback(file_index, file_rel_off);
+      bool open_after_natural_end = g_reader_anchored &&
+          g_current_file_read_end + 2 * CLUSTER_SIZE >= get_file_declared_size(g_current_file_index);
+#endif
 #ifdef FATDISK_MULTI_FILE
       fatdisk_note_file_read(file_index, file_rel_off, n);
 #endif
@@ -1003,6 +1045,46 @@ static void disk_read_at(uint32_t abs_pos, uint8_t *buffer, uint32_t len,
           uint32_t lap_end = g_ring_lap_end;
           uint32_t cursor = g_live_read_cursor;
           if (cursor >= lap_end && cursor > wp) cursor = 0;
+          uint32_t now_ms = FATDISK_MILLIS();
+          bool probe_read = false;
+#if defined(FATDISK_MULTI_FILE)
+          probe_read = !playback_read;
+          if (!probe_read && file_rel_off == 0) {
+            // A radio opening (or re-reading the start of) a file.
+            bool reread = file_index == g_open_file && (now_ms - g_open_ms) < LIVE_REREAD_WINDOW_MS &&
+                          g_open_max_off <= LIVE_REREAD_MAX_OFF;
+            if (reread) {
+              cursor = g_open_base;
+            } else {
+              uint32_t c = g_live_read_cursor_init ? cursor : live_ring_back(wp, LIVE_TARGET_LAG_BYTES, lap_end);
+              uint32_t base = open_after_natural_end ? c : live_ring_back(c, RADIO_READAHEAD_BYTES, lap_end);
+              uint32_t max_lag = LIVE_TARGET_LAG_BYTES + RADIO_READAHEAD_BYTES + LIVE_CATCHUP_THRESHOLD_BYTES;
+              if (!g_live_read_cursor_init || live_behind(base, wp, lap_end) > max_lag)
+                base = live_ring_back(wp, LIVE_TARGET_LAG_BYTES + RADIO_READAHEAD_BYTES, lap_end);
+              // Never further back than what's actually been written.
+              uint32_t max_back = avail > LIVE_SAFETY_MARGIN_BYTES ? avail - LIVE_SAFETY_MARGIN_BYTES : 0;
+              if (live_behind(base, wp, lap_end) > max_back) base = live_ring_back(wp, max_back, lap_end);
+              g_open_base = base;
+              g_open_file = file_index;
+              g_open_ms = now_ms;
+              g_open_max_off = 0;
+              g_live_opens++;
+              cursor = base;
+            }
+            g_live_read_cursor_init = true;
+            g_live_underrun = false;
+            g_silence_bridge_remaining = 0;
+            g_live_max_lag = live_behind(cursor, wp, lap_end) + LIVE_CATCHUP_THRESHOLD_BYTES;
+            g_live_grace_left = LIVE_OPEN_GRACE_BYTES;
+          }
+#endif
+          if (probe_read) {
+            // Probe (duration/ID3 lookup): valid silent frames, cursor untouched.
+            uint32_t keep = g_silence_offset;
+            serve_silence(buffer + out_off, n_safe);
+            g_silence_offset = keep;
+            g_live_probe_reads++;
+          } else {
           bool need_jump = !g_live_read_cursor_init;
           uint32_t behind = 0;
           if (!need_jump) {
@@ -1010,7 +1092,14 @@ static void disk_read_at(uint32_t abs_pos, uint8_t *buffer, uint32_t len,
             // Too far behind live -- or AHEAD of the writer, which this
             // arithmetic reports as almost a full lap behind. Either way,
             // jump to near-live.
-            need_jump = behind > LIVE_TARGET_LAG_BYTES + LIVE_CATCHUP_THRESHOLD_BYTES;
+            uint32_t jump_limit = LIVE_TARGET_LAG_BYTES + LIVE_CATCHUP_THRESHOLD_BYTES;
+            if (g_live_max_lag) {
+              // Just opened with the cursor deliberately behind (see RADIO_
+              // READAHEAD_BYTES): let the read-ahead burst drain it.
+              if (behind <= jump_limit || g_live_grace_left == 0) g_live_max_lag = 0;
+              else jump_limit = g_live_max_lag;
+            }
+            need_jump = behind > jump_limit;
           }
           if (need_jump) {
             uint32_t target = (LIVE_TARGET_LAG_BYTES > n_safe) ? LIVE_TARGET_LAG_BYTES : n_safe;
@@ -1071,6 +1160,12 @@ static void disk_read_at(uint32_t abs_pos, uint8_t *buffer, uint32_t len,
                   wp, lap_end, cursor, behind, (int)need_jump, (int)g_live_underrun);
 #endif
           g_live_read_cursor = cursor;
+          g_live_grace_left = g_live_grace_left > n_safe ? g_live_grace_left - n_safe : 0;
+#if defined(FATDISK_MULTI_FILE)
+          if (file_index == g_open_file && file_rel_off + n_safe > g_open_max_off)
+            g_open_max_off = file_rel_off + n_safe;
+#endif
+          }
         }
 #if defined(ARDUINO) && defined(FATDISK_LIVE_DEBUG)
         else {

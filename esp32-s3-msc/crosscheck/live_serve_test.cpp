@@ -123,6 +123,93 @@ static Result run(double rate, int stall_every_ms, int stall_ms, bool burst, int
   return r;
 }
 
+
+// Kenwood-pattern reader through the REAL serving path (disk_read_at) with the
+// writer running: open = start, 512 KB-stride probes, last 2 KB, 40 KB head,
+// re-read from 0 with a 58 KB burst, then 2 KB every 128 ms. Scripted: play,
+// natural end (2.5 s pause) into the next file, Next mid-file, a Back that
+// restarts, a double Back. The natural end is a real one: file 1 played to its
+// full size (~4 simulated minutes). Returns problems found (0 = pass).
+struct KwResult { int underrun_reads, underrun_after_button, violations, seam_breaks, opens; };
+static KwResult run_kenwood(bool verbose) {
+  memset(g_ring, 0, DECLARED_FILE_SIZE);
+  g_write_pos = 0; g_total_written = 0; g_ring_lap_end = DECLARED_FILE_SIZE;
+  g_live_read_cursor = 0; g_live_read_cursor_init = false;
+  g_live_underrun = false; g_live_underruns = 0; g_silence_bridge_remaining = 0;
+  g_open_file = 0xFFFFFFFF; g_live_max_lag = 0; g_live_grace_left = 0;
+  g_any_file_read = false; g_reader_anchored = false; g_file_switch_callback = nullptr;
+  const uint32_t FRAME = 418, RD = 2048;
+  const uint32_t data_start = FIRST_DATA_LBA * SECTOR_SIZE;
+  uint64_t written = 0; double owed = 0; uint8_t frame[FRAME];
+  uint8_t buf[RD];
+  KwResult r{0, 0, 0, 0, 0};
+  bool last_open_natural = false;
+  uint32_t file = 0, pos = 0;
+  int64_t last_end = -1;  // stream offset just past the last playback byte served
+  bool expect_seam = false;
+  int next_read_ms = 0, eof_until = -1;
+  auto rd = [&](uint32_t f, uint32_t off) {
+    g_link_last_frame_ms = FATDISK_MILLIS();
+    uint32_t u0 = g_live_underruns;
+    disk_read_at(data_start + f * DECLARED_FILE_SIZE + off, buf, RD);
+    return g_live_underruns != u0;
+  };
+  auto open = [&](uint32_t f, bool after_natural_end) {
+    r.opens++;
+    rd(f, 0);
+    for (uint32_t off = 0x7f800; off < DECLARED_FILE_SIZE; off += 0x80000) rd(f, off);
+    rd(f, DECLARED_FILE_SIZE - RD);
+    for (uint32_t off = 0; off < 40 * 1024; off += RD) rd(f, off);
+    file = f; pos = 0;
+    expect_seam = after_natural_end;
+    last_open_natural = after_natural_end;
+  };
+  auto play_read = [&]() {  // one playback read at `pos`, validated
+    bool under = rd(file, pos);
+    pos += RD;
+    if (under) { r.underrun_reads++; if (!last_open_natural) r.underrun_after_button++; return; }
+    int64_t at = locate(buf, RD, written);
+    if (at < 0) { r.violations++; if (verbose) printf("  kw: VIOLATION at file %u pos %u\n", file, pos - RD); return; }
+    if (expect_seam) {
+      if (at != last_end) { r.seam_breaks++; if (verbose) printf("  kw: seam off by %lld\n", (long long)(at - last_end)); }
+      expect_seam = false;
+    }
+    last_end = at + RD;
+  };
+  // Script (ms of simulated time -> action).
+  const int T_START = 5000, T_NEXT = 270000, T_BACK_RESTART = 290000, T_DOUBLE_BACK = 310000;
+  bool did_next = false, did_restart = false, did_double = false, started = false;
+  uint32_t burst_left = 0;
+  for (int t = 0; t < 330000; t++) {
+    owed += 16000 / 1000.0;
+    while (owed >= FRAME) {
+      for (uint32_t i = 0; i < FRAME; i++) frame[i] = stream_byte(written + i);
+      disk_append(frame, FRAME, false);
+      written += FRAME; owed -= FRAME;
+    }
+    if (!started && t == T_START) { open(0, false); burst_left = 58 * 1024; started = true; }
+    if (!started) continue;
+    if (!did_next && t == T_NEXT) { open((file + 1) % NUM_FILES, false); burst_left = 58 * 1024; did_next = true; eof_until = -1; }
+    if (!did_restart && t == T_BACK_RESTART) { open(file, false); burst_left = 58 * 1024; did_restart = true; eof_until = -1; }
+    if (!did_double && t == T_DOUBLE_BACK) {
+      open(file, false); open((file + NUM_FILES - 1) % NUM_FILES, false);
+      burst_left = 58 * 1024; did_double = true; eof_until = -1;
+    }
+    if (eof_until >= 0) {
+      if (t >= eof_until) { eof_until = -1; open((file + 1) % NUM_FILES, true); burst_left = 58 * 1024; }
+      continue;
+    }
+    while (burst_left > 0) { play_read(); burst_left -= RD; }
+    if (t >= next_read_ms) {
+      next_read_ms = t + 128;
+      if (pos >= DECLARED_FILE_SIZE) { eof_until = t + 2500; continue; }  // natural end: the radio's pause
+      play_read();
+    }
+  }
+  (void)frame;
+  return r;
+}
+
 int main() {
   g_ring = (uint8_t *)malloc(DECLARED_FILE_SIZE);
   g_ring_mutex = FATDISK_MUTEX_CREATE();
@@ -153,6 +240,18 @@ int main() {
     failures += !ok;
     printf("%-40s real=%d underrun=%d episodes=%d violations=%d  %s\n", "2s outage, then 400ms stall/3s jitter",
            r.real, r.underrun_reads, r.episodes, r.violations, ok ? "OK" : "FAIL (want exactly 1 episode)");
+  }
+
+  {
+    // Mount/Next/Back: no silence at all. Natural end (radio pauses 2.5 s,
+    // then wants 58 KB): seamless, so up to (58 KB - pause's worth + the
+    // 12 KB lag rebuilt) of silence -- ~1 s, once per file.
+    KwResult k = run_kenwood(true);
+    bool ok = k.underrun_after_button == 0 && k.underrun_reads <= 12 && k.violations == 0 && k.seam_breaks == 0;
+    failures += !ok;
+    printf("%-40s opens=%d underrun_reads: button/mount=%d natural_end=%d violations=%d seam_breaks=%d  %s\n",
+           "Kenwood open pattern, real serve path", k.opens, k.underrun_after_button,
+           k.underrun_reads - k.underrun_after_button, k.violations, k.seam_breaks, ok ? "OK" : "FAIL");
   }
 
   // Switch detector, driven by a model of the real Kenwood, from the car

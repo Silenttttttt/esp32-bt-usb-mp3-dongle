@@ -914,8 +914,9 @@ void loop() {
     }
 #endif
 #ifdef FATDISK_ALWAYS_SERVE_LIVE
-    Serial.printf("[s3] live: underruns=%lu lap_end=%lu cursor=%lu\n",
-                  (unsigned long)g_live_underruns, (unsigned long)g_ring_lap_end,
+    Serial.printf("[s3] live: underruns=%lu opens=%lu probes=%lu lap_end=%lu cursor=%lu\n",
+                  (unsigned long)g_live_underruns, (unsigned long)g_live_opens,
+                  (unsigned long)g_live_probe_reads, (unsigned long)g_ring_lap_end,
                   (unsigned long)g_live_read_cursor);
 #endif
   }
