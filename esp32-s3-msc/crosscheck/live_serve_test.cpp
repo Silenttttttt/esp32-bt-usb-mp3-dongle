@@ -235,6 +235,51 @@ int main() {
          a_ok ? "OK" : "FAIL", b_ok ? "OK" : "FAIL", c_ok ? "OK" : "FAIL");
   failures += !a_ok + !b_ok + !c_ok;
 
+#if defined(EARLY_END_FAT) || defined(EARLY_END_READ_ERROR)
+  // Early-end variants (build with -DEARLY_END_FAT and/or -DEARLY_END_READ_ERROR):
+  // file 2 is open (case c); a new title ends it early.
+  auto fat_entry = [](uint32_t cl) -> uint16_t {
+    const uint8_t *p = g_fat_sector_cache + (cl * 3) / 2;
+    return (cl & 1) ? (uint16_t)((p[0] >> 4) | (p[1] << 4)) : (uint16_t)(p[0] | ((p[1] & 0x0F) << 8));
+  };
+  auto read_err = [](uint32_t file, uint32_t rel) {
+    uint8_t buf[SECTOR_SIZE]; bool err = false;
+    g_link_last_frame_ms = FATDISK_MILLIS();  // link alive, else the stale-link path serves zeros first
+    disk_read_at(FIRST_DATA_LBA * SECTOR_SIZE + file * DECLARED_FILE_SIZE + rel, buf, SECTOR_SIZE,
+                 nullptr, nullptr, &err);
+    return err;
+  };
+  for (uint32_t off = 8 * CLUSTER_SIZE; off < 40 * CLUSTER_SIZE; off += CLUSTER_SIZE)
+    fatdisk_note_file_read(2, off, CLUSTER_SIZE);
+  if (set_title_utf8("Song D", 6)) force_track_change(nullptr);
+  uint32_t end = get_file_declared_size(2);
+  uint32_t last_cl = 2 + 2 * DATA_CLUSTERS + (end - 1) / CLUSTER_SIZE;
+  bool v_ok = end < DECLARED_FILE_SIZE;
+#ifdef EARLY_END_FAT
+  v_ok = v_ok && fat_entry(last_cl) == 0xFFF && fat_entry(last_cl - 1) == last_cl;
+#endif
+#ifdef EARLY_END_READ_ERROR
+  v_ok = v_ok && read_err(2, end) && read_err(2, end + 5 * CLUSTER_SIZE) && !read_err(2, end - SECTOR_SIZE) &&
+         !read_err(0, end);
+#endif
+  play_until_eof_then_next(2, 40 * CLUSTER_SIZE);  // radio moves on -> everything restored
+  v_ok = v_ok && g_current_file_index == 0 && get_file_declared_size(2) == DECLARED_FILE_SIZE &&
+         fat_entry(last_cl) == last_cl + 1 && !read_err(2, end) && g_callbacks_next == next0 + 1;
+  printf("early-end variant (FAT=%d, READ_ERROR=%d) applied and undone: %s\n",
+#ifdef EARLY_END_FAT
+         1,
+#else
+         0,
+#endif
+#ifdef EARLY_END_READ_ERROR
+         1,
+#else
+         0,
+#endif
+         v_ok ? "OK" : "FAIL");
+  failures += !v_ok;
+#endif
+
   printf(failures ? "FAILED (%d)\n" : "ALL OK\n", failures);
   return failures ? 1 : 0;
 }

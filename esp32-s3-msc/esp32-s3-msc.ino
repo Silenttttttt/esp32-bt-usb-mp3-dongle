@@ -133,9 +133,21 @@ Adafruit_NeoPixel status_led(RGB_LED_COUNT, RGB_LED_PIN, NEO_GRB + NEO_KHZ800);
 
 USBMSC MSC;
 
+extern "C" bool tud_msc_set_sense(uint8_t lun, uint8_t sense_key, uint8_t add_sense_code,
+                                  uint8_t add_sense_qualifier);
+
 static int32_t msc_on_read(uint32_t lba, uint32_t offset, void *buffer, uint32_t bufsize) {
   uint32_t abs_pos = lba * SECTOR_SIZE + offset;
-  disk_read_at(abs_pos, (uint8_t *)buffer, bufsize);
+  bool read_error = false;
+  disk_read_at(abs_pos, (uint8_t *)buffer, bufsize, nullptr, nullptr, &read_error);
+  if (read_error) {
+    // EARLY_END_READ_ERROR: fail this read as MEDIUM ERROR / unrecovered
+    // read error (03/11/00), i.e. a bad spot on a present disk -- not
+    // "medium not present", which a radio would treat as the stick being
+    // pulled. Set before returning the error so TinyUSB reports this sense.
+    tud_msc_set_sense(0, 0x03, 0x11, 0x00);
+    return -1;
+  }
   return bufsize;
 }
 

@@ -468,6 +468,19 @@ static void pack_fat12_entries(const uint16_t *entries, uint32_t n, uint8_t *out
   }
 }
 
+// Sets one FAT12 entry in the served FAT (both FAT copies are served from
+// this one cache).
+static void set_fat12_entry(uint32_t cluster, uint16_t value) {
+  uint8_t *p = g_fat_sector_cache + (cluster * 3) / 2;
+  if (cluster & 1) {
+    p[0] = (uint8_t)((p[0] & 0x0F) | ((value & 0x0F) << 4));
+    p[1] = (uint8_t)(value >> 4);
+  } else {
+    p[0] = (uint8_t)(value & 0xFF);
+    p[1] = (uint8_t)((p[1] & 0xF0) | ((value >> 8) & 0x0F));
+  }
+}
+
 static void build_boot_sector() {
   memset(g_boot_sector, 0, SECTOR_SIZE);
   uint8_t *bs = g_boot_sector;
@@ -814,6 +827,56 @@ static volatile uint32_t g_prev_file_index_to_restore = 0;
 // the file's size back so it isn't left truncated for its next open.
 static const uint32_t SUPPRESS_WINDOW_MS = 10000;
 
+// Early end (2026-09-25). There is no "end of file" message in USB mass
+// storage -- a radio decides a file ended by comparing its position with
+// the size it read, normally at open. So force_track_change() makes the
+// open file end right after what's been read in every way the S3 can show
+// a radio mid-file, pending a test on the real Kenwood:
+//   always:               the directory entry's size shrinks (radios that
+//                         re-read the entry)
+//   EARLY_END_FAT:        the file's cluster chain ends there too (radios
+//                         that follow the FAT as they read; one that cached
+//                         the size will likely see a broken chain and skip)
+//   EARLY_END_READ_ERROR: reads past that point fail with a MEDIUM ERROR
+//                         sense (radios that skip unreadable tracks)
+// All of it is undone once the radio switches file, or after
+// SUPPRESS_WINDOW_MS.
+static volatile bool g_early_end_active = false;
+static volatile uint32_t g_early_end_file = 0;
+static volatile uint32_t g_early_end_size = 0;
+
+static void restore_early_end() {
+  if (!g_early_end_active) return;
+  g_early_end_active = false;
+  set_file_declared_size(g_early_end_file, DECLARED_FILE_SIZE);
+#ifdef EARLY_END_FAT
+  uint32_t last_rel = (g_early_end_size - 1) / CLUSTER_SIZE;
+  if (last_rel + 1 < DATA_CLUSTERS) {
+    uint32_t cluster = 2 + g_early_end_file * DATA_CLUSTERS + last_rel;
+    set_fat12_entry(cluster, (uint16_t)(cluster + 1));
+  }
+#endif
+}
+
+// True when a read of file `file_index` at `file_rel_off` falls past an
+// active early end -- EARLY_END_READ_ERROR fails such reads.
+static inline bool early_end_read_blocked(uint32_t file_index, uint32_t file_rel_off) {
+#ifdef EARLY_END_READ_ERROR
+  if (!g_early_end_active) return false;
+  // Also expire here: a radio that just retries the failing read never
+  // reaches fatdisk_note_file_read()'s own expiry check.
+  if ((int32_t)(FATDISK_MILLIS() - g_suppress_deadline_ms) > 0) {
+    g_suppress_next_switch_callback = false;
+    restore_early_end();
+    return false;
+  }
+  return file_index == g_early_end_file && file_rel_off >= g_early_end_size;
+#else
+  (void)file_index; (void)file_rel_off;
+  return false;
+#endif
+}
+
 static uint32_t get_file_declared_size(uint32_t file_index) {
   return g_file_sizes[file_index];
 }
@@ -841,7 +904,7 @@ static void fatdisk_note_file_read(uint32_t file_index, uint32_t file_rel_off, u
   if (g_suppress_next_switch_callback &&
       (int32_t)(now - g_suppress_deadline_ms) > 0) {
     g_suppress_next_switch_callback = false;
-    set_file_declared_size(g_prev_file_index_to_restore, g_restore_size_for_prev_file);
+    restore_early_end();
   }
   uint32_t read_end = file_rel_off + bytes_this_read;
   bool was_idle = !g_any_file_read || (now - g_last_file_read_ms) > READER_IDLE_RESET_MS;
@@ -900,7 +963,7 @@ static void fatdisk_note_file_read(uint32_t file_index, uint32_t file_rel_off, u
     // The switch we were waiting for just landed -- safe to restore the
     // file we left back to full size now (the radio has, by definition,
     // already finished reading everything up to the shrunk size).
-    set_file_declared_size(g_prev_file_index_to_restore, g_restore_size_for_prev_file);
+    restore_early_end();
 #if !defined(ARDUINO) && defined(FATDISK_LIVE_DEBUG)
     fprintf(stderr, "[track-rotate] confirmed switch %u -> %u, restored size for %u\n",
             g_prev_file_index_to_restore, file_index, g_prev_file_index_to_restore);
@@ -933,9 +996,18 @@ static void force_track_change(const char *new_name11) {
   // already been read (which would be nonsensical -- can't un-read bytes).
   uint32_t new_size = g_current_file_read_end + CLUSTER_SIZE;
   if (new_size > DECLARED_FILE_SIZE) new_size = DECLARED_FILE_SIZE;
+  restore_early_end();  // a previous early end still pending
   g_prev_file_index_to_restore = g_current_file_index;
   g_restore_size_for_prev_file = DECLARED_FILE_SIZE;
   set_file_declared_size(g_current_file_index, new_size);
+#ifdef EARLY_END_FAT
+  uint32_t last_rel = (new_size - 1) / CLUSTER_SIZE;
+  if (last_rel + 1 < DATA_CLUSTERS)
+    set_fat12_entry(2 + g_current_file_index * DATA_CLUSTERS + last_rel, 0xFFF);  // end of chain
+#endif
+  g_early_end_file = g_current_file_index;
+  g_early_end_size = new_size;
+  g_early_end_active = true;
 
   uint32_t next_idx = (g_current_file_index + 1) % NUM_FILES;
   (void)new_name11;  // names now come from set_title_utf8(), for every file at once
@@ -969,7 +1041,8 @@ static void force_track_change(const char *new_name11) {
 // trigger against a real live feed, without duplicating this straddle
 // logic in a second, hand-copied place just to log it.
 static void disk_read_at(uint32_t abs_pos, uint8_t *buffer, uint32_t len,
-                          bool *out_straddled = nullptr, bool *out_lock_missed = nullptr) {
+                          bool *out_straddled = nullptr, bool *out_lock_missed = nullptr,
+                          bool *out_read_error = nullptr) {
 #ifdef FATDISK_ALWAYS_SERVE_LIVE
   (void)out_straddled;  // no "straddling a fixed offset" concept in this mode
 #endif
@@ -1029,6 +1102,10 @@ static void disk_read_at(uint32_t abs_pos, uint8_t *buffer, uint32_t len,
         continue;
       }
 #ifdef FATDISK_MULTI_FILE
+      if (early_end_read_blocked(file_index, file_rel_off)) {
+        if (out_read_error) *out_read_error = true;
+        return;
+      }
       fatdisk_note_file_read(file_index, file_rel_off, n);
 #endif
 

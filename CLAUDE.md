@@ -344,6 +344,12 @@ arduino-cli upload -p /dev/ttyACM<N> --fqbn "esp32:esp32:esp32s3:USBMode=default
   opens the next file, which already has the new name; the hop is never relayed to the phone.
   It only works on a radio that notices the change mid-file; car_sim (size read at open, like
   FatFs) doesn't, so there the new name shows at the next open. Unconfirmed on the Kenwood.
+- Car-test flags for that early end (both off by default; append to `F` above). USB mass
+  storage has no end-of-file message, so these are the other things a radio can see mid-file:
+  - `EARLY_END_FAT`: the file's cluster chain is also cut right after what's been read.
+  - `EARLY_END_READ_ERROR`: reads past that point fail with sense MEDIUM ERROR 03/11/00.
+  Both are undone once the radio switches file, or after 10 s. Test one at a time in the car.
+  Host test: build `crosscheck/live_serve_test.cpp` with the flag(s) added.
 - S3 debug console: `serial_logger.py --baud 115200 --mode line`.
 
 **A required local library patch lives OUTSIDE this repo and can be silently lost.** The
