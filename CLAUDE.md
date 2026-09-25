@@ -1,5 +1,8 @@
 # digispark-msc — BT-to-USB-MP3 car radio bridge
 
+**Current work (2026-09-25): the in-car capture session. Read `progress/CAR_SESSION_HANDOFF.md`
+first** -- what the first car test showed, the capture plan, hardware, and Muni's working rules.
+
 **If the ESP32-S3 board just arrived, start with `progress/MORNING_RUNBOOK.md`** — a single
 ordered checklist for bringing it up, pulled together from everything scattered across this
 file and STATUS.md.
