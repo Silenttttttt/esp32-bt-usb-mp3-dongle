@@ -3,24 +3,30 @@
 # flags live -- don't retype them by hand (a dropped flag has cost hours
 # twice: CLAUDE.md "Build/flash commands").
 #
-#   ./flash.sh                 build + flash the car build
+#   ./flash.sh                 build + flash v2 (the car build)
+#   ./flash.sh --v1            the v1 build instead (see BUILD_FLAGS.md)
+#   ./flash.sh --v1 --s3-encode  v1, but the S3 runs the MP3 encoder (classic sends PCM)
 #   ./flash.sh --trace         + MSC_TRACE (log every SCSI command; car capture)
-#   ./flash.sh --v1             the v1 build instead of v2 (see BUILD_FLAGS.md)
 #   ./flash.sh --no-upload     compile only
 #   ./flash.sh -DSOME_FLAG     extra -D flags, appended
+# Options can come in any order. The classic must be flashed with the same
+# profile and encoder choice (esp32-bt-mp3-test/flash.sh).
 #
 # The firmware prints its flags and git commit at boot ("[s3] build: ..."),
 # and each flash is appended to logs/flash_history.log.
 set -euo pipefail
 cd "$(dirname "$0")"
 
-# Car build (verified in the Kenwood 2026-09-25). ENCODE_ON_S3 must match
-# the classic's build (esp32-bt-mp3-test/flash.sh).
-FLAGS=(
+# v2, the car build (verified in the Kenwood 2026-09-25).
+V2_FLAGS=(
   -DFATDISK_ALWAYS_SERVE_LIVE  # serve reads from the live edge, not the requested offset
   -DFATDISK_MULTI_FILE         # 3 files on the same live stream + Next/Back relay to the phone
   -DLED_RAINBOW_PLAYING        # rainbow LED while playing
   -DENCODE_ON_S3               # the S3 runs the MP3 encoder; classic sends PCM at 2 Mbaud
+)
+# v1, exactly as car-proven 2026-09-18: one file served by requested offset, 25.6 s ring.
+V1_FLAGS=(
+  -DFATDISK_DATA_CLUSTERS=100
 )
 
 SERIAL=${S3_SERIAL:-5CE5146685}  # USB serial number of the board to flash
@@ -28,16 +34,23 @@ PORT=/dev/serial/by-id/usb-1a86_USB_Single_Serial_${SERIAL}-if00
 FQBN="esp32:esp32:esp32s3:USBMode=default,PSRAM=opi"
 UPLOAD=1
 TRACE=0
+V1=0
+S3ENC=0
+EXTRA=()
 for a in "$@"; do
   case $a in
-    # v1, exactly as car-proven 2026-09-18: one file served by requested offset, 25.6 s ring
-    --v1) FLAGS=(-DFATDISK_DATA_CLUSTERS=100) ;;
+    --v1) V1=1 ;;
+    --s3-encode) S3ENC=1 ;;
     --no-upload) UPLOAD=0 ;;
     --trace) TRACE=1 ;;
-    -D*) FLAGS+=("$a") ;;
+    -D*) EXTRA+=("$a") ;;
     *) echo "unknown argument: $a" >&2; exit 2 ;;
   esac
 done
+if [[ $V1 == 1 ]]; then FLAGS=("${V1_FLAGS[@]}"); else FLAGS=("${V2_FLAGS[@]}"); fi
+# --s3-encode: the S3 runs the encoder (v2 always does).
+if [[ $S3ENC == 1 && " ${FLAGS[*]} " != *" -DENCODE_ON_S3 "* ]]; then FLAGS+=(-DENCODE_ON_S3); fi
+FLAGS+=("${EXTRA[@]}")
 
 W=""
 if [[ $TRACE == 1 ]]; then
