@@ -5751,3 +5751,17 @@ post-mount probe noise). All pass.
 - S3 LED: rainbow restored (`-DLED_RAINBOW_PLAYING`, now in CLAUDE.md), and a white triple
   flash when a next/prev is relayed. Both boards now log total heap (FRAG / `[s3] mem:`).
 - Logger: framed mode keeps unframed text as `[raw]` lines (ESP-IDF/library log output).
+
+## 2026-09-25: ENCODE_ON_S3 verified with real music
+
+Both boards flashed with `-DENCODE_ON_S3` (shared encoder `common/mp3_pipeline.h`, link
+constants `common/link_protocol.h`, commit 6057b27). Phone streaming real music:
+- Link at 2 Mbaud: 4,249 frames, 0 bad. PCM 88,064 B/s as expected.
+- S3 encode per 20 ms of audio: avg 5.9 ms, max 8.3 ms (4.2 ms on silence). S3 internal free
+  174 KB (was 278 KB before Shine moved there).
+- Classic: 101 KB heap free while streaming, low-water 79.5 KB (was 19 KB / 3 KB), zero
+  PCM_DROPS.
+- AVRCP up 2.8 s after boot and stayed up; title arrived. GUI: 0 decode errors, no new
+  underruns.
+- S3 status LED: with the flag, link health = PCM freshness; new fast-red "S3 encoder
+  failed" state; `progress/LED_STATUS_TABLE.md` resynced.
