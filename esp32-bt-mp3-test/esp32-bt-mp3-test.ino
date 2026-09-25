@@ -494,6 +494,11 @@ volatile uint32_t g_audio_cb_count = 0;
 // solid), instead of connection_state_changed() just writing the pin
 // directly and loop() never knowing the current state.
 volatile bool g_bt_connected = false;
+// Last non-empty title, resent periodically from loop() so the S3 recovers
+// its file names after its own reboot or a missed message (2026-09-25: an S3
+// reflash wiped the name and the classic only sends on track change).
+static char g_last_title[96] = {0};
+
 volatile uint32_t g_bt_connected_since_ms = 0;  // see manage_encoder()
 
 // REAL DIAGNOSTIC (2026-09-22, Muni: "the phone is paired and playing audio
@@ -921,6 +926,7 @@ void connection_state_changed(esp_a2d_connection_state_t state, void *) {
   // ~1ms anyway, but zero-risk to just do it here too).
   g_bt_connected = (state == ESP_A2D_CONNECTION_STATE_CONNECTED);
   if (!g_bt_connected) digitalWrite(2, LOW);
+  if (!g_bt_connected) g_last_title[0] = 0;  // a different phone may connect next
   if (g_bt_connected) {
     g_last_connected_ms = millis();  // see STUCK_RADIO_WATCHDOG_MS's own comment in loop()
     g_bt_connected_since_ms = millis();
@@ -1227,6 +1233,10 @@ void avrc_playstatus_callback(esp_avrc_playback_stat_t playback) {
 }
 
 void avrc_metadata_callback(uint8_t id, const uint8_t *text) {
+  if (id == ESP_AVRC_MD_ATTR_TITLE && text && text[0]) {
+    strncpy(g_last_title, (const char *)text, sizeof(g_last_title) - 1);
+    g_last_title[sizeof(g_last_title) - 1] = 0;
+  }
   const char *label;
   char label_buf[16];
   switch (id) {
@@ -1859,6 +1869,13 @@ void loop() {
     // Same fix, same pattern: resend the CURRENT state here too, every
     // ~1s, not just on transitions.
     send_control(((int32_t)(now_ms - last_real_audio_ms) < 150) ? "AUDIO_LIVE" : "AUDIO_SILENCE");
+    static uint32_t last_title_resend_ms = 0;
+    if (g_bt_connected && g_last_title[0] && now_ms - last_title_resend_ms >= 5000) {
+      last_title_resend_ms = now_ms;
+      char tb[110];
+      snprintf(tb, sizeof(tb), "TITLE:%s", g_last_title);
+      send_control(tb);
+    }
   }
 
   // LED2 (classic ESP32 DevKit's onboard blue LED) status, requested by

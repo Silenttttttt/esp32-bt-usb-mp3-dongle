@@ -377,10 +377,16 @@ static void link_task(void *) {
         // given metadata typically arrives well within one file's
         // remaining playtime, without needing a more elaborate pending-name
         // queue matched against specific rotation events.
+        // All files carry the same live stream, so every one of them gets
+        // the current title (2026-09-25): whichever file the radio opens next
+        // -- Next, Back, end of file, or a re-open after the car restarts --
+        // reads the current song's name. (The open file's new name only
+        // shows once the radio re-opens it; radios read names at open.)
+        // The classic resends the title every 5s, so this also recovers
+        // after an S3 reboot.
         char name11[11];
         sanitize_to_8_3_name((const char *)(msg + 6), msg_len - 6, name11);
-        uint32_t next_idx = (g_current_file_index + 1) % NUM_FILES;
-        set_file_name(next_idx, name11);
+        for (uint32_t f = 0; f < NUM_FILES; f++) set_file_name(f, name11);
 #endif
       }
     }
