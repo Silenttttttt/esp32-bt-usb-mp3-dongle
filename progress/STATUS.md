@@ -5795,3 +5795,23 @@ constants `common/link_protocol.h`, commit 6057b27). Phone streaming real music:
 - **Name one song behind:** buffer files (Muni's design). Verified 01:18: GUI Next -> buffer ->
   one relay -> title 0.5 s later -> file 3/3 showing the new song's name.
 - `EARLY_END_FAT` / `EARLY_END_READ_ERROR` remain car-test flags (off by default).
+
+## 2026-09-25 ~01:40 GMT-3: FIRST CAR TEST OF THE MULTI-FILE BUILD -- only playback worked
+
+Build: S3 `d8726ed` (MULTI_FILE, buffer files, LFN, EARLY_END_FAT default), classic with
+ENCODE_ON_S3. Reported by Muni from the real Kenwood:
+- First plug-in: radio showed "N/A device". Unplug/replug -> it started playing.
+- Audio playback itself worked. **Everything else failed:**
+- Next on the radio -> "unsupported file" error, then it jumped to file 3.
+- On file 3, Next doesn't go forward.
+- Long file names don't show.
+- The S3 never detected the radio's file changes (no relay to the phone).
+
+Conclusion: most bench assumptions about how the Kenwood reads the disk are wrong
+(car_sim was built on guesses). **Do not tune car_sim or the S3 further from the bench.**
+
+Next step (Muni's plan, future session, not started): bring the laptop to the car, run
+Claude there, and fully capture how the Kenwood actually talks to the S3 -- e.g. log every
+MSC callback on the S3's debug serial port (SCSI commands, READ10 LBA/length/order, dir and
+FAT reads, sense requests, timing) during mount, play, Next/Back, and the "unsupported file"
+case -- then rebuild the design (and car_sim) from that real trace.
