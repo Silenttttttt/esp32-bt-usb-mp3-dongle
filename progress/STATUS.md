@@ -5819,3 +5819,13 @@ Claude there, and fully capture how the Kenwood actually talks to the S3 -- e.g.
 MSC callback on the S3's debug serial port (SCSI commands, READ10 LBA/length/order, dir and
 FAT reads, sense requests, timing) during mount, play, Next/Back, and the "unsupported file"
 case -- then rebuild the design (and car_sim) from that real trace.
+
+## 2026-09-25 12:00-13:58 GMT-3: in-car capture session (laptop) -- DONE
+
+Full results and the to-do list: `progress/CAR_SESSION_RESULTS.md`; event log:
+`progress/CAR_TRACE_FINDINGS.md`. Headlines: MSC_TRACE captured the Kenwood's real access
+pattern (2 KB reads; every open reads the file's last sector; no mid-file re-reads; 1.9-3.5 s
+pause at a file end). Next relay fixed (the last-sector probe made every Next look like a natural
+EOF) and confirmed live with Back and folder wrap; USB auto re-attach added; song names dropped
+(Muni) -- a 56-char long name caused "unsupported file", and the radio only shows ID3v1 tags anyway.
+Second-device BT pairing reproduced as broken (legacy PIN, classic reboots during pairing).
