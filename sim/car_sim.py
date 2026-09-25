@@ -297,14 +297,35 @@ def find_all_file_entries(root_dir_bytes):
     detecting the car radio's own next/prev button presses via multiple
     directory entries that all alias the same live stream)."""
     entries = []
+    # VFAT long-name parts seen since the last 8.3 entry: {ordinal: 13 chars},
+    # plus the checksum they claim. Radios that show long names read them
+    # this way; one that doesn't would just skip attr 0x0F entries.
+    lfn_parts, lfn_checksum = {}, None
     for i in range(0, len(root_dir_bytes), 32):
         entry = root_dir_bytes[i:i + 32]
         if entry[0] in (0x00, 0xE5):
+            lfn_parts, lfn_checksum = {}, None
             continue
         attr = entry[11]
-        if attr & 0x08:  # volume label
+        if attr == 0x0F:  # long-filename part
+            if entry[0] & 0x40:
+                lfn_parts, lfn_checksum = {}, entry[13]
+            raw = entry[1:11] + entry[14:26] + entry[28:32]
+            lfn_parts[entry[0] & 0x1F] = raw.decode("utf-16-le", errors="replace")
             continue
-        name = entry[0:11].decode("ascii", errors="replace").strip()
+        if attr & 0x08:  # volume label
+            lfn_parts, lfn_checksum = {}, None
+            continue
+        base = entry[0:8].decode("ascii", errors="replace").rstrip()
+        ext = entry[8:11].decode("ascii", errors="replace").rstrip()
+        name = f"{base}.{ext}" if ext else base
+        chk = 0
+        for b in entry[0:11]:
+            chk = (((chk & 1) << 7) + (chk >> 1) + b) & 0xFF
+        if lfn_parts and lfn_checksum == chk and set(lfn_parts) == set(range(1, len(lfn_parts) + 1)):
+            long_name = "".join(lfn_parts[k] for k in sorted(lfn_parts))
+            name = long_name.split("\x00", 1)[0]
+        lfn_parts, lfn_checksum = {}, None
         first_cluster = int.from_bytes(entry[26:28], "little")
         size = int.from_bytes(entry[28:32], "little")
         entries.append({"name": name, "first_cluster": first_cluster, "size": size})

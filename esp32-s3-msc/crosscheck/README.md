@@ -182,3 +182,15 @@ not-yet-overwritten stream range (catches serving past the write pointer and the
 wrap tail). Also checks the switch detector: natural EOF, a mid-file Next press, and a reader
 restart or post-mount probe noise are handled correctly. Must print `ALL OK`. Sweep the jump
 target lag with `-DFATDISK_LIVE_TARGET_LAG=<bytes>`. Added 2026-09-24.
+
+## VFAT long filenames (FATDISK_MULTI_FILE)
+
+```
+g++ -O2 -std=c++17 -Wall -Wno-unused-function -DFATDISK_ALWAYS_SERVE_LIVE -DFATDISK_MULTI_FILE -o lfn_image_test lfn_image_test.cpp
+./lfn_image_test /tmp/lfn.img "Arctic Monkeys - 505" && fsck.fat -n -v -l /tmp/lfn.img
+```
+fsck.fat must list `/Arctic Monkeys - 505.mp3 (ARCTIC~1.MP3)` and `~2`, `~3` with no errors
+(the "no volume label in root directory" notice predates the long names). Confirmed
+2026-09-25 with an empty title, ASCII, non-ASCII with forbidden characters, and a 300-char title
+(truncated to 255). The single-file build's metadata is byte-identical to before, apart from the
+per-boot volume serial.

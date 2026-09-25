@@ -335,6 +335,11 @@ arduino-cli upload -p /dev/ttyACM<N> --fqbn "esp32:esp32:esp32s3:USBMode=default
 - `LED_RAINBOW_PLAYING`: rainbow LED while audio is playing (Muni's preference) instead of solid green.
 - Host test for the live-serve path and the switch detector (run it after touching
   `fat_disk_shared.h`): `crosscheck/live_serve_test.cpp`, build line at the top of the file.
+- File names are VFAT long filenames (`<song title>.mp3`, full Unicode, up to 255 chars) on
+  the same FAT12 volume, with unique 8.3 aliases (`MARDYB~1.MP3`, `~2`, `~3`). Long names are
+  plain FAT directory entries, not a FAT16/32 feature. With `FATDISK_MULTI_FILE` the root
+  directory has 64 entries (16 without). Host check: `crosscheck/lfn_image_test.cpp` writes a
+  disk image to run `fsck.fat -n -v -l` on.
 - S3 debug console: `serial_logger.py --baud 115200 --mode line`.
 
 **A required local library patch lives OUTSIDE this repo and can be silently lost.** The

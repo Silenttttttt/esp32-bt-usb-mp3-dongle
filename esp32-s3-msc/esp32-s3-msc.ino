@@ -384,9 +384,8 @@ static void link_task(void *) {
         // shows once the radio re-opens it; radios read names at open.)
         // The classic resends the title every 5s, so this also recovers
         // after an S3 reboot.
-        char name11[11];
-        sanitize_to_8_3_name((const char *)(msg + 6), msg_len - 6, name11);
-        for (uint32_t f = 0; f < NUM_FILES; f++) set_file_name(f, name11);
+        // Written as a VFAT long filename ("<title>.mp3"), still FAT12.
+        set_title_utf8((const char *)(msg + 6), msg_len - 6);
 #endif
       }
     }

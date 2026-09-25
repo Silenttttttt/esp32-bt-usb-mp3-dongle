@@ -89,7 +89,14 @@ static const uint32_t SECTOR_SIZE = 512;
 static const uint32_t SECTORS_PER_CLUSTER = 8;  // 4KB clusters
 static const uint32_t RESERVED_SECTORS = 1;
 static const uint32_t NUM_FATS = 2;
-static const uint32_t ROOT_ENTRIES = 16;
+#ifdef FATDISK_MULTI_FILE
+// 64 (4 sectors) with multi-file: each file carries a VFAT long filename
+// (the song title) -- up to 20 long-name entries + its 8.3 entry, x3 files.
+// Still plain FAT12; long names are just extra root-directory entries.
+static const uint32_t ROOT_ENTRIES = 64;
+#else
+static const uint32_t ROOT_ENTRIES = 16;  // unchanged single-file layout
+#endif
 static const char FILE_NAME[12] = "STREAM  MP3";  // 8.3, space-padded (11 bytes + NUL)
 
 // REDUCED from 117 clusters (~30s) to 59 (~15.1s) on 2026-09-17 after a
@@ -173,23 +180,32 @@ static const uint32_t NUM_FILES = 3;
 // an early EOF (see force_end_current_file() below) the instant a real
 // track change happens, so the radio naturally advances to the NEXT file
 // in rotation, which by then already carries the new track's name. Made
-// mutable (was a compile-time `const char *const` array) so
-// set_file_name() below can rewrite an entry at runtime; still seeded from
-// FILE_NAME at boot, identical to the old static behavior until something
-// actually calls set_file_name().
+// mutable (was a compile-time `const char *const` array) so the 8.3
+// aliases can be rewritten at runtime by set_title_utf8() below.
 static char FILE_NAMES_BUF[NUM_FILES][12];
 static char *const FILE_NAMES[NUM_FILES] = {FILE_NAMES_BUF[0], FILE_NAMES_BUF[1], FILE_NAMES_BUF[2]};
-// Seeds FILE_NAMES_BUF from FILE_NAME -- called once, before build_root_dir()
-// -- rather than a static initializer, so there's exactly one place
-// (FILE_NAME itself) that defines the default name, no risk of the two
-// drifting apart.
-static void init_file_names() {
-  for (uint32_t f = 0; f < NUM_FILES; f++) memcpy(FILE_NAMES_BUF[f], FILE_NAME, 12);
-}
+// VFAT long filename (2026-09-25, Muni: "use the proper one"): the same
+// long name -- "<song title>.mp3" -- is written in front of every file's 8.3
+// entry, each file keeping a unique 8.3 alias (TITLE~1.MP3, ~2, ~3) as the
+// spec requires. Long names are FAT-generic (not a FAT16/32 feature): they
+// are extra 32-byte root-directory entries with attribute 0x0F, 13 UCS-2
+// characters each, tied to the 8.3 entry after them by a checksum.
+static const uint32_t LFN_MAX_CHARS = 255;       // VFAT maximum
+static const uint32_t LFN_CHARS_PER_ENTRY = 13;
+static const uint32_t LFN_MAX_ENTRIES = (LFN_MAX_CHARS + LFN_CHARS_PER_ENTRY - 1) / LFN_CHARS_PER_ENTRY;  // 20
+static uint16_t g_long_name[LFN_MAX_CHARS];
+static uint32_t g_long_len = 0;                   // 0 = no long name
+static bool g_names_initialized = false;
+
+static void init_file_names();  // defined with set_title_utf8(), below build_root_dir()
 #else
 static const uint32_t NUM_FILES = 1;
 static const char *const FILE_NAMES[NUM_FILES] = {FILE_NAME};
 #endif
+// Declared size of each file, and the root-dir entry index of its 8.3 entry
+// (with long names in front of it, file f is no longer simply entry f).
+static uint32_t g_file_sizes[NUM_FILES] = {DECLARED_FILE_SIZE};
+static uint32_t g_sfn_slot[NUM_FILES] = {0};
 
 static const uint32_t FAT_ENTRIES_NEEDED = NUM_FILES * DATA_CLUSTERS + 2;
 static const uint32_t FAT_BYTES = (FAT_ENTRIES_NEEDED * 3 + 1) / 2;
@@ -515,6 +531,117 @@ static void build_fat() {
 // disk_read_at() below maps every file's data range back onto the SAME
 // live ring content (see fatdisk file-index remap there). With NUM_FILES=1
 // this writes exactly the one entry it always did.
+#ifdef FATDISK_MULTI_FILE
+static_assert(NUM_FILES * (LFN_MAX_ENTRIES + 1) <= ROOT_ENTRIES,
+              "root directory too small for NUM_FILES maximum-length long names");
+
+static uint8_t lfn_checksum(const uint8_t *name11) {
+  uint8_t sum = 0;
+  for (int i = 0; i < 11; i++) sum = (uint8_t)(((sum & 1) << 7) + (sum >> 1) + name11[i]);
+  return sum;
+}
+
+static void put_ucs2(uint8_t *p, uint16_t c) { p[0] = c & 0xFF; p[1] = c >> 8; }
+
+// Rebuilds the whole root directory (long-name entries + 8.3 entry per
+// file) into a scratch copy, then swaps it in with one memcpy so a radio
+// reading the directory concurrently sees at most one short, consistent
+// update rather than a half-built layout.
+static void build_root_dir() {
+  if (!g_names_initialized) init_file_names();
+  static uint8_t dir[ROOT_DIR_SECTORS * SECTOR_SIZE];
+  static const uint8_t lfn_pos[13] = {1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30};
+  memset(dir, 0, sizeof(dir));
+  uint32_t slot = 0;
+  uint32_t n_lfn = (g_long_len + LFN_CHARS_PER_ENTRY - 1) / LFN_CHARS_PER_ENTRY;
+  for (uint32_t f = 0; f < NUM_FILES; f++) {
+    uint8_t chk = lfn_checksum((const uint8_t *)FILE_NAMES_BUF[f]);
+    for (uint32_t k = n_lfn; k >= 1; k--) {  // stored last-part-first
+      uint8_t *e = dir + slot * 32;
+      e[0] = (uint8_t)(k | (k == n_lfn ? 0x40 : 0));
+      e[11] = 0x0F;  // LFN attribute
+      e[13] = chk;
+      for (uint32_t i = 0; i < LFN_CHARS_PER_ENTRY; i++) {
+        uint32_t ci = (k - 1) * LFN_CHARS_PER_ENTRY + i;
+        uint16_t c = (ci < g_long_len) ? g_long_name[ci] : (ci == g_long_len ? 0x0000 : 0xFFFF);
+        put_ucs2(e + lfn_pos[i], c);
+      }
+      slot++;
+    }
+    uint8_t *entry = dir + slot * 32;
+    g_sfn_slot[f] = slot++;
+    memcpy(entry, FILE_NAMES_BUF[f], 11);
+    entry[11] = 0x20;  // ARCHIVE
+    entry[16] = 0x21; entry[17] = 0x4A;
+    entry[18] = 0x21; entry[19] = 0x4A;
+    entry[24] = 0x21; entry[25] = 0x4A;
+    uint32_t first_cluster = 2 + f * DATA_CLUSTERS;
+    entry[26] = first_cluster & 0xFF; entry[27] = (first_cluster >> 8) & 0xFF;
+    uint32_t size = g_file_sizes[f];
+    entry[28] = size & 0xFF; entry[29] = (size >> 8) & 0xFF;
+    entry[30] = (size >> 16) & 0xFF; entry[31] = (size >> 24) & 0xFF;
+  }
+  memcpy(g_root_dir_sector, dir, sizeof(dir));
+}
+
+// Sets every file's long name to "<title>.mp3" and its 8.3 alias to
+// <first 6 of A-Z0-9>~<n>.MP3, then rebuilds the directory. No-op when the
+// title is unchanged (the classic resends the current title every 5s).
+static void set_title_utf8(const char *title, uint32_t len) {
+  static uint16_t name[LFN_MAX_CHARS];  // static: off the UART task stack
+  uint32_t n = 0;
+  const uint32_t max_base = LFN_MAX_CHARS - 4;  // room for ".mp3"
+  for (uint32_t i = 0; i < len && n < max_base;) {
+    uint8_t b = (uint8_t)title[i];
+    uint32_t cp; uint32_t adv;
+    if (b < 0x80) { cp = b; adv = 1; }
+    else if ((b & 0xE0) == 0xC0 && i + 1 < len) { cp = ((b & 0x1F) << 6) | (title[i + 1] & 0x3F); adv = 2; }
+    else if ((b & 0xF0) == 0xE0 && i + 2 < len) { cp = ((b & 0x0F) << 12) | ((title[i + 1] & 0x3F) << 6) | (title[i + 2] & 0x3F); adv = 3; }
+    else { cp = '_'; adv = ((b & 0xF8) == 0xF0) ? 4 : 1; }  // outside the BMP, or malformed
+    i += adv;
+    if (cp < 0x20 || cp == '"' || cp == '*' || cp == '/' || cp == ':' || cp == '<' ||
+        cp == '>' || cp == '?' || cp == '\\' || cp == '|' || cp == 0x7F) cp = '_';
+    name[n++] = (uint16_t)cp;
+  }
+  uint32_t start = 0;
+  while (start < n && name[start] == ' ') start++;
+  while (n > start && (name[n - 1] == ' ' || name[n - 1] == '.')) n--;
+  if (n <= start) { static const char *def = "Stream"; start = 0; n = 0; for (const char *p = def; *p; p++) name[n++] = *p; }
+  static uint16_t full[LFN_MAX_CHARS];
+  uint32_t full_len = 0;
+  for (uint32_t i = start; i < n; i++) full[full_len++] = name[i];
+  const char *ext = ".mp3";
+  for (const char *p = ext; *p; p++) full[full_len++] = *p;
+
+  if (full_len == g_long_len && memcmp(full, g_long_name, full_len * 2) == 0) return;
+  memcpy(g_long_name, full, full_len * 2);
+  g_long_len = full_len;
+
+  char basis[6]; uint32_t bn = 0;
+  for (uint32_t i = start; i < n && bn < 6; i++) {
+    uint16_t c = name[i];
+    if (c >= 'a' && c <= 'z') c = c - 'a' + 'A';
+    if ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) basis[bn++] = (char)c;
+  }
+  if (bn == 0) { memcpy(basis, "STREAM", 6); bn = 6; }
+  for (uint32_t f = 0; f < NUM_FILES; f++) {
+    char *sfn = FILE_NAMES_BUF[f];
+    memset(sfn, ' ', 11);
+    memcpy(sfn, basis, bn);
+    sfn[bn] = '~';
+    sfn[bn + 1] = (char)('1' + f);
+    memcpy(sfn + 8, "MP3", 3);
+    sfn[11] = 0;
+  }
+  build_root_dir();
+}
+
+static void init_file_names() {
+  for (uint32_t f = 0; f < NUM_FILES; f++) g_file_sizes[f] = DECLARED_FILE_SIZE;
+  g_names_initialized = true;
+  set_title_utf8("Stream", 6);  // default until the phone sends a real title
+}
+#else
 static void build_root_dir() {
   memset(g_root_dir_sector, 0, sizeof(g_root_dir_sector));
   for (uint32_t f = 0; f < NUM_FILES; f++) {
@@ -532,6 +659,7 @@ static void build_root_dir() {
     entry[31] = (DECLARED_FILE_SIZE >> 24) & 0xFF;
   }
 }
+#endif  // FATDISK_MULTI_FILE
 
 // See esp32-s3-msc.ino's git history (2026-09-17) for the real uint32_t
 // overflow bug this capping behavior fixes, and the second bug (the
@@ -649,50 +777,12 @@ static void (*g_file_switch_callback)(int direction) = nullptr;
 // thing a FAT reader uses to know where a file ends; it has no separate
 // end-of-file marker in the data itself.
 static void set_file_declared_size(uint32_t file_index, uint32_t size) {
-  uint8_t *entry = g_root_dir_sector + file_index * 32;
+  g_file_sizes[file_index] = size;
+  uint8_t *entry = g_root_dir_sector + g_sfn_slot[file_index] * 32;
   entry[28] = size & 0xFF;
   entry[29] = (size >> 8) & 0xFF;
   entry[30] = (size >> 16) & 0xFF;
   entry[31] = (size >> 24) & 0xFF;
-}
-
-// Patches ONLY the 11-byte 8.3 short name of one root-dir entry. `name11`
-// must already be exactly 11 bytes, space-padded (same convention as
-// FILE_NAME/build_root_dir()) -- this is the short-name field only, NOT a
-// real VFAT long filename (that's a separate, larger piece of work, still
-// its own open item -- see PLAN_NEXT.md's C2 section).
-static void set_file_name(uint32_t file_index, const char *name11) {
-  memcpy(FILE_NAMES_BUF[file_index], name11, 11);
-  memcpy(g_root_dir_sector + file_index * 32, name11, 11);
-}
-
-// C1/Step 2 (2026-09-22, real-name forwarding): turns an arbitrary real
-// AVRCP song title (any length, any characters -- UTF-8, punctuation,
-// lowercase) into a valid FAT 8.3 short-name field for set_file_name()
-// above. Extension is always "MP3" (these are always our synthetic MP3
-// stream, regardless of title) -- only the 8-char basename comes from the
-// real title. Only [A-Z0-9] survive (spaces and punctuation are dropped
-// entirely rather than replaced with a filler char like '_', so a title
-// like "Bohemian Rhapsody" becomes "BOHEMIAN" instead of a less readable
-// "BOHEMIAN_RHAPSODY"-truncated-with-junk); falls back to the original
-// generic "STREAM" placeholder if the title yields zero valid characters
-// (e.g. a title that's entirely emoji/non-ASCII, or empty).
-static void sanitize_to_8_3_name(const char *title, uint32_t title_len, char out11[11]) {
-  char basename[8];
-  uint32_t n = 0;
-  for (uint32_t i = 0; i < title_len && n < 8; i++) {
-    char c = title[i];
-    if (c >= 'a' && c <= 'z') c = c - 'a' + 'A';
-    if ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) {
-      basename[n++] = c;
-    }
-  }
-  if (n == 0) {
-    memcpy(basename, "STREAM", 6);
-    n = 6;
-  }
-  for (uint32_t i = 0; i < 8; i++) out11[i] = (i < n) ? basename[i] : ' ';
-  memcpy(out11 + 8, "MP3", 3);
 }
 
 // Highest file-relative offset the reader has reached in the CURRENTLY
@@ -724,9 +814,7 @@ static volatile uint32_t g_prev_file_index_to_restore = 0;
 static const uint32_t SUPPRESS_WINDOW_MS = 10000;
 
 static uint32_t get_file_declared_size(uint32_t file_index) {
-  const uint8_t *entry = g_root_dir_sector + file_index * 32;
-  return (uint32_t)entry[28] | ((uint32_t)entry[29] << 8) |
-         ((uint32_t)entry[30] << 16) | ((uint32_t)entry[31] << 24);
+  return g_file_sizes[file_index];
 }
 
 // A reader that (re)starts after a gap -- radio powering up, re-mounting
@@ -849,7 +937,8 @@ static void force_track_change(const char *new_name11) {
   set_file_declared_size(g_current_file_index, new_size);
 
   uint32_t next_idx = (g_current_file_index + 1) % NUM_FILES;
-  if (new_name11) set_file_name(next_idx, new_name11);
+  (void)new_name11;  // names now come from set_title_utf8(), for every file at once
+  (void)next_idx;
 #if !defined(ARDUINO) && defined(FATDISK_LIVE_DEBUG)
   fprintf(stderr, "[track-rotate] force_track_change: shrinking file %u to %u bytes (was %u), "
                   "next file %u\n", g_current_file_index, new_size, DECLARED_FILE_SIZE, next_idx);
