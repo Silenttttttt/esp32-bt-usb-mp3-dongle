@@ -5844,3 +5844,30 @@ Second-device BT pairing reproduced as broken (legacy PIN, classic reboots durin
 - Bench (both boards on b6eb486): Next relayed, single Back not, double Back relayed prev, no
   false Next at mount. One car_sim bug of my own found and fixed on the way (mount peek did a
   full open of the last file, which relayed a Next).
+
+## 2026-09-25 ~14:30-14:50 GMT-3: "only one device can ever pair" -- found and fixed
+
+Bench with two real Bluetooth hosts (desktop + laptop) plus Muni's phone. Classic now logs
+every pairing-related GAP event (`GAP:acl_conn/acl_disconn/pin_req/cfm_req/auth_cmpl`).
+
+| Cause | Evidence | Fix |
+|---|---|---|
+| Legacy PIN requests never answered | Laptop pairs the old way every time (`GAP:pin_req`, BlueZ `LegacyPairing=true` even after a fresh scan); the ESP32-A2DP library only stores the address on `ESP_BT_GAP_PIN_REQ_EVT`, so the host hits `AuthenticationTimeout` after ~30 s | Classic replies `0000` (16 digits if asked) |
+| Stuck-radio watchdog rebooted mid-pairing | `WATCHDOG_RESTART:stuck_disconnected` every ~3 min while no device is connected (phone off) -- the "classic reboots during pairing" from the car | Open ACL links and pairing events (and successful links) count as activity; failed pages of a vanished phone don't, so the real wedge still gets restarted |
+
+Phones and the desktop use SSP numeric comparison, which the classic already auto-accepted --
+that's why the phone "asks about a PIN, I hit pair, it works".
+
+Verified (firmware `6027620`):
+- Laptop pairs while the phone is bonded but off: 0.6 s pair + 0.5 s connect (was: timeout).
+- Phone reconnects after the laptop goes off (Muni, 14:37).
+- `sim/bt_switch_test.py`: desktop/laptop alternate as "the phone", 12/12 switches OK
+  (6 Bluetooth-off, 6 clean disconnect), 0 classic resets; usually 1-3 s to reconnect.
+  Re-run on 6027620: 12/12 OK, all on the first attempt, 0 resets.
+- Fresh re-pair (forget + pair again) of the laptop with the desktop off, and of the desktop
+  with the laptop off: both OK.
+
+Tools: `sim/bt_desktop_source.py` (desktop as A2DP source + auto-accept agent, no PipeWire
+change -- the desktop's audio server registers no BT endpoint), `sim/bt_switch_test.py`.
+Harness gotcha: bluetoothctl registers its own agent and swallows confirmations; use
+`agent off` in it so the script's agent answers.
