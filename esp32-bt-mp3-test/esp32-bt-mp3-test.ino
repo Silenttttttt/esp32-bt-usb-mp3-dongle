@@ -540,15 +540,28 @@ void audio_data_callback(const uint8_t *data, uint32_t length) {
   emit_mono(data, length);
   return;
 #endif
-  if (length > PCM_SLOT_SIZE) length = PCM_SLOT_SIZE;  // never overflow a slot
-  uint8_t idx;
-  if (xQueueReceive(free_slots, &idx, 0) != pdTRUE) {
-    pcm_drops++;  // no free slot -- drop rather than block Bluedroid's task
-    return;
+  // A callback can carry more than one slot's worth: the source decides how
+  // many SBC frames go in a packet (a phone: ~7 frames = ~3.6 KB of stereo
+  // PCM; a PC source with an 11-frame packet: 5.6 KB). This used to clamp
+  // to one slot and silently drop the rest -- 27% of the audio from such a
+  // source, seen 2026-09-25 as 65.5 KB/s of PCM at the S3 instead of 88.2.
+  // Split across slots instead (on a stereo sample boundary); only if no
+  // slot is free is the remainder dropped, and that counts as a drop.
+  while (length > 0) {
+    uint32_t n = (length > PCM_SLOT_SIZE) ? PCM_SLOT_SIZE : length;
+    n &= ~3u;  // whole stereo 16-bit frames
+    if (n == 0) break;
+    uint8_t idx;
+    if (xQueueReceive(free_slots, &idx, 0) != pdTRUE) {
+      pcm_drops++;  // no free slot -- drop rather than block Bluedroid's task
+      return;
+    }
+    memcpy(pcm_slots[idx].data, data, n);
+    pcm_slots[idx].length = n;
+    xQueueSend(filled_slots, &idx, 0);
+    data += n;
+    length -= n;
   }
-  memcpy(pcm_slots[idx].data, data, length);
-  pcm_slots[idx].length = length;
-  xQueueSend(filled_slots, &idx, 0);
 }
 
 // FIX for the stale-loop-on-pause bug described above. Rather than relying
