@@ -849,6 +849,52 @@ volatile uint32_t g_reconnect_ts_ms = 0;
 // unconditionally, the instant this event fires.
 void self_healing_gap_callback(esp_bt_gap_cb_event_t event,
                                 esp_bt_gap_cb_param_t *param) {
+  // Pairing diagnostics (2026-09-25: a second device can't pair). One
+  // control line per pairing-related GAP event; bounded wait, since this
+  // runs on a Bluedroid task.
+  {
+    char g[96];
+    g[0] = 0;
+    const uint8_t *b = nullptr;
+    switch (event) {
+      case ESP_BT_GAP_AUTH_CMPL_EVT:
+        b = param->auth_cmpl.bda;
+        snprintf(g, sizeof(g), "GAP:auth_cmpl stat=%d name=%.20s", (int)param->auth_cmpl.stat,
+                 (const char *)param->auth_cmpl.device_name);
+        break;
+      case ESP_BT_GAP_PIN_REQ_EVT:
+        b = param->pin_req.bda;
+        snprintf(g, sizeof(g), "GAP:pin_req min16=%d", (int)param->pin_req.min_16_digit);
+        break;
+      case ESP_BT_GAP_CFM_REQ_EVT:
+        b = param->cfm_req.bda;
+        snprintf(g, sizeof(g), "GAP:cfm_req num=%lu", (unsigned long)param->cfm_req.num_val);
+        break;
+      case ESP_BT_GAP_KEY_NOTIF_EVT:
+        b = param->key_notif.bda;
+        snprintf(g, sizeof(g), "GAP:key_notif passkey=%lu", (unsigned long)param->key_notif.passkey);
+        break;
+      case ESP_BT_GAP_KEY_REQ_EVT:
+        b = param->key_req.bda;
+        snprintf(g, sizeof(g), "GAP:key_req");
+        break;
+      case ESP_BT_GAP_ACL_CONN_CMPL_STAT_EVT:
+        b = param->acl_conn_cmpl_stat.bda;
+        snprintf(g, sizeof(g), "GAP:acl_conn stat=%d", (int)param->acl_conn_cmpl_stat.stat);
+        break;
+      case ESP_BT_GAP_ACL_DISCONN_CMPL_STAT_EVT:
+        b = param->acl_disconn_cmpl_stat.bda;
+        snprintf(g, sizeof(g), "GAP:acl_disconn reason=0x%02x", (int)param->acl_disconn_cmpl_stat.reason);
+        break;
+      default:
+        break;
+    }
+    if (g[0]) {
+      size_t n = strlen(g);
+      if (b) snprintf(g + n, sizeof(g) - n, " peer=%02x:%02x:%02x", b[3], b[4], b[5]);
+      send_control(g, pdMS_TO_TICKS(20));
+    }
+  }
   if (event == ESP_BT_GAP_AUTH_CMPL_EVT &&
       param->auth_cmpl.stat != ESP_BT_STATUS_SUCCESS) {
     esp_bt_gap_remove_bond_device(param->auth_cmpl.bda);
