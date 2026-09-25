@@ -5829,3 +5829,18 @@ pause at a file end). Next relay fixed (the last-sector probe made every Next lo
 EOF) and confirmed live with Back and folder wrap; USB auto re-attach added; song names dropped
 (Muni) -- a 56-char long name caused "unsupported file", and the radio only shows ID3v1 tags anyway.
 Second-device BT pairing reproduced as broken (legacy PIN, classic reboots during pairing).
+
+## 2026-09-25 afternoon (desktop): car findings applied
+
+- Car build is the default. Removed: title renaming, buffer files, early end (force_track_change,
+  EARLY_END_*), FATDISK_NO_TITLES / NO_BUFFER_FILES, NAME_TEST. Kept: Next-probe fix, USB auto
+  re-attach, UART FIFO fix. 3 full-length files named Stream.mp3 (the layout verified in the car).
+- Flags now live only in `esp32-s3-msc/flash.sh` and `esp32-bt-mp3-test/flash.sh` (table in
+  CLAUDE.md). Boards print `build: commit ... flags ...` at boot and every 60 s; every flash is
+  appended to `logs/flash_history.log`.
+- car_sim rewritten as a Kenwood model from the trace (2 KB reads, 3.7 s read-ahead, open-time
+  probes, EOF pause, Back restart/previous, wrap, remembered track, F01 T-0N display).
+- Host test: switch detector driven by a Kenwood model (14 checks) -- all pass.
+- Bench (both boards on b6eb486): Next relayed, single Back not, double Back relayed prev, no
+  false Next at mount. One car_sim bug of my own found and fixed on the way (mount peek did a
+  full open of the last file, which relayed a Next).

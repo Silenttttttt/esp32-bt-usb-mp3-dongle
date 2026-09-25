@@ -326,6 +326,21 @@ name, `Stream.mp3` (8.3 aliases `STREAM~1..3.MP3`); the radio shows only `F01 T-
 921600 without). `--mode line` produces garbage on the classic, which led to hours of wrong
 conclusions on 2026-09-24. S3 `--baud 115200 --mode line` (921600 with `MSC_TRACE`).
 
+**car_sim (`sim/car_sim.py --device auto --gui`) is a model of the real Kenwood (rewritten
+2026-09-25 from the car trace; change it only to match observed radio behavior):**
+- 2 KB reads; a ~58 KB (~3.7 s) read-ahead, so audio plays ~3.7 s behind the reads (the car
+  showed ~5 s end to end; the bench used to be nearly instant).
+- Every open re-reads the root dir + FAT, reads the file's start, a probe every 512 KB, the last
+  2 KB (ID3v1 tag) and ~40 KB from the start, then plays from 0. Size and cluster chain are read
+  only at open.
+- Natural end: 1.9-3.5 s pause, then the next file. Next: immediate, drops the read-ahead.
+  Back: restarts the file; within 3 s of the open it goes to the previous file (quick double
+  Back). Folder wrap on (`--no-folder-wrap` for the radio's default). ~0.5 s silence at each
+  new file's start. Remembers the last track across restarts. Mount: peeks the last file's
+  first/last 2 KB, then opens the remembered track.
+- Display shows `F01 T-0N`; DISP shows the ID3v1 tag or `NO NAME` (never the file name).
+- Scriptable: `kill -USR1 <pid>` = Next, `-USR2` = Back.
+
 **Host tests (run after touching `fat_disk_shared.h`):** `esp32-s3-msc/crosscheck/live_serve_test.cpp`,
 build line at the top of the file. Its switch-detector part drives a model of the real Kenwood.
 

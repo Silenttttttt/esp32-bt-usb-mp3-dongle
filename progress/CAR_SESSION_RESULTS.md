@@ -70,6 +70,13 @@ Read this first when you pick the project back up. Detailed event-by-event log w
 
 ## To do next (in order)
 
+**Done 2026-09-25 afternoon (desktop):** #1 (car build is the default: song-name, buffer-file and
+early-end code removed; flags in `esp32-s3-msc/flash.sh` / `esp32-bt-mp3-test/flash.sh`; both
+boards report commit + flags at boot and every 60 s; `logs/flash_history.log`), and #5 (car_sim
+rewritten as a Kenwood model; see CLAUDE.md). Both boards flashed with `b6eb486` and bench-checked
+with car_sim: Next relayed, single Back not relayed, double Back relayed `prev`, no false Next at
+mount.
+
 1. **Make the car build the default**: fold `FATDISK_NO_TITLES` + `FATDISK_NO_BUFFER_FILES`
    into the normal build (or delete the name/buffer/early-end code, since names are dropped),
    keep the auto re-attach, update CLAUDE.md's S3 build command. MSC_TRACE stays opt-in.

@@ -37,6 +37,8 @@ import socket
 import subprocess
 import sys
 import threading
+import random
+import collections
 import time
 
 from sector_protocol import SECTOR_SIZE, read_sectors
@@ -581,39 +583,45 @@ def scan_file_validity(transport, layout, file_entry):
     return not problems
 
 
+# ---------------------------------------------------------------------------
+# Kenwood model (2026-09-25). Everything below comes from the in-car
+# MSC_TRACE capture of the real radio (progress/CAR_SESSION_RESULTS.md,
+# "What the Kenwood actually does", and CAR_TRACE_FINDINGS.md). car_sim
+# changes only to match observed radio behavior -- never to make a test pass.
+# ---------------------------------------------------------------------------
+KW_READ_BYTES = 2048            # every READ10 is 4 sectors
+KW_PREFILL_BYTES = 58 * 1024    # read-ahead held before/while playing (~3.7 s)
+KW_OPEN_PROBE_STRIDE = 512 * 1024
+KW_OPEN_HEAD_BYTES = 40 * 1024  # read from the start at open, before the real playback read
+KW_EOF_GAP_S = (1.9, 3.5)       # pause after the last sector before opening the next file
+KW_BACK_RESTART_AFTER_S = 3.0   # Back later than this into a file restarts it; earlier -> previous file
+# The real Kenwood goes silent for about half a second whenever it changes
+# file (Muni, in the car). Applied when a new file's audio starts playing.
+FILE_CHANGE_GAP_S = 0.5
+
+
 class RadioGuiState:
-    def __init__(self, files):
-        self.files = files  # list of {"name": str, "cluster_list": [int, ...]}
-        self.current_index = 0
-        self.requested_index = 0
-        self.total_read = 0
-        self.lap_bytes = 0  # bytes read since the current file last started from position 0
-        self.reader_alive = True
-        self.paused = False  # Muni's request (2026-09-22): a real Pause/Resume button
+    def __init__(self, files, folder_wrap=True):
+        self.files = files  # [{"name", "first_cluster", "size", "id3": None|(title, artist)}]
+        self.folder_wrap = folder_wrap  # the radio's menu option (Muni has it on)
         self._lock = threading.Lock()
-        # Plain in-memory dict, updated by the read loop with zero I/O --
-        # resume_cache_writer_thread() is the only thing that ever touches
-        # disk for this, on its own separate schedule. See gui_read_loop's
-        # own comment for why this split exists (a real, confirmed timing
-        # bug from doing the file I/O directly in the real-time read loop).
-        self.pending_resume_positions = {}
+        self._presses = []          # "next" / "back", consumed by the radio thread
+        self.paused = False
+        self.reader_alive = True
+        self.total_read = 0
+        self.play_index = 0         # file whose audio is playing now (lags the reader)
+        self.play_bytes = 0         # bytes of that file played so far
+        self.buffered_bytes = 0     # radio read-ahead currently held
+        self.read_index = 0         # file the reader has open
 
-    def request_switch(self, delta):
+    def press(self, button):
         with self._lock:
-            self.requested_index = (self.requested_index + delta) % len(self.files)
+            self._presses.append(button)
 
-    def maybe_apply_switch(self):
-        """Called from the reader thread only. Returns True if a switch was
-        just applied (caller should reset its own cluster_pos to 0)."""
+    def take_presses(self):
         with self._lock:
-            if self.requested_index != self.current_index:
-                self.current_index = self.requested_index
-                return True
-            return False
-
-    def current_name(self):
-        with self._lock:
-            return self.files[self.current_index]["name"]
+            p, self._presses = self._presses, []
+            return p
 
     def toggle_paused(self):
         with self._lock:
@@ -624,354 +632,220 @@ class RadioGuiState:
         with self._lock:
             return self.paused
 
-    def note_resume_position(self, key, cluster_pos):
-        with self._lock:
-            self.pending_resume_positions[key] = cluster_pos
-
-    def snapshot_resume_positions(self):
-        with self._lock:
-            return dict(self.pending_resume_positions)
-
     def snapshot(self):
         with self._lock:
-            return (self.current_index, len(self.files), self.total_read,
-                    self.lap_bytes, self.reader_alive, self.paused)
+            return (self.play_index, len(self.files), self.total_read, self.play_bytes,
+                    self.reader_alive, self.paused, self.buffered_bytes)
 
 
-def gui_read_loop(transport, layout, state, player, capture_f, volume_serial, bursty_pacing=False, level_proc=None):
-    """Same read-decode-loop shape as main()'s existing single-file loop
-    below, generalized to react to state.requested_index changing (a button
-    press) by switching which file's cluster chain it's pulling from, always
-    restarting the newly-selected file at its own beginning -- matching how
-    a real radio presents a freshly-selected track.
+def load_remembered_track():
+    try:
+        return int(load_resume_cache().get("kenwood_last_track", 0))
+    except (ValueError, TypeError):
+        return 0
 
-    REAL BUG FOUND AND FIXED (2026-09-20, live GUI test): unlike the
-    single-file loop below, this one needs its own pacing. The single-file
-    loop's module docstring explains why pacing was deliberately REMOVED
-    from THIS FILE once already -- an earlier version's fixed bitrate
-    constant was never quite right and caused a slow-building drift bug over
-    long sessions. That reasoning doesn't carry over cleanly here: this
-    reader can hit a real straddle-protected zero-fill read (already known,
-    already-documented elsewhere in this project to happen at a low but
-    nonzero rate -- see fat_disk_shared.h's own READ_MARGIN_BYTES history),
-    which can desync ffmpeg's decoder. Once desynced, ffmpeg has nothing
-    valid queued for its real-time (-f pulse) output to actually pace
-    against, so it stops applying real-time backpressure on stdin -- and
-    with NO pacing of its own, this loop then races through the entire
-    ~4-minute file in a few seconds (confirmed live: reads=987 in ~6s
-    real time, vs. a real ~240s lap at the pipeline's actual encode rate).
-    That's exactly what "just jumping around" sounds like: hearing many
-    different points of the file in rapid succession. Fixed with an
-    ABSOLUTE-DEADLINE pace (anchored once to a fixed start time, re-derived
-    fresh every iteration -- not a per-iteration sleep, which is what
-    actually causes compounding drift) so a hiccup can never let the reader
-    burst arbitrarily far ahead of real time, whether or not ffmpeg's own
-    backpressure is currently working.
 
-    REAL DIVERGENCE FROM THE ACTUAL CAR RADIO FOUND (2026-09-20, live
-    bench test): this loop always restarted every file at cluster_pos=0 on
-    launch. On a ring that happens to have a long stretch of stale/injected
-    silence sitting at the start (confirmed directly tonight: ~46s of
-    silence-encoded content at the very start of the ring, left over from
-    an earlier Bluetooth-debugging outage), that produces a real, long
-    silent delay before any audio -- but Muni's real, repeated experience
-    with the ACTUAL Kenwood radio is a consistent ~10s regardless. This
-    project's own code already theorized why (see `--simulate-radio-resume-
-    cache`'s own comment, added after a real hardware test where the radio
-    appeared to resume mid-file rather than always restarting cold): a real
-    head unit plausibly caches a resume position keyed on volume identity +
-    filename, and since the S3's volume serial only changes when the S3
-    ITSELF reboots (not on every classic reflash, not on every GUI
-    restart), a real radio reconnecting within the same S3 session would
-    resume from near wherever it last left off -- never revisiting stale
-    early-ring content. That mechanism existed in this file's OLDER
-    single-file/TCP-transport code path (behind an opt-in
-    `--simulate-radio-resume-cache` flag) but was never carried over when
-    --gui/DeviceTransport was added tonight. Fixed by making the SAME
-    resume-cache mechanism the DEFAULT (not opt-in) behavior for --gui mode
-    specifically, since the whole point of this tool is to accurately
-    emulate the real radio's real behavior, not a strictly-more-pessimistic
-    always-cold-restart approximation of it.
+def save_remembered_track(index):
+    cache = load_resume_cache()
+    cache["kenwood_last_track"] = index
+    try:
+        with open(RESUME_CACHE_PATH, "w") as f:
+            json.dump(cache, f)
+    except OSError:
+        pass
+
+
+def gui_read_loop(transport, layout, state, player, capture_f, level_proc=None):
+    """One radio "session" from mount until the device goes away, modelled
+    on the real Kenwood (see the KW_* constants):
+
+    - Mount: reads the root dir, peeks the last file's start and end, then
+      opens the track it remembers from last time, from 0.
+    - Open: re-reads the root dir and FAT (size and cluster chain come from
+      this read and are never re-read while the file plays), reads the
+      file's start, a 2 KB probe every 512 KB, the last 2 KB (the ID3v1 tag
+      -- DISP shows that, not the file name) and ~40 KB from the start, then
+      plays from 0.
+    - Playback: 2 KB reads that keep a ~58 KB read-ahead topped up, so reads
+      run at real time (~2 KB every 128 ms) and audio plays ~3.7 s behind
+      what's being read -- the bench used to feed each read straight to the
+      player, which made it nearly instant while the car had ~5 s delay.
+    - Natural end: after the last sector it pauses 1.9-3.5 s, then opens
+      the next file; the read-ahead keeps playing meanwhile.
+    - Next: opens the next file at once and drops the read-ahead. Back:
+      restarts the file; pressed within ~3 s of the start it goes to the
+      previous file (a quick double Back). Folder wrap per the menu option.
+    - Every new file's audio starts after a ~0.5 s silence.
     """
-    cluster_bytes = layout["sectors_per_cluster"] * SECTOR_SIZE
+    spc = layout["sectors_per_cluster"]
+    cluster_bytes = spc * SECTOR_SIZE
+    n_files = len(state.files)
+    device_path = getattr(transport, "path", None)
 
-    eoc = end_of_chain_marker(layout["fat_type"])
+    def check_device():
+        # A removed USB device's open fd can keep returning data (seen
+        # 2026-09-22); the device node disappearing is the reliable signal.
+        if device_path is not None and not os.path.exists(device_path):
+            raise OSError(f"device node {device_path} no longer exists (unplugged)")
 
-    def live_next_cluster(prev):
-        # Follows the cluster chain as it reads, like a FAT driver does at
-        # each cluster boundary: reads the FAT entry for `prev` from the
-        # device now, not from the chain mapped at open. An end-of-chain
-        # marker here ends the file, whatever size the directory gave.
-        # (2026-09-25: this is how we expect the Kenwood to take the S3's
-        # early end -- EARLY_END_FAT.)
-        off = prev * 2 if layout["fat_type"] == "FAT16" else prev + prev // 2
-        sec, local = divmod(off, SECTOR_SIZE)
-        data = transport.read(layout["reserved_sectors"] + sec, 2)
-        if layout["fat_type"] == "FAT16":
-            return int.from_bytes(data[local:local + 2], "little")
-        if prev % 2 == 0:
-            return data[local] | ((data[local + 1] & 0x0F) << 8)
-        return (data[local] >> 4) | (data[local + 1] << 4)
-
-    def open_current_file():
-        # A real head unit's FAT layer (e.g. FatFs f_open) reads the file's
-        # directory entry when it OPENS the file -- the name it displays and
-        # the size it stops at come from that read, not from whatever the
-        # directory said at mount time. Matched by first cluster, since the
-        # S3 rewrites names at runtime (TITLE: -> set_file_name()).
-        f = state.files[state.current_index]
+    def read_dir_and_fat():
         root = transport.read(layout["root_dir_lba"], layout["root_dir_sectors"])
-        for e in find_all_file_entries(root):
-            if e["first_cluster"] == f["first_cluster"]:
-                f["name"] = e["name"]
-                f["size"] = e["size"]
-                break
-        return f["size"]
+        fat = transport.read(layout["reserved_sectors"], layout["fat_size_sectors"])
+        return {e["first_cluster"]: e for e in find_all_file_entries(root)}, fat
 
-    # Thread start = drive (re)inserted: resume position applies. Every
-    # later open (Next/Back/EOF) starts the new file at byte 0, like a real
-    # radio selecting a track.
-    cluster_pos = state.files[state.current_index].get("start_cluster_pos", 0)
-    file_size = open_current_file()
-    file_bytes = cluster_pos * cluster_bytes
-    # REAL BUG FOUND (2026-09-20, live test against FATDISK_ALWAYS_SERVE_LIVE
-    # real hardware): this used to compute sleep_time against a FIXED
-    # start_time/bytes_since_start baseline that never re-anchors. If this
-    # loop EVER falls behind schedule even once (ordinary OS/Python
-    # scheduling jitter, unavoidable over a real run), sleep_time goes
-    # negative and STAYS negative forever after -- with no correction, this
-    # loop then reads strictly faster than real-time for the rest of the
-    # session, permanently. Against the ORIGINAL, offset-based S3 design
-    # this was survivable (just meant occasionally overtaking the writer,
-    # producing a straddle-protected zero-fill once in a while). Against
-    # FATDISK_ALWAYS_SERVE_LIVE it's much worse: reading faster than the
-    # real encode rate means this loop's own persistent server-side cursor
-    # keeps chasing content that hasn't been written yet, producing
-    # constant misalignment -- confirmed live: recurring "Illegal Audio-
-    # MPEG-Header" resyncs roughly every 8192 bytes. tcp_paced_listen.py
-    # (used to validate the new design before this bug was found) already
-    # had the correct fix for this same class of pacing loop -- carrying it
-    # over here: when the loop is behind, just re-anchor the schedule to
-    # "now" instead of trying to catch up to an increasingly-unrealistic
-    # original baseline.
-    #
-    # REAL GAP FOUND (2026-09-21, after a real car test failed despite this
-    # tool passing): this smooth, continuously-paced-to-exactly-16000B/s
-    # loop is STRUCTURALLY INCAPABLE of exercising a real firmware bug found
-    # the same night -- the live-serve cursor's "reader has raced ahead of
-    # the writer" correction path (fat_disk_shared.h's LIVE_CATCHUP_
-    # THRESHOLD_BYTES ahead-direction fix) only ever fires if the reader
-    # actually reads FASTER than real-time, which this loop was specifically
-    # built never to do. A real embedded USB-MSC host/decoder very plausibly
-    # reads ahead into a bounded internal buffer rather than at a smooth
-    # per-byte rate -- this tool testing ONLY the smooth pattern gave false
-    # confidence that a design was ready for real hardware when it hadn't
-    # actually been exercised the way the real target very plausibly
-    # behaves.
-    #
-    # TWO REAL BUGS FOUND AND FIXED IN EARLIER VERSIONS OF bursty_pacing
-    # (2026-09-21, both found via live tests against real hardware, both
-    # confirmed via the S3's own FATDISK_LIVE_DEBUG trace before concluding
-    # anything about the firmware): the first version read a large batch of
-    # clusters instantly then wrote them ALL to the player immediately too
-    # -- followed by one long silent sleep -- causing the player to run dry
-    # mid-burst and audibly stall ("plays 1-2s, stops, comes back"). The
-    # SECOND version fixed that by draining a burst's already-read data to
-    # the player with per-cluster pacing -- but STILL read the entire burst
-    # in one upfront batch with ZERO new reads issued during the whole
-    # drain phase. The S3's own debug trace proved this was still wrong:
-    # g_write_pos barely moved during the fast-read burst (confirming reads
-    # ARE genuinely bursty, as intended), but the cursor's "ahead" amount
-    # kept COMPOUNDING across successive burst+drain cycles -- because with
-    # zero reads happening during each ~5-6s drain phase, nothing ever lets
-    # accumulated ahead-drift shrink back down; each new burst's fast-reads
-    # just add MORE drift on top of whatever was already there from the
-    # last cycle. This doesn't match how a real decoder's bounded read-
-    # ahead buffer actually behaves: a real buffer is continuously topped
-    # up as it drains, never goes fully silent on the read side for
-    # multiple seconds at a stretch. The firmware's own jump-correction
-    # was independently confirmed CORRECT from the same trace (lands the
-    # cursor at exactly safe_edge - n_safe, precisely as designed) -- the
-    # compounding drift was entirely this test tool's own artifact.
-    #
-    # CORRECTED MODEL: a genuine bounded read-ahead allowance, not a batch.
-    # Reads are issued with NO sleep as long as the reader is within
-    # BURST_AHEAD_SECONDS of the real-time playback schedule; once reading
-    # would push it further ahead than that, sleep just enough to bring it
-    # back to the allowance boundary before the next read. Every cluster is
-    # written to the player IMMEDIATELY after being read (never batched),
-    # so delivery is always continuous -- only the READ REQUESTS burst
-    # ahead, exactly matching what a real bounded-buffer decoder's read
-    # side would do, without ever silently starving the player or letting
-    # drift compound unchecked across cycles.
-    next_send_time = time.monotonic()
-    loop_start_time = next_send_time
-    # REAL BUG FOUND (2026-09-21, live test against real hardware with a
-    # real player attached): a cold-started bursty reader had the FULL
-    # BURST_AHEAD_SECONDS allowance available from its very first read,
-    # since `ahead` starts at 0 and each read is cheap (a few ms of real
-    # I/O) while next_send_time jumps forward a full cluster's worth of
-    # assumed playback time -- so `ahead` climbed from 0 to the 6s ceiling
-    # in well under a second of real wall-clock time. Against
-    # FATDISK_ALWAYS_SERVE_LIVE, "reading ahead" doesn't fetch real future
-    # content (the server ignores requested LBA and always serves from its
-    # own live cursor) -- it just races that persistent cursor forward past
-    # what the writer has actually produced in that same instant, forcing
-    # 1-2 jump-corrections bunched together right at connect (confirmed via
-    # direct reproduction: exactly 2 "Illegal Audio-MPEG-Header" events,
-    # both within the first ~9KB, then clean for the rest of a 60s/~1MB
-    # run). Fixed by ramping the allowance up from 0 over the first
-    # BURST_AHEAD_SECONDS of REAL elapsed time instead of granting the full
-    # allowance instantly -- steady-state behavior after the ramp period is
-    # unchanged, so this doesn't weaken what --bursty is actually testing.
-    was_paused = False
+    cur = {"file": 0, "size": 0, "chain": [], "pos": 0, "opened_at": 0.0}
+
+    def read_at(off):
+        check_device()
+        cluster = cur["chain"][off // cluster_bytes]
+        lba = layout["data_lba"] + (cluster - 2) * spc + (off % cluster_bytes) // SECTOR_SIZE
+        data = transport.read(lba, KW_READ_BYTES // SECTOR_SIZE)
+        state.total_read += len(data)
+        return data[:max(0, min(KW_READ_BYTES, cur["size"] - off))]
+
+    def open_file(idx):
+        entries, fat = read_dir_and_fat()
+        f = state.files[idx]
+        e = entries.get(f["first_cluster"])
+        if e is None:
+            return False
+        cur.update(file=idx, size=e["size"], pos=0, opened_at=time.monotonic(),
+                   chain=walk_cluster_chain(fat, f["first_cluster"], layout["fat_type"]))
+        if cur["size"] <= 0 or not cur["chain"]:
+            return False
+        read_at(0)
+        for off in range(KW_OPEN_PROBE_STRIDE - KW_READ_BYTES, cur["size"], KW_OPEN_PROBE_STRIDE):
+            read_at(off)
+        tail = read_at(max(0, cur["size"] - KW_READ_BYTES))
+        tag = tail[-128:]
+        f["id3"] = ((tag[3:33].rstrip(b"\0 ").decode("latin-1"), tag[33:63].rstrip(b"\0 ").decode("latin-1"))
+                    if len(tag) == 128 and tag[:3] == b"TAG" else None)
+        for off in range(0, min(KW_OPEN_HEAD_BYTES, cur["size"]), KW_READ_BYTES):
+            read_at(off)
+        state.read_index = idx
+        save_remembered_track(idx)
+        return True
+
+    buf = collections.deque()  # (bytes, file_index, starts_file)
+    held = [0]
+    starts_next_chunk = [True]
+
+    def flush():
+        buf.clear()
+        held[0] = 0
+
+    def open_and_queue(idx, drop_buffer):
+        if drop_buffer:
+            flush()
+        if open_file(idx):
+            starts_next_chunk[0] = True
+            return True
+        return False
+
+    def neighbor(idx, step):
+        j = idx + step
+        if 0 <= j < n_files:
+            return j
+        return j % n_files if state.folder_wrap else None
+
+    # Mount.
+    remembered = load_remembered_track()
+    if not 0 <= remembered < n_files:
+        remembered = 0
+    # At mount the trace shows only a peek at the last file: its first and
+    # last 2 KB, not a full open (2026-09-25, event 1).
+    entries, fat = read_dir_and_fat()
+    last = entries.get(state.files[-1]["first_cluster"])
+    if last is not None and last["size"] > 0:
+        cur.update(size=last["size"], chain=walk_cluster_chain(fat, last["first_cluster"], layout["fat_type"]))
+        read_at(0)
+        read_at(max(0, last["size"] - KW_READ_BYTES))
+    open_and_queue(remembered, True)
+
+    playing = False
+    first_audio = True
+    out_next = time.monotonic()
+    eof_until = None
     try:
         while True:
+            for button in state.take_presses():
+                if button == "next":
+                    j = neighbor(cur["file"], 1)
+                    if j is not None:
+                        eof_until = None
+                        open_and_queue(j, True)
+                elif button == "back":
+                    # Position in the track = time since the radio opened it
+                    # (the audio lags the reads by the read-ahead).
+                    target = cur["file"]
+                    if time.monotonic() - cur["opened_at"] < KW_BACK_RESTART_AFTER_S:
+                        j = neighbor(cur["file"], -1)
+                        target = j if j is not None else cur["file"]
+                    eof_until = None
+                    open_and_queue(target, True)
             if state.is_paused():
-                # Muni's request (2026-09-22): a real Pause/Resume button.
-                # Just stop requesting/feeding new bytes -- the player's own
-                # small buffer drains and it goes silent naturally, exactly
-                # like a real radio's pause would. Resuming continues
-                # reading forward from the SAME cluster_pos (whatever
-                # content played during the pause is simply skipped, never
-                # played -- correct for a live continuous stream, same as a
-                # real radio pausing/resuming live BT audio).
-                was_paused = True
-                time.sleep(0.1)
+                time.sleep(0.05)
+                out_next = time.monotonic()
                 continue
-            if was_paused:
-                # Re-anchor pacing to right now instead of trying to "catch
-                # up" to however far real wall-clock drifted during the
-                # pause -- next_send_time is an absolute deadline (see this
-                # function's own docstring on why), so without this reset,
-                # resuming would burst-read through many clusters at once
-                # to make up the paused interval.
-                next_send_time = time.monotonic()
-                was_paused = False
-            if state.maybe_apply_switch():
-                cluster_pos = 0
-                file_size = open_current_file()
-                file_bytes = 0
-                state.lap_bytes = 0
-                # Radio's file-change gap: no reads and no audio, then the
-                # new file plays from its start. Pacing re-anchors to now,
-                # same as after a pause.
-                time.sleep(FILE_CHANGE_GAP_S)
-                next_send_time = time.monotonic()
-            if file_bytes >= file_size:
-                # EOF at the declared size (not the cluster chain's end): a
-                # real radio moves on to the next file in directory order.
-                if len(state.files) > 1:
-                    state.request_switch(1)
+
+            now = time.monotonic()
+            # Reader: top the read-ahead up; at the end, the radio's EOF pause.
+            if eof_until is not None:
+                if now >= eof_until:
+                    eof_until = None
+                    j = neighbor(cur["file"], 1)
+                    open_and_queue(j if j is not None else cur["file"], False)
+            elif held[0] < KW_PREFILL_BYTES:
+                if cur["pos"] >= cur["size"]:
+                    eof_until = now + random.uniform(*KW_EOF_GAP_S)
                 else:
-                    cluster_pos = 0
-                    file_size = open_current_file()
-                    file_bytes = 0
-                    state.lap_bytes = 0
-                if file_size == 0:
-                    time.sleep(0.1)
-                continue
-            cluster_list = state.files[state.current_index]["cluster_list"]
-            if cluster_pos > 0 and live_next_cluster(cluster_list[cluster_pos - 1]) >= eoc:
-                file_bytes = file_size  # chain ended early: end of file
-                continue
-            cluster = cluster_list[cluster_pos]
-            lba = layout["data_lba"] + (cluster - 2) * layout["sectors_per_cluster"]
-            if bursty_pacing:
-                # Only sleep if reading now would push the schedule further
-                # ahead than the allowed read-ahead buffer -- otherwise
-                # read immediately (racing ahead, up to the bound).
-                now = time.monotonic()
-                allowed_ahead = min(BURST_AHEAD_SECONDS, now - loop_start_time)
-                ahead = next_send_time - now
-                if ahead > allowed_ahead:
-                    time.sleep(ahead - allowed_ahead)
-            # REAL BUG FOUND (2026-09-22, Muni: unplugged the real S3 mid-
-            # test, GUI kept showing "Now Playing" with bytes read still
-            # climbing forever). Root cause: os.preadv() against a real
-            # block-device fd does NOT reliably raise once the underlying
-            # USB device is physically removed -- confirmed live, the fd
-            # (already pointing at "/dev/sda (deleted)" per /proc) kept
-            # returning data with zero errors for hours after unplug, so
-            # the existing `except (OSError, ConnectionError)` below never
-            # fired and the GUI never learned playback had become phantom.
-            # The one thing that DOES reliably reflect removal is the
-            # device node itself disappearing from the filesystem -- a
-            # cheap os.path.exists() stat catches that even though the
-            # read() syscall itself won't.
-            device_path = getattr(transport, "path", None)
-            if device_path is not None and not os.path.exists(device_path):
-                raise OSError(f"device node {device_path} no longer exists "
-                               f"(physically unplugged)")
-            data = transport.read(lba, layout["sectors_per_cluster"])
-            if len(data) > file_size - file_bytes:
-                data = data[:file_size - file_bytes]
-            file_bytes += len(data)
-            if capture_f:
-                capture_f.write(data)
-            if player:
-                try:
-                    player.stdin.write(data)
-                    player.stdin.flush()
-                except (BrokenPipeError, ValueError):
-                    # ValueError: the window was closed (on_close() closed the
-                    # player's stdin) while this thread was mid-write.
-                    print("[radio] player exited, stopping", file=sys.stderr)
-                    break
-            if level_proc is not None:
-                # Best-effort, non-blocking duplicate for the silence/level
-                # meter -- level_proc.stdin's fd was set non-blocking at
-                # construction specifically so this can NEVER delay real
-                # playback above. A full pipe or a dead process just drops
-                # this chunk (the meter reading goes briefly stale, nothing
-                # else) instead of ever stalling the loop that feeds the
-                # actual audio player. Uses a raw os.write() on the fd
-                # directly rather than the stdin file object's own
-                # .write() -- REAL BUG FOUND (2026-09-24, live test): the
-                # file object is a BufferedWriter with its own internal
-                # buffering/retry logic layered on top of the fd, which
-                # doesn't reliably surface a non-blocking fd's real EAGAIN
-                # behavior -- confirmed live, level_proc received literally
-                # zero bytes for 10+ real seconds through .write() despite
-                # never raising an exception. A raw os.write() talks to the
-                # non-blocking fd directly, matching what os.set_blocking()
-                # actually configured.
-                try:
-                    os.write(level_proc.stdin.fileno(), data)
-                except (BrokenPipeError, BlockingIOError, OSError):
-                    pass
-            next_send_time += len(data) / ASSUMED_BYTES_PER_SEC
-            if not bursty_pacing:
-                sleep_time = next_send_time - time.monotonic()
-                if sleep_time > 0:
-                    time.sleep(sleep_time)
-                else:
-                    next_send_time = time.monotonic()
-            state.total_read += len(data)
-            state.lap_bytes += len(data)
-            cluster_pos = (cluster_pos + 1) % len(cluster_list)
-            if cluster_pos == 0:
-                # Chain ran out before the declared size (malformed volume):
-                # treat as EOF; the check at the top of the loop advances.
-                file_bytes = file_size
-            # Zero disk I/O -- a plain, lock-protected dict write, cheap
-            # enough every iteration. See resume_cache_writer_thread() for
-            # where this actually reaches disk, on its own decoupled
-            # schedule.
-            name = state.files[state.current_index]["name"]
-            state.note_resume_position(resume_cache_key(volume_serial, name), cluster_pos)
+                    data = read_at(cur["pos"])
+                    cur["pos"] += KW_READ_BYTES
+                    if data:
+                        buf.append((data, cur["file"], starts_next_chunk[0]))
+                        starts_next_chunk[0] = False
+                        held[0] += len(data)
+                    continue  # keep reading until the read-ahead is full
+            state.buffered_bytes = held[0]
+
+            # Output: starts once the read-ahead is full, then real time.
+            if not playing and (held[0] >= KW_PREFILL_BYTES or (eof_until is not None and held[0] > 0)):
+                playing = True
+                out_next = time.monotonic()
+            if playing and buf and time.monotonic() >= out_next:
+                data, fidx, starts = buf.popleft()
+                held[0] -= len(data)
+                if starts:
+                    if not first_audio:
+                        time.sleep(FILE_CHANGE_GAP_S)
+                    first_audio = False
+                    state.play_index = fidx
+                    state.play_bytes = 0
+                    out_next = time.monotonic()
+                if capture_f:
+                    capture_f.write(data)
+                if player:
+                    try:
+                        player.stdin.write(data)
+                        player.stdin.flush()
+                    except (BrokenPipeError, ValueError):
+                        print("[radio] player exited, stopping", file=sys.stderr)
+                        break
+                if level_proc is not None:
+                    try:  # best effort, never blocks playback (see run_gui_mode)
+                        os.write(level_proc.stdin.fileno(), data)
+                    except (BrokenPipeError, BlockingIOError, OSError):
+                        pass
+                state.play_bytes += len(data)
+                out_next += len(data) / ASSUMED_BYTES_PER_SEC
+                if out_next < time.monotonic() - 0.5:
+                    out_next = time.monotonic()  # fell behind (scheduling hiccup): re-anchor
+            elif playing and not buf:
+                playing = False  # ran dry (Next/Back dropped it, or a slow device)
+            time.sleep(max(0.0, min(0.02, out_next - time.monotonic())))
     except (OSError, ConnectionError) as e:
-        print(f"[radio][gui] socket error, reader thread stopping: {e}", file=sys.stderr)
+        print(f"[radio][gui] device error, radio session stopping: {e}", file=sys.stderr)
     finally:
-        # Persist exactly where this thread was, keyed the same way the
-        # thread's own startup reads it back (line 646 above) -- so a
-        # reconnect_supervisor() restart (see run_gui_mode) picks up right
-        # where this thread left off instead of jumping back to wherever
-        # playback happened to be when the GUI first launched. Needed
-        # because note_resume_position()'s own disk-backed cache is keyed
-        # by (volume_serial, filename) and only flushed on its own ~3s
-        # schedule -- this in-memory write is immediate and exact, no race.
-        state.files[state.current_index]["start_cluster_pos"] = cluster_pos
         state.reader_alive = False
 
 
@@ -984,78 +858,25 @@ def run_gui_mode(transport, layout, fat, root_dir, args):
     if not entries:
         print("[radio][gui] no files found in root directory, aborting", file=sys.stderr)
         return
-    volume_serial = layout["volume_serial"]
-    resume_cache = load_resume_cache()
-    files = []
-    for e in entries:
-        cluster_list = walk_cluster_chain(fat, e["first_cluster"], layout["fat_type"])
-        if not cluster_list:
-            print(f"[radio][gui] file {e['name']!r} has an empty cluster chain, skipping",
-                  file=sys.stderr)
-            continue
-        # Default (not opt-in) resume-cache behavior for --gui, matching the
-        # real Kenwood radio's own apparent behavior -- see gui_read_loop's
-        # own comment for the full reasoning. Falls back to 0 (cold start)
-        # on a genuinely fresh volume identity (S3 rebooted) or first run.
-        key = resume_cache_key(volume_serial, e["name"])
-        cached_pos = resume_cache.get(key)
-        start_cluster_pos = cached_pos if (cached_pos is not None and cached_pos < len(cluster_list)) else 0
-        if start_cluster_pos:
-            print(f"[radio][gui] resume cache hit for {key} -- starting {e['name']!r} "
-                  f"at cluster_pos={start_cluster_pos} instead of 0", file=sys.stderr)
-        files.append({"name": e["name"], "cluster_list": cluster_list,
-                      "start_cluster_pos": start_cluster_pos,
-                      "first_cluster": e["first_cluster"], "size": e["size"]})
+    # The radio re-reads the directory, FAT and ID3 tag each time it opens
+    # a file (see gui_read_loop); nothing is cached from here.
+    files = [{"name": e["name"], "first_cluster": e["first_cluster"], "size": e["size"], "id3": None}
+             for e in entries if e["size"] > 0]
     if not files:
         print("[radio][gui] no playable files found, aborting", file=sys.stderr)
         return
-    print(f"[radio][gui] found {len(files)} file(s): {[f['name'] for f in files]}",
-          file=sys.stderr)
+    print(f"[radio][gui] found {len(files)} file(s): {[f['name'] for f in files]}", file=sys.stderr)
+    # No mount-time full-file scan: the real Kenwood doesn't do one (car
+    # trace 2026-09-25). --bursty is superseded by the Kenwood read model.
 
-    # Mount-time validity scan (2026-09-21) -- see scan_file_validity()'s own
-    # comment for why this exists: this tool previously never caught a real,
-    # confirmed firmware bug (a boot-primer tail-gap leaving raw zero-fill at
-    # the ring's physical tail) precisely because it only ever played
-    # sequentially from wherever, never validating the WHOLE declared file
-    # up front the way a real head unit's own mount-time scan plausibly
-    # does. Runs for every discovered file, not just the one about to play.
-    #
-    # REAL BUG FOUND AND FIXED (2026-09-21, live test, reproduced directly):
-    # running this scan immediately before --bursty playback under
-    # FATDISK_ALWAYS_SERVE_LIVE produces real, clustered audio corruption
-    # ("Frankenstein stream" warnings, multiple resyncs) -- confirmed via a
-    # direct A/B (scan+bursty vs. skip-scan+bursty, otherwise identical)
-    # against real hardware. Root cause: the scan itself does 938 UNPACED
-    # reads in a tight loop -- a far more extreme, unbounded version of
-    # exactly what --bursty does in a controlled way (BURST_AHEAD_SECONDS-
-    # bounded), and it advances the SAME shared, persistent live-serve
-    # cursor the real playback read loop depends on. By the time the scan
-    # finishes, the cursor is left in a state the subsequent --bursty
-    # playback has never been tuned to recover cleanly from. The scan
-    # itself still correctly reports PASS (it does its own job right) --
-    # the harm is a SIDE EFFECT on cursor state, not a scan-accuracy bug.
-    # Fixed by never running the two together: the scan's real, proven
-    # value (catching the B2 boot-primer tail-gap bug) doesn't require
-    # --bursty pacing at all, so skip it automatically whenever --bursty is
-    # requested rather than let them silently corrupt each other.
-    if args.bursty and not args.skip_scan:
-        print("[radio][gui] skipping validity scan -- incompatible with --bursty "
-              "(the scan's own unpaced full-file read perturbs the same live-serve "
-              "cursor --bursty playback depends on; confirmed live, 2026-09-21). "
-              "Run once WITHOUT --bursty first if you want scan coverage this session.",
-              file=sys.stderr)
-    elif not args.skip_scan:
-        for f in files:
-            scan_file_validity(transport, layout, f)
-
-    state = RadioGuiState(files)
+    state = RadioGuiState(files, folder_wrap=not args.no_folder_wrap)
     # Scriptable Next/Back for unattended tests (`kill -USR1 <pid>` = Next,
-    # `-USR2` = Back): same request_switch() path as the buttons. Tkinter's
+    # `-USR2` = Back): the same radio button presses as the GUI buttons. Tkinter's
     # periodic refresh() keeps the interpreter running Python code, so the
     # handlers fire within ~200ms.
     import signal
-    signal.signal(signal.SIGUSR1, lambda *_: state.request_switch(1))
-    signal.signal(signal.SIGUSR2, lambda *_: state.request_switch(-1))
+    signal.signal(signal.SIGUSR1, lambda *_: state.press("next"))
+    signal.signal(signal.SIGUSR2, lambda *_: state.press("back"))
     player = None
     level_proc = None  # only set for the default ffmpeg player, see below
     capture_f = open(args.capture, "wb") if args.capture else None
@@ -1224,7 +1045,7 @@ def run_gui_mode(transport, layout, fat, root_dir, args):
 
     reader_thread = threading.Thread(
         target=gui_read_loop,
-        args=(transport, layout, state, player, capture_f, volume_serial, args.bursty),
+        args=(transport, layout, state, player, capture_f),
         kwargs={"level_proc": level_proc},
         daemon=True)
     reader_thread.start()
@@ -1269,8 +1090,7 @@ def run_gui_mode(transport, layout, fat, root_dir, args):
                 state.reader_alive = True
                 threading.Thread(
                     target=gui_read_loop,
-                    args=(new_transport, layout, state, player, capture_f,
-                          volume_serial, args.bursty),
+                    args=(new_transport, layout, state, player, capture_f),
                     kwargs={"level_proc": level_proc},
                     daemon=True).start()
             reconnect_stop.wait(0.5)
@@ -1278,20 +1098,12 @@ def run_gui_mode(transport, layout, fat, root_dir, args):
     if getattr(transport, "path", None) is not None:
         threading.Thread(target=reconnect_supervisor, daemon=True).start()
 
-    # Snapshots (not pops) so the writer always has the latest known
-    # position for every file touched so far, even across its own 3s gaps.
-    writer_stop = threading.Event()
-    writer_thread = threading.Thread(
-        target=resume_cache_writer_thread,
-        args=(state.snapshot_resume_positions, writer_stop),
-        daemon=True)
-    writer_thread.start()
-
     root = tk.Tk()
     root.title("Car Radio Simulator")
     root.geometry("420x260")
 
-    now_playing_var = tk.StringVar(value="Now Playing: --")
+    now_playing_var = tk.StringVar(value="F01 T-01")
+    disp_mode = [False]  # the radio's DISP button: index -> ID3 title/artist
     elapsed_var = tk.StringVar(value="0:00")
     status_var = tk.StringVar(value="")
 
@@ -1301,17 +1113,19 @@ def run_gui_mode(transport, layout, fat, root_dir, args):
 
     btn_frame = tk.Frame(root)
     btn_frame.pack()
-    tk.Button(btn_frame, text="◀ Back", width=12,
-              command=lambda: state.request_switch(-1)).grid(row=0, column=0, padx=10)
-    tk.Button(btn_frame, text="Next ▶", width=12,
-              command=lambda: state.request_switch(1)).grid(row=0, column=1, padx=10)
+    tk.Button(btn_frame, text="◀ Back", width=9,
+              command=lambda: state.press("back")).grid(row=0, column=0, padx=6)
+    tk.Button(btn_frame, text="Next ▶", width=9,
+              command=lambda: state.press("next")).grid(row=0, column=1, padx=6)
+    tk.Button(btn_frame, text="DISP", width=6,
+              command=lambda: disp_mode.__setitem__(0, not disp_mode[0])).grid(row=0, column=3, padx=6)
 
     def toggle_pause():
         is_paused = state.toggle_paused()
         pause_btn.config(text="▶ Resume" if is_paused else "⏸ Pause")
 
-    pause_btn = tk.Button(btn_frame, text="⏸ Pause", width=12, command=toggle_pause)
-    pause_btn.grid(row=0, column=2, padx=10)
+    pause_btn = tk.Button(btn_frame, text="⏸ Pause", width=9, command=toggle_pause)
+    pause_btn.grid(row=0, column=2, padx=6)
 
     # Local-only playback volume (2026-09-22, Muni's request): adjusts just
     # this PC's own PulseAudio playback of the ffmpeg player process below --
@@ -1460,8 +1274,14 @@ def run_gui_mode(transport, layout, fat, root_dir, args):
     DECODE_ERROR_DISPLAY_SECS = 2.0
 
     def refresh():
-        idx, n, total_read, lap_bytes, alive, paused = state.snapshot()
-        now_playing_var.set(f"Now Playing: {state.files[idx]['name']}")
+        idx, n, total_read, lap_bytes, alive, paused, buffered = state.snapshot()
+        # What the Kenwood shows: the index; DISP shows the file's ID3v1 tag,
+        # never the file name (car trace 2026-09-25). No tag -> no name.
+        if disp_mode[0]:
+            tag = state.files[idx].get("id3")
+            now_playing_var.set(f"{tag[0]} / {tag[1]}" if tag else "NO NAME")
+        else:
+            now_playing_var.set(f"F01 T-{idx + 1:02d}")
         elapsed_secs = lap_bytes // ASSUMED_BYTES_PER_SEC
         elapsed_var.set(f"{elapsed_secs // 60}:{elapsed_secs % 60:02d}")
         # "reconnecting" not "reader stopped" (2026-09-22): with
@@ -1474,7 +1294,8 @@ def run_gui_mode(transport, layout, fat, root_dir, args):
             suffix = "  [PAUSED]"
         else:
             suffix = ""
-        status_var.set(f"file {idx + 1}/{n}  |  bytes read: {total_read}{suffix}")
+        status_var.set(f"file {idx + 1}/{n}  |  read-ahead {buffered / ASSUMED_BYTES_PER_SEC:.1f}s  |  "
+                       f"bytes read: {total_read}{suffix}")
         since_last_level = time.monotonic() - audio_level_state["last_ms"]
         if audio_level_state["rms_db"] is None or since_last_level > 1.0:
             # No reading yet, or stale (player not running/crashed, or
@@ -1494,7 +1315,6 @@ def run_gui_mode(transport, layout, fat, root_dir, args):
         root.after(200, refresh)
 
     def on_close():
-        writer_stop.set()
         reconnect_stop.set()
         if player:
             try:
@@ -1619,6 +1439,10 @@ def main():
                           "real firmware bug (a boot-primer tail-gap) through undetected on a "
                           "prior bench test. Only skip this for a quick, repeat test where the "
                           "file's already been validated once this session.")
+    ap.add_argument("--no-folder-wrap", action="store_true",
+                     help="--gui only: the Kenwood's default (folder wrap menu option OFF): Next does "
+                          "nothing on the last file, Back does nothing on the first. Muni's radio has "
+                          "wrap ON, which is the default here.")
     ap.add_argument("--bursty", action="store_true",
                      help="--gui only: let reads race up to BURST_AHEAD_SECONDS ahead of the "
                           "real-time playback schedule (pausing only once that bound would be "
