@@ -22,6 +22,7 @@
 
 #include "AudioTools.h"
 #include "AudioTools/AudioCodecs/CodecMP3Shine.h"
+#include "../common/mp3_pipeline.h"  // shared encoder + link baud (ENCODE_ON_S3)
 #include "BluetoothA2DPSink.h"
 #include "esp_gap_bt_api.h"
 
@@ -366,8 +367,19 @@ class SerialPrintSink : public Print {
 };
 
 SerialPrintSink serial_sink;
-MP3EncoderShine shine_encoder;
-EncodedAudioStream mp3_out(&serial_sink, &shine_encoder);
+#ifndef ENCODE_ON_S3
+Mp3Pipeline mp3_out(serial_sink);  // the shared encoder, output as 'A' frames
+#endif
+
+// Every path that hands mono PCM downstream goes through here: encoded on
+// this board (default) or shipped raw to the S3 as 'P' frames (ENCODE_ON_S3).
+static inline void emit_mono(const uint8_t *pcm, uint32_t len) {
+#ifdef ENCODE_ON_S3
+  send_framed(LINK_FRAME_PCM, pcm, len);
+#else
+  mp3_out.write_mono(pcm, len);
+#endif
+}
 
 // audio_data_callback runs directly inside Bluedroid's own receive task. Shine
 // encoding is too CPU-heavy to run there in real time on this chip: real audio
@@ -520,7 +532,7 @@ void audio_data_callback(const uint8_t *data, uint32_t length) {
   }
 #endif
 #ifdef DIAG_NO_ENCODE_TASK
-  mp3_out.write(data, length);
+  emit_mono(data, length);
   return;
 #endif
   if (length > PCM_SLOT_SIZE) length = PCM_SLOT_SIZE;  // never overflow a slot
@@ -716,7 +728,7 @@ void encode_task(void *) {
       uint32_t mono_len = 0;
       downmix_stereo_to_mono(pcm_slots[idx].data, pcm_slots[idx].length,
                               mono_buf, &mono_len);
-      mp3_out.write(mono_buf, mono_len);
+      emit_mono(mono_buf, mono_len);
       uint32_t elapsed = micros() - t0;
       if (elapsed > encode_us_max) encode_us_max = elapsed;
       encode_us_sum += elapsed;
@@ -1314,7 +1326,7 @@ void setup() {
   esp_log_level_set("*", ESP_LOG_NONE);
 #endif
   serial_mutex = xSemaphoreCreateRecursiveMutex();
-  Serial.begin(921600);
+  Serial.begin(LINK_BAUD);  // shared with the S3 via common/mp3_pipeline.h
   delay(500);
 
   // Diagnostic added after a real, confirmed reboot-on-reconnect bug
@@ -1596,11 +1608,11 @@ void setup() {
 // the A2DP link came up), stopped on disconnect so the next connect gets the
 // same headroom. While stopped, mp3_out.write() is a no-op and the S3 serves
 // valid silent frames on its own (live-serve underrun handling).
-static const AudioInfo MP3_INFO(44100, 1, 16);
 static bool g_encoder_active = false;
 static const uint32_t ENCODER_AVRC_GRACE_MS = 4000;
 
 void manage_encoder() {
+#ifndef ENCODE_ON_S3
   uint32_t now = millis();
   if (g_encoder_active && !g_bt_connected) {
     mp3_out.end();
@@ -1613,13 +1625,14 @@ void manage_encoder() {
   if (!g_encoder_active && g_bt_connected &&
       (int32_t)(now - last_real_audio_ms) < 500 &&
       (g_avrc_link_connected || (int32_t)(now - g_bt_connected_since_ms) > (int32_t)ENCODER_AVRC_GRACE_MS)) {
-    g_encoder_active = mp3_out.begin(MP3_INFO);
+    g_encoder_active = mp3_out.begin();
     char b[64];
     snprintf(b, sizeof(b), "ENCODER:%s,avrc=%d,free=%u,largest=%u", g_encoder_active ? "on" : "FAILED",
              (int)g_avrc_link_connected, (unsigned)ESP.getFreeHeap(),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
     send_control(b);
   }
+#endif  // ENCODE_ON_S3: the S3 owns the encoder, nothing to manage here
 }
 
 void loop() {
@@ -1936,7 +1949,7 @@ void loop() {
     uint32_t mono_len = 0;
     downmix_stereo_to_mono(pcm_slots[idx].data, pcm_slots[idx].length,
                             mono_buf_loop, &mono_len);
-    mp3_out.write(mono_buf_loop, mono_len);  // no-op while the encoder is stopped
+    emit_mono(mono_buf_loop, mono_len);  // encode here, or ship PCM to the S3 (ENCODE_ON_S3)
     uint32_t elapsed = micros() - t0;
     if (elapsed > encode_us_max) encode_us_max = elapsed;
     encode_us_sum += elapsed;

@@ -54,6 +54,10 @@
 #include "esp_heap_caps.h"
 #include "silence_primer.h"
 #include "fat_disk_shared.h"
+#include "../common/link_protocol.h"  // LINK_BAUD + frame types, shared with the classic
+#ifdef ENCODE_ON_S3
+#include "../common/mp3_pipeline.h"   // the shared encoder (same source the classic uses by default)
+#endif
 #include <Adafruit_NeoPixel.h>
 
 // UART pins to the classic ESP32's TX (its Serial/UART0 TX pin, wired
@@ -82,7 +86,7 @@
 // 26-37 range, so no conflict.
 #define UART_S3_RX_PIN 8
 #define UART_S3_TX_PIN 4  // moved off GPIO17 (2026-09-19) as part of a real hardware A/B test with a new short, direct cable -- see progress/STATUS.md
-#define UART_BAUD 921600
+#define UART_BAUD LINK_BAUD  // 921600 by default, 2000000 with ENCODE_ON_S3 (common/link_protocol.h)
 HardwareSerial LinkSerial(1);  // UART1
 
 // REAL ROOT CAUSE, finally confirmed (2026-09-19, first live test of the
@@ -261,6 +265,34 @@ static void find_sync() {
   }
 }
 
+// Appends whole MP3 frames to the ring (the 'A' path, and the S3 encoder's
+// output with ENCODE_ON_S3). Same retry-then-force policy either way.
+static void append_mp3(const uint8_t *data, uint32_t length) {
+  for (uint32_t i = 0; i < MAX_WRITE_RETRIES; i++) {
+    if (disk_append(data, length, true)) return;
+    delay(WRITE_RETRY_DELAY_MS);
+  }
+  disk_append(data, length, false);  // force through, same fallback as s3_sim_serial.py
+}
+
+#ifdef ENCODE_ON_S3
+class RingSink : public Print {
+ public:
+  size_t write(uint8_t b) override { return write(&b, 1); }
+  size_t write(const uint8_t *data, size_t len) override {
+    append_mp3(data, len);
+    return len;
+  }
+};
+static RingSink g_ring_sink;
+static Mp3Pipeline g_s3_encoder(g_ring_sink);
+// Encode cost per 'P' frame (~20ms of audio each), for the heartbeat.
+static volatile uint32_t g_enc_us_sum = 0, g_enc_us_max = 0, g_enc_n = 0, g_pcm_bytes = 0;
+// Status LED inputs for this mode: encoder started OK, and when PCM last arrived.
+static volatile bool g_s3_encoder_ok = false;
+static volatile uint32_t g_pcm_last_ms = 0;
+#endif
+
 static void link_task(void *) {
   static uint8_t payload[MAX_FRAME_LEN];
   while (true) {
@@ -271,20 +303,28 @@ static void link_task(void *) {
     uint32_t length = ((uint32_t)header[1] << 24) | ((uint32_t)header[2] << 16) |
                        ((uint32_t)header[3] << 8) | (uint32_t)header[4];
 
-    if ((frame_type != 'A' && frame_type != 'C') || length > MAX_FRAME_LEN) {
+    bool known = frame_type == LINK_FRAME_MP3 || frame_type == LINK_FRAME_CONTROL;
+#ifdef ENCODE_ON_S3
+    known = known || frame_type == LINK_FRAME_PCM;
+#endif
+    if (!known || length > MAX_FRAME_LEN) {
       g_link_frames_bad++;
       continue;  // bad header -- rescan from find_sync(), same as the Python side
     }
     if (length) read_exact(payload, length);
     g_link_last_frame_ms = millis();
 
-    if (frame_type == 'A') {
-      bool ok = false;
-      for (uint32_t i = 0; i < MAX_WRITE_RETRIES; i++) {
-        if (disk_append(payload, length, true)) { ok = true; break; }
-        delay(WRITE_RETRY_DELAY_MS);
-      }
-      if (!ok) disk_append(payload, length, false);  // force through, same fallback as s3_sim_serial.py
+    if (frame_type == LINK_FRAME_MP3) {
+      append_mp3(payload, length);
+#ifdef ENCODE_ON_S3
+    } else if (frame_type == LINK_FRAME_PCM) {
+      uint32_t t0 = micros();
+      g_pcm_last_ms = millis();
+      g_s3_encoder.write_mono(payload, length);
+      uint32_t dt = micros() - t0;
+      g_enc_us_sum += dt; g_enc_n++; g_pcm_bytes += length;
+      if (dt > g_enc_us_max) g_enc_us_max = dt;
+#endif
     } else {
       // 'C' (control/diagnostic messages from the classic ESP32). Most of
       // these (BT_CONNECTED/ENCODE_US/etc.) existed purely for the PC-side
@@ -386,6 +426,16 @@ void setup() {
     while (true) delay(1000);
   }
   memset(g_ring, 0, DECLARED_FILE_SIZE);
+#ifdef ENCODE_ON_S3
+  // Shine's working state is hot, table-heavy data: keep it in internal RAM.
+  // With PSRAM enabled, malloc() otherwise sends allocations above the
+  // (4KB) internal threshold to slower PSRAM. Internal has ~278KB free.
+  heap_caps_malloc_extmem_enable(256 * 1024);
+  bool enc_ok = g_s3_encoder.begin();
+  g_s3_encoder_ok = enc_ok;
+  Serial.printf("[s3] encoder (ENCODE_ON_S3): %s, int_free=%u\n", enc_ok ? "on" : "FAILED",
+                (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+#endif
   // Prime the ring with pre-encoded silence up front -- same fix as
   // fat12_disk.py's __init__, same rationale (see CLAUDE.md/STATUS.md):
   // gets the radio's decoder real bytes to engage with immediately on
@@ -450,7 +500,11 @@ void setup() {
   // must be set before begin(). 8KB gives real headroom (two full
   // MAX_FRAME_LEN frames) against link_task briefly falling behind
   // during a disk_append() retry stall.
+#ifdef ENCODE_ON_S3
+  LinkSerial.setRxBufferSize(16384);  // ~180ms of PCM at 88KB/s, covers encode jitter
+#else
   LinkSerial.setRxBufferSize(8192);
+#endif
   // TX=-1: GPIO17 no longer belongs to this UART instance -- see
   // ReturnTxSerial above for why (moved to its own dedicated, slower,
   // noise-resilient UART instance instead).
@@ -554,6 +608,12 @@ void loop() {
   //                                  |                   | car install (no debug-port power there -- losing
   //                                  |                   | this port means the whole board loses power and
   //                                  |                   | goes dark, not white).
+  //   S3 encoder failed              | fast-blinking RED | ENCODE_ON_S3 only: the S3's own MP3 encoder
+  //   (ENCODE_ON_S3 only)            | (250ms)           | didn't start -- no audio can reach the radio.
+  //                                  |                   | NOTE for the two rows below: with ENCODE_ON_S3,
+  //                                  |                   | "frames from the classic" means PCM ('P') frames
+  //                                  |                   | specifically (the classic streams PCM nonstop
+  //                                  |                   | while running); by default any frame counts.
   //   both links down: never linked  | blinking WHITE    | zero frames from the classic since S3 boot --
   //                                  |                   | consistent with "off/disconnected from the start"
   //   both links down: link lost     | blinking CYAN     | was receiving frames from the classic, now silent
@@ -585,6 +645,8 @@ void loop() {
   //                                  | -DLED_RAINBOW_    |
   //                                  | PLAYING)          |
   //
+  //   next/prev relayed to the phone | 3 WHITE flashes    | overlay on top of any state above, ~0.6s
+  //
   // History: a hue-cycling "rainbow while playing" state existed 2026-09-21
   // through early 2026-09-22 (plain fixed-speed animation, never made
   // audio-reactive -- tried that, didn't feel meaningfully connected to the
@@ -594,7 +656,17 @@ void loop() {
   // (LED_RAINBOW_PLAYING) after Muni missed it -- solid GREEN stays the
   // default; pass the flag to get rainbow instead.
   {
-    bool s3_connected = (g_link_last_frame_ms != 0) && (now_ms - g_link_last_frame_ms < 2000);
+    // "Forward link" = is audio input from the classic arriving. By default any
+    // frame proves it (the classic's encoder sleeps while idle, so MP3 frames
+    // legitimately stop). With ENCODE_ON_S3 only PCM counts: the classic
+    // streams PCM (real or injected silence) nonstop while running, so
+    // control frames with no PCM still means nothing can reach the radio.
+#ifdef ENCODE_ON_S3
+    uint32_t link_ms = g_pcm_last_ms;
+#else
+    uint32_t link_ms = g_link_last_frame_ms;
+#endif
+    bool s3_connected = (link_ms != 0) && (now_ms - link_ms < 2000);
     // REAL FEEDBACK (2026-09-21, Muni): the link being one-way is
     // legitimately fine depending on what's actually built -- the return
     // channel (S3->classic) only exists to serve RADIO_CMD_RELAY/C3's
@@ -618,6 +690,14 @@ void loop() {
       // variant here stays consistent with that convention instead of
       // introducing a genuinely new hue every time a new state is added.
       status_led.setPixelColor(0, 255, 255, 255);  // solid white -- native USB-OTG (car radio/PC) port disconnected
+#ifdef ENCODE_ON_S3
+    } else if (!g_s3_encoder_ok) {
+      // The S3 runs the encoder in this mode; if it failed to start, nothing
+      // can reach the radio at all. Fast red: a fault, and unlike solid red
+      // ("not paired") it blinks.
+      bool on = ((now_ms / 250) % 2) == 0;
+      status_led.setPixelColor(0, on ? 255 : 0, 0, 0);  // fast-blinking red -- S3 encoder failed to start
+#endif
     } else if (!s3_connected) {
       // Muni's real-world observation (2026-09-22): the classic being
       // fully powered off and one specific wire coming loose while the
@@ -643,7 +723,7 @@ void loop() {
       // the "both links down" case, not just "one link down"). WHITE/CYAN
       // instead, unmistakably distinct from every other state's palette.
       bool on = ((now_ms / 250) % 2) == 0;
-      if (g_link_last_frame_ms == 0) {
+      if (link_ms == 0) {
         status_led.setPixelColor(0, on ? 255 : 0, on ? 255 : 0, on ? 255 : 0);  // blinking white -- never heard from it at all
       } else {
         status_led.setPixelColor(0, 0, on ? 255 : 0, on ? 255 : 0);  // blinking cyan -- was talking, now silent
@@ -729,6 +809,15 @@ void loop() {
                   (unsigned)heap_caps_get_total_size(MALLOC_CAP_SPIRAM),
                   (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
                   (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
+#ifdef ENCODE_ON_S3
+    {
+      uint32_t n = g_enc_n, sum = g_enc_us_sum, mx = g_enc_us_max, pcm = g_pcm_bytes;
+      g_enc_n = 0; g_enc_us_sum = 0; g_enc_us_max = 0; g_pcm_bytes = 0;
+      Serial.printf("[s3] enc: frames=%lu pcm_bytes=%lu avg_us=%lu max_us=%lu\n",
+                    (unsigned long)n, (unsigned long)pcm,
+                    (unsigned long)(n ? sum / n : 0), (unsigned long)mx);
+    }
+#endif
 #ifdef FATDISK_ALWAYS_SERVE_LIVE
     Serial.printf("[s3] live: underruns=%lu lap_end=%lu cursor=%lu\n",
                   (unsigned long)g_live_underruns, (unsigned long)g_ring_lap_end,

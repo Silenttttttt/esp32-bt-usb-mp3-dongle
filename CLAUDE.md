@@ -284,6 +284,19 @@ losing the 3 files and title renaming).** When unsure what a board is currently 
 the last build's recorded flags: `grep -h customBuildProperties
 ~/.cache/arduino/sketches/*/build.options.json` (each entry lists its sketchLocation).
 
+**Encoder location: `ENCODE_ON_S3` (added 2026-09-25). Set it on BOTH boards or NEITHER.**
+The MP3 encoder is one shared source, `common/mp3_pipeline.h` (with the link baud and frame
+types in `common/link_protocol.h`), compiled into whichever board encodes:
+- Without the flag (the original design): the classic encodes and sends MP3 `A` frames at 921600
+  baud. The classic only holds Shine's ~80KB while streaming (see `manage_encoder()`).
+- With the flag (**currently flashed on both boards**): the classic downmixes and sends raw mono
+  PCM `P` frames at **2,000,000** baud; the S3 encodes (~4.2 ms per 20 ms of audio) into the ring.
+  The classic keeps ~101KB of heap free.
+- A mismatch (flag on one board only) means different link bauds, so the S3 sees no valid
+  frames and shows the blinking-WHITE "link never seen" status.
+- To build with it, append ` -DENCODE_ON_S3` to `F` in BOTH commands below. The classic's logger
+  must then use `--baud 2000000 --mode framed`.
+
 Classic ESP32:
 ```
 cd esp32-bt-mp3-test

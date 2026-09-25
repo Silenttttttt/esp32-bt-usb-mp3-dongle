@@ -861,7 +861,9 @@ def gui_read_loop(transport, layout, state, player, capture_f, volume_serial, bu
                 try:
                     player.stdin.write(data)
                     player.stdin.flush()
-                except BrokenPipeError:
+                except (BrokenPipeError, ValueError):
+                    # ValueError: the window was closed (on_close() closed the
+                    # player's stdin) while this thread was mid-write.
                     print("[radio] player exited, stopping", file=sys.stderr)
                     break
             if level_proc is not None:
