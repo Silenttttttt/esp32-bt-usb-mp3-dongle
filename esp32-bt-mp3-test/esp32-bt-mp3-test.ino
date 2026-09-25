@@ -1313,6 +1313,35 @@ void avrc_play_pos_callback(uint32_t play_pos) {
 }
 #endif  // AVRC_TRACK_POSITION
 
+#ifndef BUILD_GIT_SHA
+#define BUILD_GIT_SHA 0
+#define BUILD_GIT_DIRTY 1
+#endif
+// Which build this is (flash.sh passes the commit): flags compiled in. Sent
+// at boot and once a minute, since a logger started after a flash misses boot.
+static void send_build_frame() {
+    char b[128];
+    snprintf(b, sizeof(b), "BUILD:commit=%07lx%s%s%s%s", (unsigned long)BUILD_GIT_SHA,
+             BUILD_GIT_DIRTY ? "+dirty" : "",
+#ifdef V2_ALL
+             " V2_ALL",
+#else
+             "",
+#endif
+#ifdef ENCODE_ON_S3
+             " ENCODE_ON_S3",
+#else
+             "",
+#endif
+#ifdef DIAG_LOOP_DRAIN
+             " DIAG_LOOP_DRAIN"
+#else
+             ""
+#endif
+             );
+    send_control(b);
+}
+
 void setup() {
   pinMode(2, OUTPUT);
   // RX only (TX=-1), 9600 baud -- deliberately slower than the forward
@@ -1369,33 +1398,7 @@ void setup() {
     snprintf(buf, sizeof(buf), "RESET_REASON:%s", reason);
     send_control(buf);
   }
-#ifndef BUILD_GIT_SHA
-#define BUILD_GIT_SHA 0
-#define BUILD_GIT_DIRTY 1
-#endif
-  {
-    // Which build this is (flash.sh passes the commit): flags compiled in.
-    char b[128];
-    snprintf(b, sizeof(b), "BUILD:commit=%07lx%s%s%s%s", (unsigned long)BUILD_GIT_SHA,
-             BUILD_GIT_DIRTY ? "+dirty" : "",
-#ifdef V2_ALL
-             " V2_ALL",
-#else
-             "",
-#endif
-#ifdef ENCODE_ON_S3
-             " ENCODE_ON_S3",
-#else
-             "",
-#endif
-#ifdef DIAG_LOOP_DRAIN
-             " DIAG_LOOP_DRAIN"
-#else
-             ""
-#endif
-             );
-    send_control(b);
-  }
+  send_build_frame();
 
   // Slot pool is static (see pcm_slots above); these two queues just pass
   // slot indices (a single byte each) around, so they're the only actual
@@ -1896,6 +1899,11 @@ void loop() {
     // Same fix, same pattern: resend the CURRENT state here too, every
     // ~1s, not just on transitions.
     send_control(((int32_t)(now_ms - last_real_audio_ms) < 150) ? "AUDIO_LIVE" : "AUDIO_SILENCE");
+    static uint32_t last_build_ms = 0;
+    if (now_ms - last_build_ms >= 60000) {
+      last_build_ms = now_ms;
+      send_build_frame();
+    }
     static uint32_t last_title_resend_ms = 0;
     if (g_bt_connected && g_last_title[0] && now_ms - last_title_resend_ms >= 5000) {
       last_title_resend_ms = now_ms;

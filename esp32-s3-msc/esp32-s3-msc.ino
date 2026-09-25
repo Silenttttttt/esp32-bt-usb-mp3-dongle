@@ -390,20 +390,14 @@ static void usb_event_callback(void *arg, esp_event_base_t event_base, int32_t e
   }
 }
 
-void setup() {
-#ifdef MSC_TRACE
-  Serial.setTxBufferSize(16384);
-  Serial.begin(MSC_TRACE_BAUD);  // the trace needs more than 115200 (see msc_trace.h)
-#else
-  Serial.begin(115200);  // USB CDC debug console (separate from the UART link)
-#endif
-  delay(200);
-  Serial.println("[s3] booting");
 #ifndef BUILD_GIT_SHA
 #define BUILD_GIT_SHA 0
 #define BUILD_GIT_DIRTY 1
 #endif
-  // Which build this is (flash.sh passes the commit): flags compiled in.
+// Which build this is (flash.sh passes the commit): flags compiled in.
+// Printed at boot and once a minute, since a logger started after a flash
+// misses the boot line.
+static void print_build_line() {
   Serial.printf("[s3] build: commit %07lx%s flags:%s%s%s%s%s%s\n", (unsigned long)BUILD_GIT_SHA,
                 BUILD_GIT_DIRTY ? "+dirty" : "",
 #ifdef FATDISK_ALWAYS_SERVE_LIVE
@@ -437,6 +431,18 @@ void setup() {
                 ""
 #endif
                 );
+}
+
+void setup() {
+#ifdef MSC_TRACE
+  Serial.setTxBufferSize(16384);
+  Serial.begin(MSC_TRACE_BAUD);  // the trace needs more than 115200 (see msc_trace.h)
+#else
+  Serial.begin(115200);  // USB CDC debug console (separate from the UART link)
+#endif
+  delay(200);
+  Serial.println("[s3] booting");
+  print_build_line();
 
   status_led.begin();
   status_led.setBrightness(80);  // full 255 is uncomfortably bright for a status LED at close range
@@ -877,6 +883,8 @@ void loop() {
   static uint32_t last_heartbeat_ms = 0;
   if (now_ms - last_heartbeat_ms >= 1000) {
     last_heartbeat_ms = now_ms;
+    static uint32_t heartbeat_n = 0;
+    if (++heartbeat_n % 60 == 0) print_build_line();
     Serial.printf("[s3] link heartbeat: bytes_read=%lu frames_ok=%lu frames_bad=%lu "
                   "write_pos=%lu total_written=%lu last_read_offset=%lu "
                   "diag_write_byte=%02x(n=%lu) diag_read_byte=%02x(n=%lu)\n",

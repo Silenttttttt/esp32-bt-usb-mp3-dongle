@@ -56,7 +56,9 @@ arduino-cli compile --fqbn "$FQBN" \
 [[ $UPLOAD == 1 ]] || exit 0
 
 [[ -e $PORT ]] || { echo "S3 ($SERIAL) not connected: $PORT missing" >&2; exit 1; }
-pkill -f "[s]erial_logger.py --by-id $PORT" && sleep 0.5 || true
+# Anchored: only a process whose command line STARTS with python ... serial_logger.py
+# matches, never a shell whose command line merely mentions it (pkill -f self-match).
+pkill -f "^[^ ]*python3?(\.[0-9]+)? [^ ]*serial_logger\.py --by-id $PORT" && sleep 0.5 || true
 arduino-cli upload -p "$PORT" --fqbn "$FQBN" .
 mkdir -p ../logs
 echo "$(date '+%F %T') S3 $SHA$([[ $DIRTY == 1 ]] && echo +dirty) ${FLAGS[*]}" >> ../logs/flash_history.log
