@@ -146,19 +146,17 @@ Both boards have onboard LED status for debugging without a laptop attached:
 
 ## Build & flash
 
-Classic ESP32 (`esp32-bt-mp3-test/`):
+Use the flash scripts; each board's flags live in one list inside its script (a bare
+`arduino-cli compile .` silently drops them). **[BUILD_FLAGS.md](BUILD_FLAGS.md)** explains
+the two known-good profiles, v1 and v2, every flag, and which combinations work.
+
 ```
-arduino-cli compile --fqbn esp32:esp32:esp32 \
-  --build-property "compiler.c.extra_flags=-DINT2IDX_SIZE=4000 -DDIAG_LOOP_DRAIN -DDIAG_FRAG_TRACE -DA2DP_DISABLE_AVRC" \
-  --build-property "compiler.cpp.extra_flags=-DINT2IDX_SIZE=4000 -DDIAG_LOOP_DRAIN -DDIAG_FRAG_TRACE -DA2DP_DISABLE_AVRC" .
-arduino-cli upload -p /dev/ttyACM<N> --fqbn esp32:esp32:esp32 .
+esp32-bt-mp3-test/flash.sh [--v1] [--no-upload]     # classic ESP32
+esp32-s3-msc/flash.sh      [--v1] [--no-upload]     # ESP32-S3
 ```
 
-ESP32-S3 (`esp32-s3-msc/`):
-```
-arduino-cli compile --fqbn "esp32:esp32:esp32s3:USBMode=default,PSRAM=opi" .
-arduino-cli upload -p /dev/ttyACM<N> --fqbn "esp32:esp32:esp32s3:USBMode=default,PSRAM=opi" .
-```
+Flash both boards with the same profile (v2 is the default). The scripts pick the board by its
+USB serial number; set `CLASSIC_SERIAL` / `S3_SERIAL` for your own boards.
 
 Wiring: classic ESP32's TX0 (GPIO1) → S3's GPIO8, plus a shared ground wire between the
 two boards. If powering the two boards from separate sources (e.g. the S3 from the

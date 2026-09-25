@@ -104,11 +104,11 @@ int main() {
   build_fat();
   build_root_dir();
   FILE *f;
-  f = fopen("/home/silent/.claude/jobs/cf21d43d/tmp/c_boot_sector.bin", "wb");
+  f = fopen("c_boot_sector.bin", "wb");
   fwrite(g_boot_sector, 1, SECTOR_SIZE, f); fclose(f);
-  f = fopen("/home/silent/.claude/jobs/cf21d43d/tmp/c_fat_sector.bin", "wb");
+  f = fopen("c_fat_sector.bin", "wb");
   fwrite(g_fat_sector_cache, 1, sizeof(g_fat_sector_cache), f); fclose(f);
-  f = fopen("/home/silent/.claude/jobs/cf21d43d/tmp/c_root_dir.bin", "wb");
+  f = fopen("c_root_dir.bin", "wb");
   fwrite(g_root_dir_sector, 1, sizeof(g_root_dir_sector), f); fclose(f);
   return 0;
 }

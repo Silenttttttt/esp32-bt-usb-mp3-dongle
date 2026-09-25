@@ -35,11 +35,12 @@ BURST_AHEAD_SECONDS comment for why the default smooth pacing can never
 exercise that path at all.
 """
 import subprocess
+import os
 import sys
 import threading
 import time
 
-sys.path.insert(0, "./sim")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from car_sim import (
     parse_boot_sector, find_all_file_entries, walk_cluster_chain,
     RadioGuiState, gui_read_loop, HelperDeviceTransport, SUDO_PASSWORD,

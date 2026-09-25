@@ -5,6 +5,7 @@
 #
 #   ./flash.sh                 build + flash the car build
 #   ./flash.sh --trace         + MSC_TRACE (log every SCSI command; car capture)
+#   ./flash.sh --v1             the v1 build instead of v2 (see BUILD_FLAGS.md)
 #   ./flash.sh --no-upload     compile only
 #   ./flash.sh -DSOME_FLAG     extra -D flags, appended
 #
@@ -22,13 +23,15 @@ FLAGS=(
   -DENCODE_ON_S3               # the S3 runs the MP3 encoder; classic sends PCM at 2 Mbaud
 )
 
-SERIAL=5CE5146685
+SERIAL=${S3_SERIAL:-5CE5146685}  # USB serial number of the board to flash
 PORT=/dev/serial/by-id/usb-1a86_USB_Single_Serial_${SERIAL}-if00
 FQBN="esp32:esp32:esp32s3:USBMode=default,PSRAM=opi"
 UPLOAD=1
 TRACE=0
 for a in "$@"; do
   case $a in
+    # v1, exactly as car-proven 2026-09-18: one file served by requested offset, 25.6 s ring
+    --v1) FLAGS=(-DFATDISK_DATA_CLUSTERS=100) ;;
     --no-upload) UPLOAD=0 ;;
     --trace) TRACE=1 ;;
     -D*) FLAGS+=("$a") ;;

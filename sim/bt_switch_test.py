@@ -6,6 +6,10 @@ then the other device keeps trying to connect until it gets an A2DP link.
 
 Needs sim/bt_desktop_source.py running on the desktop (A2DP source endpoint
 + agent) and the laptop reachable over SSH with sim/bt_pair_laptop.py.
+Configuration (nothing personal lives in this file):
+  GOLZIN_TEST_REMOTE   ssh target for the second machine, e.g. user@laptop-host (required)
+  GOLZIN_MAC           the classic's Bluetooth address (default: looked up by name "Golzin")
+  SSH password: sim/.sudo_password (git-ignored), or leave it empty for key auth.
 
   sim/bt_switch_test.py [cycles]      default 3 cycles of each variant
 """
@@ -14,11 +18,28 @@ import subprocess
 import sys
 import time
 
-GOLZIN = "<golzin-mac>"
-LAPTOP = "user@laptop-host"
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def _golzin_mac():
+    mac = os.environ.get("GOLZIN_MAC", "")
+    if mac:
+        return mac
+    out = subprocess.run(["bluetoothctl", "devices"], capture_output=True, text=True).stdout
+    for line in out.splitlines():
+        parts = line.split(" ", 2)
+        if len(parts) == 3 and parts[2].strip() == "Golzin":
+            return parts[1]
+    sys.exit("Golzin not known to this PC's BlueZ: pair it once, or set GOLZIN_MAC")
+
+
+GOLZIN = _golzin_mac()
+LAPTOP = os.environ.get("GOLZIN_TEST_REMOTE") or sys.exit("set GOLZIN_TEST_REMOTE=user@host (the second machine)")
 DEV_PATH = "/org/bluez/hci0/dev_" + GOLZIN.replace(":", "_")
-CLASSIC_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "logs", "classic_serial.log")
-PASSWORD = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".sudo_password")).read().strip()
+SINK = "bluez_output." + GOLZIN.replace(":", "_") + ".1"
+CLASSIC_LOG = os.path.join(HERE, "..", "logs", "classic_serial.log")
+_pw_file = os.path.join(HERE, ".sudo_password")
+PASSWORD = open(_pw_file).read().strip() if os.path.exists(_pw_file) else ""
 
 
 def sh(cmd, timeout=60):
@@ -29,8 +50,17 @@ def sh(cmd, timeout=60):
 
 
 def ssh(cmd, timeout=60):
-    env_cmd = f"SSHPASS='{PASSWORD}' sshpass -e ssh -o PubkeyAuthentication=no -o ConnectTimeout=8 {LAPTOP} {subprocess.list2cmdline([cmd])}"
-    return sh(env_cmd, timeout)
+    quoted = subprocess.list2cmdline([cmd])
+    if PASSWORD:
+        env = dict(os.environ, SSHPASS=PASSWORD)
+        full = f"sshpass -e ssh -o PubkeyAuthentication=no -o ConnectTimeout=8 {LAPTOP} {quoted}"
+    else:
+        env = None
+        full = f"ssh -o ConnectTimeout=8 {LAPTOP} {quoted}"
+    try:
+        return subprocess.run(full, shell=True, capture_output=True, text=True, timeout=timeout, env=env).stdout
+    except subprocess.TimeoutExpired:
+        return ""
 
 
 def btctl(*cmds, wait=1):

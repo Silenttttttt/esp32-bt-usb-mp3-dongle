@@ -12,7 +12,7 @@ Last updated: 2026-09-16 02:30 GMT-3
 
 **Methodology that finally cracked it**: rather than keep testing flag changes against
 the real ESP32/BT hardware (slow, hard to control, confounded by real-world jitter),
-built `/home/silent/.claude/jobs/cf21d43d/tmp/synthetic_s3_server.py` — a fully
+built `<tmp>/synthetic_s3_server.py` — a fully
 isolated, hardware-free reproduction that imports the REAL `GrowingFat12Disk` class
 and copies `serve_radio()`'s exact retry/margin logic verbatim from
 `s3_sim_serial.py`/`fat12_disk.py`, driven by a synthetic writer thread feeding real
@@ -3694,7 +3694,7 @@ recording so this isn't re-chased blind next time):
   Ruled out: identical failure even on a freshly-erased, freshly-reflashed chip.
 - Suspected the specific classic ESP32 UNIT itself had some hardware-level BT radio degradation
   from hours of testing. Muni provided a brand-new, never-before-paired second classic ESP32
-  board (fresh MAC `00:70:07:84:C1:66`) specifically to test this. Ruled out: the fresh board
+  board (fresh MAC `<board-mac>`) specifically to test this. Ruled out: the fresh board
   reproduced the exact identical `bluez`-level error
   (`GDBus.Error:org.bluez.Error.Failed: Resource temporarily unavailable`) on its very first
   pairing attempt, conclusively proving this was never about any specific ESP32 hardware or

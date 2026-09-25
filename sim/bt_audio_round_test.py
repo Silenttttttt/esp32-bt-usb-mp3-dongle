@@ -11,7 +11,7 @@ import re
 import sys
 import time
 
-from bt_switch_test import CLASSIC_LOG, Desktop, Laptop, classic_resets, ssh
+from bt_switch_test import CLASSIC_LOG, SINK, Desktop, Laptop, classic_resets, ssh
 
 TONE_S = 12
 
@@ -29,10 +29,10 @@ def play_tone_and_check(laptop):
     t0 = time.time()
     # The laptop's Bluetooth output starts at 0% volume (found 2026-09-25: the
     # first run sent pure silence); set it so the tone is audible.
-    ssh("XDG_RUNTIME_DIR=/run/user/1000 pactl set-sink-volume bluez_output.GOLZIN_MAC.1 80%")
+    ssh(f"XDG_RUNTIME_DIR=/run/user/1000 pactl set-sink-volume {SINK} 80%")
     ssh("XDG_RUNTIME_DIR=/run/user/1000 timeout 30 ffmpeg -loglevel error -re -f lavfi "
         f"-i sine=frequency=440:duration={TONE_S} -ac 2 -f pulse "
-        "-device bluez_output.GOLZIN_MAC.1 golzin_test", TONE_S + 25)
+        f"-device {SINK} golzin_test", TONE_S + 25)
     lines = log_since(t0)
     peaks = [int(m.group(1)) for l in lines for m in [re.search(r"PCM_PEAK:(\d+)", l)] if m]
     live = sum("|AUDIO_LIVE" in l for l in lines)

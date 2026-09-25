@@ -1,5 +1,6 @@
+import os
 import sys
-sys.path.insert(0, "./sim")
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "sim"))
 from fat12_disk import GrowingFat12Disk, SECTOR_SIZE
 
 d = GrowingFat12Disk(capacity_bytes=117 * 8 * 512)

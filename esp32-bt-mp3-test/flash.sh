@@ -3,6 +3,7 @@
 # classic's flags live -- don't retype them by hand.
 #
 #   ./flash.sh              build + flash
+#   ./flash.sh --v1             the v1 build instead of v2 (see BUILD_FLAGS.md)
 #   ./flash.sh --no-upload  compile only
 #   ./flash.sh -DSOME_FLAG  extra -D flags, appended
 #
@@ -19,12 +20,18 @@ FLAGS=(
   -DENCODE_ON_S3        # send mono PCM at 2 Mbaud; the S3 encodes. Must match esp32-s3-msc/flash.sh
 )
 
-SERIAL=5B52096812
+SERIAL=${CLASSIC_SERIAL:-5B52096812}  # USB serial number of the board to flash
 PORT=/dev/serial/by-id/usb-1a86_USB_Single_Serial_${SERIAL}-if00
 FQBN=esp32:esp32:esp32
 UPLOAD=1
 for a in "$@"; do
   case $a in
+    --v1) FLAGS=(
+    -DINT2IDX_SIZE=4000
+    -DDIAG_LOOP_DRAIN
+    -DDIAG_FRAG_TRACE
+    -DA2DP_DISABLE_AVRC   # v1: AVRCP off; the classic encodes MP3 itself (921600 baud)
+  ) ;;
     --no-upload) UPLOAD=0 ;;
     -D*) FLAGS+=("$a") ;;
     *) echo "unknown argument: $a" >&2; exit 2 ;;

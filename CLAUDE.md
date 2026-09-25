@@ -290,9 +290,12 @@ reports what it is at boot: the S3 prints `[s3] build: commit ... flags: ...` on
 serial; the classic sends a `BUILD:commit=... ...` control frame. Restart the logger after a flash.
 
 ```
-esp32-s3-msc/flash.sh [--trace] [--no-upload] [-DEXTRA ...]
-esp32-bt-mp3-test/flash.sh [--no-upload] [-DEXTRA ...]
+esp32-s3-msc/flash.sh [--v1] [--trace] [--no-upload] [-DEXTRA ...]
+esp32-bt-mp3-test/flash.sh [--v1] [--no-upload] [-DEXTRA ...]
 ```
+
+**`BUILD_FLAGS.md` is the reference for the known-good profiles (v1, v2), every flag and which
+combinations work.** v2 is the default; `--v1` reproduces the 2026-09-18 car-proven build.
 
 **Car build flags (verified in the real Kenwood, 2026-09-25):**
 
