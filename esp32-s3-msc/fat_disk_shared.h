@@ -842,6 +842,12 @@ static const uint32_t SUPPRESS_WINDOW_MS = 10000;
 // All of it is undone once the radio switches file, or after
 // SUPPRESS_WINDOW_MS.
 static volatile bool g_early_end_active = false;
+// Size an early end gave the CURRENT file, kept after the size is restored:
+// a radio that opened the file while it was short stops there -- a natural
+// end, even though the directory says full size again by then. Seen live
+// 2026-09-25: 01:00:02, a GUI that opened the shortened file played it out
+// ~17s later, after the 10s restore, and the switch was relayed as "next".
+static volatile uint32_t g_current_file_early_end = 0;  // 0 = none
 static volatile uint32_t g_early_end_file = 0;
 static volatile uint32_t g_early_end_size = 0;
 
@@ -899,6 +905,15 @@ static volatile uint32_t g_last_file_read_ms = 0;
 static volatile bool g_any_file_read = false;
 static volatile bool g_reader_anchored = false;
 
+// A radio is playing a file right now (anchored and read recently). The
+// early end only makes sense then: with no reader -- e.g. the first title
+// right after boot, when only the PC's mount probe has read anything --
+// it would shorten a file for whoever opens it next.
+static bool fatdisk_reader_active() {
+  return g_reader_anchored && g_any_file_read &&
+         (FATDISK_MILLIS() - g_last_file_read_ms) <= READER_IDLE_RESET_MS;
+}
+
 static void fatdisk_note_file_read(uint32_t file_index, uint32_t file_rel_off, uint32_t bytes_this_read) {
   uint32_t now = FATDISK_MILLIS();
   if (g_suppress_next_switch_callback &&
@@ -925,6 +940,7 @@ static void fatdisk_note_file_read(uint32_t file_index, uint32_t file_rel_off, u
     if (g_candidate_bytes_read >= SWITCH_DEBOUNCE_BYTES) {
       g_reader_anchored = true;
       g_current_file_index = file_index;
+      g_current_file_early_end = 0;
       g_current_file_read_end = read_end;
       g_candidate_bytes_read = 0;
     }
@@ -955,8 +971,13 @@ static void fatdisk_note_file_read(uint32_t file_index, uint32_t file_rel_off, u
   // DECLARED_FILE_SIZE lap). If the reader had reached (within two clusters
   // of) the declared end of the file it left, that's end-of-file, not a
   // button.
+  // "The end" is wherever the radio thinks the file ends: the full size, or
+  // an early end the S3 set while this file was open. Only a switch right
+  // at one of those is natural; anywhere else is a button press.
+  uint32_t re = g_current_file_read_end, cut = g_current_file_early_end;
   bool natural_eof = (direction == 1) &&
-      (g_current_file_read_end + 2 * CLUSTER_SIZE >= get_file_declared_size(g_current_file_index));
+      (re + 2 * CLUSTER_SIZE >= get_file_declared_size(g_current_file_index) ||
+       (cut != 0 && re + 2 * CLUSTER_SIZE >= cut && re <= cut + CLUSTER_SIZE));
   bool suppress = g_suppress_next_switch_callback;
   g_suppress_next_switch_callback = false;
   if (suppress) {
@@ -975,6 +996,7 @@ static void fatdisk_note_file_read(uint32_t file_index, uint32_t file_rel_off, u
   }
   g_current_file_index = file_index;
   g_current_file_read_end = read_end;
+  g_current_file_early_end = 0;
   g_candidate_bytes_read = 0;
   // direction==0 means a non-adjacent jump (shouldn't happen with a real
   // radio's own sequential file navigation) -- still adopt the new current
@@ -1008,6 +1030,7 @@ static void force_track_change(const char *new_name11) {
   g_early_end_file = g_current_file_index;
   g_early_end_size = new_size;
   g_early_end_active = true;
+  g_current_file_early_end = new_size;
 
   uint32_t next_idx = (g_current_file_index + 1) % NUM_FILES;
   (void)new_name11;  // names now come from set_title_utf8(), for every file at once

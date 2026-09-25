@@ -421,7 +421,7 @@ static void link_task(void *) {
         // it, and it's a natural EOF anyway). Driven by the title rather
         // than TRACK_CHANGED so the rename always lands before the hop,
         // whichever of the two the classic sends first.
-        if (set_title_utf8((const char *)(msg + 6), msg_len - 6)) {
+        if (set_title_utf8((const char *)(msg + 6), msg_len - 6) && fatdisk_reader_active()) {
           force_track_change(nullptr);
         }
 #endif
