@@ -5871,3 +5871,8 @@ Tools: `sim/bt_desktop_source.py` (desktop as A2DP source + auto-accept agent, n
 change -- the desktop's audio server registers no BT endpoint), `sim/bt_switch_test.py`.
 Harness gotcha: bluetoothctl registers its own agent and swallows confirmations; use
 `agent off` in it so the script's agent answers.
+- With real audio (`sim/bt_audio_round_test.py`, no un-pairing anywhere): 3 rounds of laptop
+  connects + plays a tone -> laptop BT off -> desktop connects -> desktop off -> laptop again.
+  All OK, tone reached the classic every round (PCM_PEAK 1803-2032) and car_sim heard it
+  (-30 dB), 0 classic reboots. Gotcha: the laptop's Bluetooth output starts at 0% volume,
+  which sends pure silence (the first run showed AUDIO_LIVE with PCM_PEAK 0).
