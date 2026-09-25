@@ -166,10 +166,18 @@ int main() {
     uint32_t file = 0, pos = 0, size = 0;
     std::string name;
     bool honors_recheck = false;  // true: re-reads its size every cluster
+    // The real Kenwood (car trace 2026-09-25): on every open it reads the
+    // file's start, a 2 KB probe every 512 KB, and the LAST 2 KB, then plays from 0.
+    bool kenwood_probe = false;
     void open(uint32_t f) {
       file = f; pos = 0; size = get_file_declared_size(f);
       name.clear();
       for (uint32_t i = 0; i < g_long_len; i++) name += (char)g_long_name[i];
+      if (kenwood_probe) {
+        fatdisk_note_file_read(f, 0, 2048);
+        for (uint32_t off = 0x7f800; off < size; off += 0x80000) fatdisk_note_file_read(f, off, 2048);
+        fatdisk_note_file_read(f, size - 2048, 2048);
+      }
     }
     void step() {  // one cluster; natural end opens the next file
       if (honors_recheck) size = get_file_declared_size(file);
@@ -273,6 +281,31 @@ int main() {
   r.open((r.file + 1) % NUM_FILES);
   r.steps(20);
   expect("reader restart not relayed", g_callbacks_next == n0 + 1 && g_callbacks_prev == p0 + 1);
+
+  // 8. The Kenwood's open-time probes (they read each file's last sector)
+  //    must not make a mid-file Next look like a natural end.
+  r.kenwood_probe = true;
+  while (r.size != DECLARED_FILE_SIZE) r.step();
+  r.steps(100);
+  {
+    int n1 = g_callbacks_next, p1 = g_callbacks_prev;
+    r.press(+1);
+    r.steps(6);
+    expect("Kenwood probes: Next mid-file relayed", g_callbacks_next == n1 + 1 && g_callbacks_prev == p1);
+    title("Song K");
+    r.steps(BUF + 2);
+    r.steps(60);
+    expect("Kenwood probes: buffer end -> full file, no extra relay",
+           r.size == DECLARED_FILE_SIZE && g_callbacks_next == n1 + 1 && g_callbacks_prev == p1);
+    r.steps((DECLARED_FILE_SIZE / CLUSTER_SIZE) + BUF + 4);
+    expect("Kenwood probes: natural file end not relayed", g_callbacks_next == n1 + 1 && g_callbacks_prev == p1);
+    r.press(-1);
+    r.steps(6);
+    expect("Kenwood probes: Back mid-file relayed", g_callbacks_prev == p1 + 1);
+  }
+  r.kenwood_probe = false;
+  n0 = g_callbacks_next - 1; p0 = g_callbacks_prev - 1;  // later checks expect "one relay so far"
+  r.steps(60);
 
 #if defined(EARLY_END_FAT) || defined(EARLY_END_READ_ERROR)
   // Early-end variants: a new title cuts the playing (full-length) file.

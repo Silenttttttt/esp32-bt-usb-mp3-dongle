@@ -162,7 +162,11 @@ static const char FILE_NAME[12] = "STREAM  MP3";  // 8.3, space-padded (11 bytes
 // (~240.1s, ~4.0min at 16000 B/s). Comfortably inside FAT12's 4084-total-
 // cluster ceiling (see the static_assert below) and well inside the
 // real S3 module's 8MB PSRAM budget.
-static const uint32_t DATA_CLUSTERS = 938;
+// -DFATDISK_DATA_CLUSTERS=118 gives ~30 s files (car test 2026-09-25).
+#ifndef FATDISK_DATA_CLUSTERS
+#define FATDISK_DATA_CLUSTERS 938
+#endif
+static const uint32_t DATA_CLUSTERS = FATDISK_DATA_CLUSTERS;
 static const uint32_t CLUSTER_SIZE = SECTORS_PER_CLUSTER * SECTOR_SIZE;
 static const uint32_t DECLARED_FILE_SIZE = DATA_CLUSTERS * CLUSTER_SIZE;  // 409600
 
@@ -227,7 +231,13 @@ static const uint32_t BUFFER_FILE_SIZE = FATDISK_BUFFER_FILE_BYTES;
 static_assert(BUFFER_FILE_SIZE % CLUSTER_SIZE == 0 && BUFFER_FILE_SIZE < DECLARED_FILE_SIZE,
               "buffer file must be whole clusters, shorter than a full file");
 #ifdef FATDISK_MULTI_FILE
+#ifdef FATDISK_NO_BUFFER_FILES
+// Car test 2026-09-25: song names dropped (Muni), so the short buffer files
+// have no purpose -- every file is full length.
+static volatile bool g_file_is_buffer[NUM_FILES] = {false, false, false};
+#else
 static volatile bool g_file_is_buffer[NUM_FILES] = {false, true, true};  // file 0 plays first
+#endif
 #endif
 
 static const uint32_t FAT_ENTRIES_NEEDED = NUM_FILES * DATA_CLUSTERS + 2;
@@ -828,6 +838,15 @@ static void set_file_declared_size(uint32_t file_index, uint32_t size) {
 // advance from a button press, and by force_track_change() to shrink the
 // file to just past where the reader already is. Reset on every switch.
 static volatile uint32_t g_current_file_read_end = 0;
+// Only reads that continue the previous one (or restart at 0) move
+// g_current_file_read_end. Seen on the real Kenwood (car trace 2026-09-25):
+// every time it opens a file it also reads that file's LAST sector (and one
+// every 512 KB) -- a duration probe. Counting those made every Next look
+// like the reader had reached the end, so no Next was ever relayed.
+static uint32_t g_last_read_file = 0xFFFFFFFF, g_last_read_end = 0;
+static inline bool fatdisk_read_is_playback(uint32_t file_index, uint32_t file_rel_off) {
+  return file_rel_off == 0 || (file_index == g_last_read_file && file_rel_off == g_last_read_end);
+}
 
 // Set right before forcing a switch, consumed (and cleared) the moment
 // fatdisk_note_file_read() below actually confirms the radio landed on the
@@ -905,6 +924,10 @@ static void restore_early_end() {
 static void arrange_neighbor_sizes(uint32_t cur) {
   if (g_early_end_active && g_early_end_file != cur) restore_early_end();
   uint32_t next = (cur + 1) % NUM_FILES, other = (cur + 2) % NUM_FILES;
+#ifdef FATDISK_NO_BUFFER_FILES
+  (void)next; (void)other;
+  return;
+#endif
   bool next_long = g_file_is_buffer[cur];
   g_file_is_buffer[next] = !next_long;
   g_file_is_buffer[other] = true;
@@ -970,6 +993,9 @@ static void fatdisk_note_file_read(uint32_t file_index, uint32_t file_rel_off, u
     restore_early_end();
   }
   uint32_t read_end = file_rel_off + bytes_this_read;
+  bool playback = fatdisk_read_is_playback(file_index, file_rel_off);
+  g_last_read_file = file_index;
+  g_last_read_end = read_end;
   bool was_idle = !g_any_file_read || (now - g_last_file_read_ms) > READER_IDLE_RESET_MS;
   g_any_file_read = true;
   g_last_file_read_ms = now;
@@ -989,7 +1015,7 @@ static void fatdisk_note_file_read(uint32_t file_index, uint32_t file_rel_off, u
       g_reader_anchored = true;
       FATDISK_TRACE(ANCHOR, file_index, 0, 0);
       g_current_file_index = file_index;
-      g_current_file_read_end = read_end;
+      g_current_file_read_end = playback ? read_end : 0;
       g_candidate_bytes_read = 0;
       arrange_neighbor_sizes(file_index);
     }
@@ -1000,7 +1026,7 @@ static void fatdisk_note_file_read(uint32_t file_index, uint32_t file_rel_off, u
     // range reverted) -- reset any in-progress candidate.
     g_candidate_file_index = file_index;
     g_candidate_bytes_read = 0;
-    if (read_end > g_current_file_read_end) g_current_file_read_end = read_end;
+    if (playback) g_current_file_read_end = read_end;
     return;
   }
   if (file_index == g_candidate_file_index) {
@@ -1049,7 +1075,7 @@ static void fatdisk_note_file_read(uint32_t file_index, uint32_t file_rel_off, u
                     ((!suppress && !natural_eof && direction != 0) ? 4 : 0),
                 re);
   g_current_file_index = file_index;
-  g_current_file_read_end = read_end;
+  g_current_file_read_end = playback ? read_end : 0;
   g_candidate_bytes_read = 0;
   arrange_neighbor_sizes(file_index);
   // direction==0 means a non-adjacent jump (shouldn't happen with a real

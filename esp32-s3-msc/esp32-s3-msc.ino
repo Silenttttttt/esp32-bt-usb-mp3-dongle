@@ -138,10 +138,53 @@ USBMSC MSC;
 extern "C" bool tud_msc_set_sense(uint8_t lun, uint8_t sense_key, uint8_t add_sense_code,
                                   uint8_t add_sense_qualifier);
 
+#ifdef NAME_TEST
+// Car debug build (2026-09-25): what does the Kenwood's DISP show -- the
+// long file name, an ID3v2 tag at the file start, or an ID3v1 tag at the
+// end? Fixed long name "LFN NAME TEST.mp3" on all files (phone titles
+// ignored); file 1 gets an ID3v2 tag, file 2 none, file 3 an ID3v1 tag.
+static uint8_t g_id3v2[128];
+static uint8_t g_id3v1[128];
+static void id3_frame(uint8_t *&p, const char *id, const char *text) {
+  uint32_t n = strlen(text) + 1;  // + encoding byte
+  memcpy(p, id, 4); p += 4;
+  *p++ = 0; *p++ = 0; *p++ = (n >> 8) & 0xFF; *p++ = n & 0xFF;
+  *p++ = 0; *p++ = 0;  // flags
+  *p++ = 0;            // ISO-8859-1
+  memcpy(p, text, n - 1); p += n - 1;
+}
+static void build_test_tags() {
+  memset(g_id3v2, 0, sizeof(g_id3v2));
+  uint8_t *p = g_id3v2;
+  memcpy(p, "ID3\x03\x00\x00", 6); p += 6;
+  uint32_t body = sizeof(g_id3v2) - 10;  // rest is padding
+  *p++ = (body >> 21) & 0x7F; *p++ = (body >> 14) & 0x7F; *p++ = (body >> 7) & 0x7F; *p++ = body & 0x7F;
+  id3_frame(p, "TIT2", "V2 TITLE ONE");
+  id3_frame(p, "TPE1", "V2 ARTIST ONE");
+  memset(g_id3v1, 0, sizeof(g_id3v1));
+  memcpy(g_id3v1, "TAG", 3);
+  memcpy(g_id3v1 + 3, "V1 TITLE THREE", 14);
+  memcpy(g_id3v1 + 33, "V1 ARTIST THREE", 15);
+  g_id3v1[127] = 12;  // genre: Other
+}
+static void overlay(uint32_t abs_pos, uint8_t *buf, uint32_t len, uint32_t at, const uint8_t *src, uint32_t n) {
+  uint32_t lo = abs_pos > at ? abs_pos : at, hi = (abs_pos + len < at + n) ? abs_pos + len : at + n;
+  if (lo < hi) memcpy(buf + (lo - abs_pos), src + (lo - at), hi - lo);
+}
+static void apply_test_tags(uint32_t abs_pos, uint8_t *buf, uint32_t len) {
+  uint32_t data = FIRST_DATA_LBA * SECTOR_SIZE;
+  overlay(abs_pos, buf, len, data + 0 * DECLARED_FILE_SIZE, g_id3v2, sizeof(g_id3v2));
+  overlay(abs_pos, buf, len, data + 2 * DECLARED_FILE_SIZE + g_file_sizes[2] - 128, g_id3v1, 128);
+}
+#endif
+
 static int32_t msc_on_read(uint32_t lba, uint32_t offset, void *buffer, uint32_t bufsize) {
   uint32_t abs_pos = lba * SECTOR_SIZE + offset;
   bool read_error = false;
   disk_read_at(abs_pos, (uint8_t *)buffer, bufsize, nullptr, nullptr, &read_error);
+#ifdef NAME_TEST
+  apply_test_tags(abs_pos, (uint8_t *)buffer, bufsize);
+#endif
   if (read_error) {
     // EARLY_END_READ_ERROR: fail this read as MEDIUM ERROR / unrecovered
     // read error (03/11/00), i.e. a bad spot on a present disk -- not
@@ -429,10 +472,15 @@ static void link_task(void *) {
         // mount probe -- cutting the file it touched made the next radio to
         // open it end ~17s in (01:00:02 and 01:11:12, 2026-09-25).
         static bool s_title_seen = false;
+#if defined(NAME_TEST) || defined(FATDISK_NO_TITLES)
+        if (true) { /* names fixed: test build, or song names dropped (Muni, 2026-09-25) */ } else
+#endif
+        {
         bool changed = set_title_utf8((const char *)(msg + 6), msg_len - 6);
         if (changed) FATDISK_TRACE(TITLE, 1, msg_len - 6, 0);
         if (changed && s_title_seen && fatdisk_reader_active()) force_track_change(nullptr);
         s_title_seen = true;
+        }
 #endif
       }
     }
@@ -472,6 +520,10 @@ void setup() {
 
 #ifdef FATDISK_MULTI_FILE
   init_file_names();
+#endif
+#ifdef NAME_TEST
+  build_test_tags();
+  set_title_utf8("LFN NAME TEST", 13);
 #endif
   build_boot_sector();
   build_fat();
@@ -619,12 +671,52 @@ void setup() {
   Serial.println("[s3] ready");
 }
 
+// Auto re-attach (car test 2026-09-25, Muni: "the s3 needs to detect that
+// and 'replug' automatically"). After an S3 reset with the radio's USB port
+// still powered, the Kenwood sometimes never re-enumerates it (seen twice:
+// no bus reset at all until the cable was replugged). If no host has
+// configured us, drop the D+ pull-up and reconnect -- electrically what the
+// host sees on an unplug/replug -- with a longer disconnect each try.
+// Bench note: with only the debug port connected (no host on the native
+// port) this keeps retrying every ~10 s, harmlessly.
+extern "C" bool tud_disconnect(void);
+extern "C" bool tud_connect(void);
+static void usb_reattach_poll(uint32_t now_ms) {
+  static const uint32_t FIRST_WAIT_MS = 4000, RETRY_EVERY_MS = 10000;
+  static const uint32_t off_ms[] = {300, 1000, 3000};
+  static uint32_t next_try_ms = FIRST_WAIT_MS, tries = 0, reconnect_at_ms = 0;
+  static bool disconnected = false;
+  if (disconnected) {
+    if ((int32_t)(now_ms - reconnect_at_ms) >= 0) {
+      tud_connect();
+      disconnected = false;
+      next_try_ms = now_ms + RETRY_EVERY_MS;
+      Serial.println("[s3] usb re-attach: reconnected");
+    }
+    return;
+  }
+  if (g_native_usb_connected) {  // a host has us; re-arm for a later loss
+    tries = 0;
+    next_try_ms = now_ms + FIRST_WAIT_MS;
+    return;
+  }
+  if ((int32_t)(now_ms - next_try_ms) < 0) return;
+  uint32_t off = off_ms[tries < 3 ? tries : 2];
+  tries++;
+  Serial.printf("[s3] usb re-attach: no host, disconnect for %lu ms (try %lu)\n", (unsigned long)off, (unsigned long)tries);
+  FATDISK_TRACE(USB_STOPPED, 1000 + tries, off, 0);
+  tud_disconnect();
+  disconnected = true;
+  reconnect_at_ms = now_ms + off;
+}
+
 void loop() {
   // All real disk/USB work happens in link_task + USBMSC callbacks; loop()
   // only drives the RGB status LED and the debug heartbeat now. Runs every
   // 20ms (was 1000ms) so the audio-live pulse actually looks smooth instead
   // of stepping once a second.
   uint32_t now_ms = millis();
+  usb_reattach_poll(now_ms);
 
   // RGB status LED (see status_led/RGB_LED_PIN above). Priority-ordered:
   // hardware/link-health states take precedence over BT/audio states,
