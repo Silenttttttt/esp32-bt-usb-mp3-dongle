@@ -20,3 +20,4 @@ firmware/msc_test_client
 sim/.sudo_password
 logs/*.log
 logs/__pycache__/
+logs/car/

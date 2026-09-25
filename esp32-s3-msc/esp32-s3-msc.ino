@@ -135,64 +135,9 @@ Adafruit_NeoPixel status_led(RGB_LED_COUNT, RGB_LED_PIN, NEO_GRB + NEO_KHZ800);
 
 USBMSC MSC;
 
-extern "C" bool tud_msc_set_sense(uint8_t lun, uint8_t sense_key, uint8_t add_sense_code,
-                                  uint8_t add_sense_qualifier);
-
-#ifdef NAME_TEST
-// Car debug build (2026-09-25): what does the Kenwood's DISP show -- the
-// long file name, an ID3v2 tag at the file start, or an ID3v1 tag at the
-// end? Fixed long name "LFN NAME TEST.mp3" on all files (phone titles
-// ignored); file 1 gets an ID3v2 tag, file 2 none, file 3 an ID3v1 tag.
-static uint8_t g_id3v2[128];
-static uint8_t g_id3v1[128];
-static void id3_frame(uint8_t *&p, const char *id, const char *text) {
-  uint32_t n = strlen(text) + 1;  // + encoding byte
-  memcpy(p, id, 4); p += 4;
-  *p++ = 0; *p++ = 0; *p++ = (n >> 8) & 0xFF; *p++ = n & 0xFF;
-  *p++ = 0; *p++ = 0;  // flags
-  *p++ = 0;            // ISO-8859-1
-  memcpy(p, text, n - 1); p += n - 1;
-}
-static void build_test_tags() {
-  memset(g_id3v2, 0, sizeof(g_id3v2));
-  uint8_t *p = g_id3v2;
-  memcpy(p, "ID3\x03\x00\x00", 6); p += 6;
-  uint32_t body = sizeof(g_id3v2) - 10;  // rest is padding
-  *p++ = (body >> 21) & 0x7F; *p++ = (body >> 14) & 0x7F; *p++ = (body >> 7) & 0x7F; *p++ = body & 0x7F;
-  id3_frame(p, "TIT2", "V2 TITLE ONE");
-  id3_frame(p, "TPE1", "V2 ARTIST ONE");
-  memset(g_id3v1, 0, sizeof(g_id3v1));
-  memcpy(g_id3v1, "TAG", 3);
-  memcpy(g_id3v1 + 3, "V1 TITLE THREE", 14);
-  memcpy(g_id3v1 + 33, "V1 ARTIST THREE", 15);
-  g_id3v1[127] = 12;  // genre: Other
-}
-static void overlay(uint32_t abs_pos, uint8_t *buf, uint32_t len, uint32_t at, const uint8_t *src, uint32_t n) {
-  uint32_t lo = abs_pos > at ? abs_pos : at, hi = (abs_pos + len < at + n) ? abs_pos + len : at + n;
-  if (lo < hi) memcpy(buf + (lo - abs_pos), src + (lo - at), hi - lo);
-}
-static void apply_test_tags(uint32_t abs_pos, uint8_t *buf, uint32_t len) {
-  uint32_t data = FIRST_DATA_LBA * SECTOR_SIZE;
-  overlay(abs_pos, buf, len, data + 0 * DECLARED_FILE_SIZE, g_id3v2, sizeof(g_id3v2));
-  overlay(abs_pos, buf, len, data + 2 * DECLARED_FILE_SIZE + g_file_sizes[2] - 128, g_id3v1, 128);
-}
-#endif
-
 static int32_t msc_on_read(uint32_t lba, uint32_t offset, void *buffer, uint32_t bufsize) {
   uint32_t abs_pos = lba * SECTOR_SIZE + offset;
-  bool read_error = false;
-  disk_read_at(abs_pos, (uint8_t *)buffer, bufsize, nullptr, nullptr, &read_error);
-#ifdef NAME_TEST
-  apply_test_tags(abs_pos, (uint8_t *)buffer, bufsize);
-#endif
-  if (read_error) {
-    // EARLY_END_READ_ERROR: fail this read as MEDIUM ERROR / unrecovered
-    // read error (03/11/00), i.e. a bad spot on a present disk -- not
-    // "medium not present", which a radio would treat as the stick being
-    // pulled. Set before returning the error so TinyUSB reports this sense.
-    tud_msc_set_sense(0, 0x03, 0x11, 0x00);
-    return -1;
-  }
+  disk_read_at(abs_pos, (uint8_t *)buffer, bufsize);
   return bufsize;
 }
 
@@ -419,69 +364,11 @@ static void link_task(void *) {
         // confirms the S3->classic wire is genuinely reaching its
         // destination, not just that the classic->S3 forward link is up.
         g_return_ack_last_ms = millis();
-#ifdef FATDISK_MULTI_FILE
-      } else if (msg_len == 13 && memcmp(msg, "TRACK_CHANGED", 13) == 0) {
-        // PLAN_NEXT.md's C1/C2/C4/C6 unification (2026-09-21): a real
-        // track change happened on the phone -- force the currently-open
-        // file to an early EOF so the radio naturally rotates to the next
-        // file (fat_disk_shared.h's force_track_change()). Renaming is now
-        // handled separately below (TITLE:), not passed here -- see that
-        // branch's own comment for why.
-        // 2026-09-25: the early end now happens on the TITLE change below
-        // instead, so it always follows the rename (see there).
-      } else if (msg_len > 6 && memcmp(msg, "TITLE:", 6) == 0) {
-        // C1/Step 2 (2026-09-22, Muni: "yes ofc i want it, its part of the
-        // plan"): the classic already sends this exact message (see
-        // avrc_metadata_callback() on that side) for its own debug logging
-        // -- it reaches the S3 for free over the same shared wire, no new
-        // message type needed. Deliberately NOT bundled into
-        // TRACK_CHANGED's own handling above: TRACK_CHANGED fires
-        // synchronously with the AVRCP track-change notification, but the
-        // real title arrives moments LATER via a separate, asynchronous
-        // AVRCP round trip (this file's own send_control() call happens
-        // from a different callback entirely) -- trying to pass the name
-        // at TRACK_CHANGED time would almost always still be the PREVIOUS
-        // track's stale title. Renaming here, independently, whenever the
-        // real title actually arrives, always targets whichever slot is
-        // currently "next" at that moment -- close enough in practice
-        // given metadata typically arrives well within one file's
-        // remaining playtime, without needing a more elaborate pending-name
-        // queue matched against specific rotation events.
-        // All files carry the same live stream, so every one of them gets
-        // the current title (2026-09-25): whichever file the radio opens next
-        // -- Next, Back, end of file, or a re-open after the car restarts --
-        // reads the current song's name. (The open file's new name only
-        // shows once the radio re-opens it; radios read names at open.)
-        // The classic resends the title every 5s, so this also recovers
-        // after an S3 reboot.
-        // Written as a VFAT long filename ("<title>.mp3"), still FAT12.
-        //
-        // Early end on a NEW title (2026-09-25, Muni's design): radios read a
-        // file's name when they open it, and the title always arrives after
-        // the radio has already opened the file it's playing -- after a Next/
-        // Back press (the phone only changes song once we relay it), and
-        // possibly after a natural song change too. So once the new name is
-        // in the directory, end the open file right after what's been read:
-        // the radio opens the next file, which carries the new name. The
-        // hop is not relayed to the phone (force_track_change() suppresses
-        // it, and it's a natural EOF anyway). Driven by the title rather
-        // than TRACK_CHANGED so the rename always lands before the hop,
-        // whichever of the two the classic sends first.
-        // The first title after boot only names the files: it isn't a song
-        // change, and right after boot the only "reader" may be the PC's
-        // mount probe -- cutting the file it touched made the next radio to
-        // open it end ~17s in (01:00:02 and 01:11:12, 2026-09-25).
-        static bool s_title_seen = false;
-#if defined(NAME_TEST) || defined(FATDISK_NO_TITLES)
-        if (true) { /* names fixed: test build, or song names dropped (Muni, 2026-09-25) */ } else
-#endif
-        {
-        bool changed = set_title_utf8((const char *)(msg + 6), msg_len - 6);
-        if (changed) FATDISK_TRACE(TITLE, 1, msg_len - 6, 0);
-        if (changed && s_title_seen && fatdisk_reader_active()) force_track_change(nullptr);
-        s_title_seen = true;
-        }
-#endif
+        // TRACK_CHANGED / TITLE: ignored. Song names were dropped after the
+        // 2026-09-25 car test (Muni): the Kenwood reads a file's size and
+        // cluster chain once, at open, so the S3 can't end a playing file
+        // early, and a 56-char long name made it reject files ("unsupported
+        // file"). The 3 files keep one fixed name, set at boot.
       }
     }
     g_link_frames_ok++;
@@ -512,6 +399,44 @@ void setup() {
 #endif
   delay(200);
   Serial.println("[s3] booting");
+#ifndef BUILD_GIT_SHA
+#define BUILD_GIT_SHA 0
+#define BUILD_GIT_DIRTY 1
+#endif
+  // Which build this is (flash.sh passes the commit): flags compiled in.
+  Serial.printf("[s3] build: commit %07lx%s flags:%s%s%s%s%s%s\n", (unsigned long)BUILD_GIT_SHA,
+                BUILD_GIT_DIRTY ? "+dirty" : "",
+#ifdef FATDISK_ALWAYS_SERVE_LIVE
+                " ALWAYS_SERVE_LIVE",
+#else
+                "",
+#endif
+#ifdef FATDISK_MULTI_FILE
+                " MULTI_FILE",
+#else
+                "",
+#endif
+#ifdef LED_RAINBOW_PLAYING
+                " LED_RAINBOW",
+#else
+                "",
+#endif
+#ifdef ENCODE_ON_S3
+                " ENCODE_ON_S3",
+#else
+                "",
+#endif
+#ifdef MSC_TRACE
+                " MSC_TRACE",
+#else
+                "",
+#endif
+#ifdef FATDISK_DATA_CLUSTERS
+                " DATA_CLUSTERS(set)"
+#else
+                ""
+#endif
+                );
 
   status_led.begin();
   status_led.setBrightness(80);  // full 255 is uncomfortably bright for a status LED at close range
@@ -520,10 +445,6 @@ void setup() {
 
 #ifdef FATDISK_MULTI_FILE
   init_file_names();
-#endif
-#ifdef NAME_TEST
-  build_test_tags();
-  set_title_utf8("LFN NAME TEST", 13);
 #endif
   build_boot_sector();
   build_fat();

@@ -1369,6 +1369,33 @@ void setup() {
     snprintf(buf, sizeof(buf), "RESET_REASON:%s", reason);
     send_control(buf);
   }
+#ifndef BUILD_GIT_SHA
+#define BUILD_GIT_SHA 0
+#define BUILD_GIT_DIRTY 1
+#endif
+  {
+    // Which build this is (flash.sh passes the commit): flags compiled in.
+    char b[128];
+    snprintf(b, sizeof(b), "BUILD:commit=%07lx%s%s%s%s", (unsigned long)BUILD_GIT_SHA,
+             BUILD_GIT_DIRTY ? "+dirty" : "",
+#ifdef V2_ALL
+             " V2_ALL",
+#else
+             "",
+#endif
+#ifdef ENCODE_ON_S3
+             " ENCODE_ON_S3",
+#else
+             "",
+#endif
+#ifdef DIAG_LOOP_DRAIN
+             " DIAG_LOOP_DRAIN"
+#else
+             ""
+#endif
+             );
+    send_control(b);
+  }
 
   // Slot pool is static (see pcm_slots above); these two queues just pass
   // slot indices (a single byte each) around, so they're the only actual

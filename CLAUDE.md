@@ -279,97 +279,58 @@ available substitute for now, but a PC's read/scheduling timing isn't identical 
 see its own file header and `progress/STATUS.md`'s bring-up checklist for what still needs
 verification once the physical board exists.
 
-## Build/flash commands (for tomorrow, once the S3 board exists)
+## Build/flash commands
 
-**These are the CURRENT build commands (verified 2026-09-24). Copy them exactly. Both boards'
-key features live in build flags, not in the source, and a bare `arduino-cli compile .`
-silently drops them — that happened on 2026-09-24 (two S3 reflashes for an LED color dropped
-`FATDISK_ALWAYS_SERVE_LIVE`, reintroducing a minutes-long delay, and `FATDISK_MULTI_FILE`,
-losing the 3 files and title renaming).** When unsure what a board is currently running, read
-the last build's recorded flags: `grep -h customBuildProperties
-~/.cache/arduino/sketches/*/build.options.json` (each entry lists its sketchLocation).
+**Always build and flash with the scripts: `esp32-s3-msc/flash.sh` and `esp32-bt-mp3-test/flash.sh`.**
+Each board's flags live in ONE list at the top of its script -- don't retype them. A bare
+`arduino-cli compile .` silently drops them (it happened twice on 2026-09-24 and reintroduced a
+minutes-long delay). The scripts confirm the port's USB serial number, stop that board's serial
+logger, pass the git commit in, and append each flash to `logs/flash_history.log`. The firmware
+reports what it is at boot: the S3 prints `[s3] build: commit ... flags: ...` on its debug
+serial; the classic sends a `BUILD:commit=... ...` control frame. Restart the logger after a flash.
 
-**Encoder location: `ENCODE_ON_S3` (added 2026-09-25). Set it on BOTH boards or NEITHER.**
-The MP3 encoder is one shared source, `common/mp3_pipeline.h` (with the link baud and frame
-types in `common/link_protocol.h`), compiled into whichever board encodes:
-- Without the flag (the original design): the classic encodes and sends MP3 `A` frames at 921600
-  baud. The classic only holds Shine's ~80KB while streaming (see `manage_encoder()`).
-- With the flag (**currently flashed on both boards**): the classic downmixes and sends raw mono
-  PCM `P` frames at **2,000,000** baud; the S3 encodes (~4.2 ms per 20 ms of audio) into the ring.
-  The classic keeps ~101KB of heap free.
-- A mismatch (flag on one board only) means different link bauds, so the S3 sees no valid
-  frames and shows the blinking-WHITE "link never seen" status.
-- To build with it, append ` -DENCODE_ON_S3` to `F` in BOTH commands below. The classic's logger
-  must then use `--baud 2000000 --mode framed`.
+```
+esp32-s3-msc/flash.sh [--trace] [--no-upload] [-DEXTRA ...]
+esp32-bt-mp3-test/flash.sh [--no-upload] [-DEXTRA ...]
+```
 
-Classic ESP32:
-```
-cd esp32-bt-mp3-test
-F="-DINT2IDX_SIZE=4000 -DDIAG_LOOP_DRAIN -DDIAG_FRAG_TRACE -DV2_ALL"
-arduino-cli compile --fqbn esp32:esp32:esp32 \
-  --build-property "compiler.c.extra_flags=$F" --build-property "compiler.cpp.extra_flags=$F" .
-# confirm the port's serial is 5B52096812 (see Safety-critical above), and stop its serial logger first:
-arduino-cli upload -p /dev/ttyACM<N> --fqbn esp32:esp32:esp32 .
-```
-- `-DV2_ALL` turns on the AVRCP-dependent features (radio button relay, track rename, auto
-  resume/skip). **Do NOT add `-DA2DP_DISABLE_AVRC`** — the older doc recommended it as a
-  crash fix, but Muni rejected disabling AVRCP (it's the whole point); the crash was instead
-  root-caused to heap fragmentation (see STATUS.md 2026-09-22).
-- `-DDIAG_LOOP_DRAIN` is load-bearing, not just a diagnostic: it keeps Shine encoding in
-  `loop()`. The separate `encode_task()` alternative breaks Bluetooth connectability on this
-  board (creating the task itself is the problem — confirmed by A/B test 2026-09-22).
-- The classic's `Serial` is 921600 baud and carries FRAMED binary (audio 'A' frames + text 'C'
-  frames — the same wire goes to the S3). Log it with `logs/serial_logger.py --baud 921600
-  --mode framed`; `--mode line` at 115200 produces garbage (done by mistake 2026-09-24, which
-  led to hours of wrong conclusions from a log that was actually unreadable).
+**Car build flags (verified in the real Kenwood, 2026-09-25):**
 
-ESP32-S3:
-```
-cd esp32-s3-msc
-F="-DFATDISK_ALWAYS_SERVE_LIVE -DFATDISK_MULTI_FILE -DLED_RAINBOW_PLAYING"
-arduino-cli compile --fqbn "esp32:esp32:esp32s3:USBMode=default,PSRAM=opi" \
-  --build-property "compiler.cpp.extra_flags=$F" --build-property "compiler.c.extra_flags=$F" .
-# confirm the port's serial is 5CE5146685, and stop its serial logger first:
-arduino-cli upload -p /dev/ttyACM<N> --fqbn "esp32:esp32:esp32s3:USBMode=default,PSRAM=opi" .
-```
-- `FATDISK_ALWAYS_SERVE_LIVE`: reads are served from a persistent cursor that tracks the live
-  write edge (~1 s latency) instead of the requested offset. Without it the ring's full ~4 min
-  catch-up lag comes back.
-- `FATDISK_MULTI_FILE`: 3 directory entries aliasing the same live stream, S3-side handling of
-  the classic's `TITLE:`/`TRACK_CHANGED`, and the radio-button relay (`RADIO_CMD:next/prev`).
-- `LED_RAINBOW_PLAYING`: rainbow LED while audio is playing (Muni's preference) instead of solid green.
-- Host test for the live-serve path and the switch detector (run it after touching
-  `fat_disk_shared.h`): `crosscheck/live_serve_test.cpp`, build line at the top of the file.
-- File names are VFAT long filenames (`<song title>.mp3`, full Unicode, up to 255 chars) on
-  the same FAT12 volume, with unique 8.3 aliases (`MARDYB~1.MP3`, `~2`, `~3`). Long names are
-  plain FAT directory entries, not a FAT16/32 feature. With `FATDISK_MULTI_FILE` the root
-  directory has 64 entries (16 without). Host check: `crosscheck/lfn_image_test.cpp` writes a
-  disk image to run `fsck.fat -n -v -l` on.
-- Buffer files (Muni's "do it twice"): the playing file is full length; its two neighbors are
-  ~5 s buffers (`FATDISK_BUFFER_FILE_BYTES`). Next/Back or a file end opens a buffer (old
-  name); the press is relayed, the new title renames all files, the buffer runs out and the
-  radio opens the full-length file with the new name. Works on a size-at-open radio (car_sim).
-  A switch right at the end the radio was given (full, buffer or early end) is never relayed.
-- A new `TITLE:` makes the S3 end the open file early (`force_track_change`) so the radio
-  opens the next file, which already has the new name; the hop is never relayed to the phone.
-  It only works on a radio that notices the change mid-file; car_sim (size read at open, like
-  FatFs) doesn't, so there the new name shows at the next open. Unconfirmed on the Kenwood.
-- Car-test flags for that early end (both off by default; append to `F` above). USB mass
-  storage has no end-of-file message, so these are the other things a radio can see mid-file:
-  - `EARLY_END_FAT`: the file's cluster chain is also cut right after what's been read.
-  - `EARLY_END_READ_ERROR`: reads past that point fail with sense MEDIUM ERROR 03/11/00.
-  Both are undone once the radio switches file, or after 10 s. Test one at a time in the car.
-  Host test: build `crosscheck/live_serve_test.cpp` with the flag(s) added.
-- S3 debug console: `serial_logger.py --baud 115200 --mode line`.
-- **Car capture build, `MSC_TRACE` (2026-09-25)**: `esp32-s3-msc/flash_trace.sh [extra -D flags]`
-  builds and flashes the current S3 flags (incl. `ENCODE_ON_S3`) plus `-DMSC_TRACE` and the
-  `-Wl,--wrap=...` link flags it needs (`msc_trace.h`; without them the link fails on purpose).
-  It logs every SCSI command the USB host sends (CDB, status, bytes, timing, region hit), bus
-  resets, descriptor/control requests and stalls, plus file switch/early-end/title events. The
-  debug serial is **921600** in this build. Run the session with `logs/car_capture.sh
-  start|mark|replay|status|stop` (both loggers, markers, and `replay` re-prints the first 4096
-  records since power-on, for cold boots captured with no laptop attached). Use
-  `/usr/bin/python3` for the loggers on the laptop: the pyenv `python3` has no pyserial.
+| Board | Flag | What it does |
+|---|---|---|
+| S3 | `FATDISK_ALWAYS_SERVE_LIVE` | Reads are served from a cursor at the live write edge, not the requested offset. Without it the ring's ~4 min catch-up lag comes back |
+| S3 | `FATDISK_MULTI_FILE` | 3 full-length files on the same live stream; Next/Back detection and relay (`RADIO_CMD:next/prev`) |
+| S3 | `LED_RAINBOW_PLAYING` | Rainbow LED while playing (Muni's preference) instead of solid green |
+| S3 + classic | `ENCODE_ON_S3` | Classic sends mono PCM `P` frames at **2 Mbaud**; the S3 runs the MP3 encoder (`common/mp3_pipeline.h`). **Both boards or neither**: a mismatch means different bauds and the S3 shows blinking WHITE ("link never seen") |
+| classic | `V2_ALL` | AVRCP features: radio-button relay, auto resume, near-end auto skip. **Never add `A2DP_DISABLE_AVRC`**: AVRCP is the point; the old crash was heap fragmentation |
+| classic | `DIAG_LOOP_DRAIN` | Load-bearing: encode/PCM work stays in `loop()`. A separate task breaks BT connectability (A/B test 2026-09-22) |
+| classic | `DIAG_FRAG_TRACE` | `FRAG:` heap line every second |
+| classic | `INT2IDX_SIZE=4000` | Shine MP3 encoder's x^(3/4) quantization table: 4000 entries instead of 10000 (~24 KB less RAM). Only matters when the classic encodes (no `ENCODE_ON_S3`) |
+
+**Opt-in flags (not in the car build):**
+
+| Board | Flag | What it does |
+|---|---|---|
+| S3 | `MSC_TRACE` (`flash.sh --trace`, or `flash_trace.sh`) | Car capture: logs every SCSI command the radio sends (CDB, status, bytes, timing, region hit), bus resets, descriptor/control requests, file switches. Debug serial becomes **921600**. Needs the `-Wl,--wrap` link flags, which the script adds. Run sessions with `logs/car_capture.sh start|mark|replay|status|stop`; `replay` re-prints the first 4096 records since power-on (cold boots with no laptop attached) |
+| S3 | `FATDISK_DATA_CLUSTERS=N` | File length in 4 KB clusters (default 938 = ~4 min at 128 kbps; 118 = ~30 s) |
+| S3 | `FATDISK_LIVE_TARGET_LAG=N` | Live-serve target lag in bytes (default 12288, ~0.77 s) |
+
+**Removed after the car test (2026-09-25, Muni dropped song names):** phone titles renaming the
+files, buffer files, the early end (`force_track_change`, `EARLY_END_FAT`,
+`EARLY_END_READ_ERROR`), `FATDISK_NO_TITLES`, `FATDISK_NO_BUFFER_FILES`, `NAME_TEST`. The Kenwood
+reads a file's size and cluster chain once, at open, so a playing file can't be ended early, and
+a 56-char long file name made it reject files ("unsupported file"). The 3 files keep one fixed
+name, `Stream.mp3` (8.3 aliases `STREAM~1..3.MP3`); the radio shows only `F01 T-01` anyway.
+
+**Loggers:** classic `logs/serial_logger.py --baud 2000000 --mode framed` (with `ENCODE_ON_S3`;
+921600 without). `--mode line` produces garbage on the classic, which led to hours of wrong
+conclusions on 2026-09-24. S3 `--baud 115200 --mode line` (921600 with `MSC_TRACE`).
+
+**Host tests (run after touching `fat_disk_shared.h`):** `esp32-s3-msc/crosscheck/live_serve_test.cpp`,
+build line at the top of the file. Its switch-detector part drives a model of the real Kenwood.
+
+When unsure what a board runs: its boot line (above), `logs/flash_history.log`, or `grep -h
+customBuildProperties ~/.cache/arduino/sketches/*/build.options.json`.
 
 **A required local library patch lives OUTSIDE this repo and can be silently lost.** The
 classic ESP32 firmware will not compile at all without a 2-line patch in

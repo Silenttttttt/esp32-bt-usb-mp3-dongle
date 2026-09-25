@@ -216,30 +216,6 @@ static const char *const FILE_NAMES[NUM_FILES] = {FILE_NAME};
 static uint32_t g_file_sizes[NUM_FILES] = {DECLARED_FILE_SIZE};
 static uint32_t g_sfn_slot[NUM_FILES] = {0};
 
-// Buffer files (2026-09-25, Muni's "do it twice" design). A radio reads a
-// file's name and size when it opens it, and on Next/Back or a file end
-// it opens a neighbor of the playing file -- before the phone has sent the
-// new title. So the playing file is full length, and its neighbors are
-// short buffers: the radio opens a buffer (old name), the S3 relays the
-// press, the new title arrives within ~1-2s and renames every file, then
-// the buffer ends naturally and the radio opens the next file, full length,
-// with the new name. A buffer running out is a natural end, never relayed.
-#ifndef FATDISK_BUFFER_FILE_BYTES
-#define FATDISK_BUFFER_FILE_BYTES (20 * 4096)  // ~5s: 1s switch debounce + relay + phone + title
-#endif
-static const uint32_t BUFFER_FILE_SIZE = FATDISK_BUFFER_FILE_BYTES;
-static_assert(BUFFER_FILE_SIZE % CLUSTER_SIZE == 0 && BUFFER_FILE_SIZE < DECLARED_FILE_SIZE,
-              "buffer file must be whole clusters, shorter than a full file");
-#ifdef FATDISK_MULTI_FILE
-#ifdef FATDISK_NO_BUFFER_FILES
-// Car test 2026-09-25: song names dropped (Muni), so the short buffer files
-// have no purpose -- every file is full length.
-static volatile bool g_file_is_buffer[NUM_FILES] = {false, false, false};
-#else
-static volatile bool g_file_is_buffer[NUM_FILES] = {false, true, true};  // file 0 plays first
-#endif
-#endif
-
 static const uint32_t FAT_ENTRIES_NEEDED = NUM_FILES * DATA_CLUSTERS + 2;
 static const uint32_t FAT_BYTES = (FAT_ENTRIES_NEEDED * 3 + 1) / 2;
 static const uint32_t FAT_SECTORS = (FAT_BYTES + SECTOR_SIZE - 1) / SECTOR_SIZE;
@@ -501,19 +477,6 @@ static void pack_fat12_entries(const uint16_t *entries, uint32_t n, uint8_t *out
   }
 }
 
-// Sets one FAT12 entry in the served FAT (both FAT copies are served from
-// this one cache).
-static void set_fat12_entry(uint32_t cluster, uint16_t value) {
-  uint8_t *p = g_fat_sector_cache + (cluster * 3) / 2;
-  if (cluster & 1) {
-    p[0] = (uint8_t)((p[0] & 0x0F) | ((value & 0x0F) << 4));
-    p[1] = (uint8_t)(value >> 4);
-  } else {
-    p[0] = (uint8_t)(value & 0xFF);
-    p[1] = (uint8_t)((p[1] & 0xF0) | ((value >> 8) & 0x0F));
-  }
-}
-
 static void build_boot_sector() {
   memset(g_boot_sector, 0, SECTOR_SIZE);
   uint8_t *bs = g_boot_sector;
@@ -684,9 +647,9 @@ static bool set_title_utf8(const char *title, uint32_t len) {
 }
 
 static void init_file_names() {
-  for (uint32_t f = 0; f < NUM_FILES; f++) g_file_sizes[f] = g_file_is_buffer[f] ? BUFFER_FILE_SIZE : DECLARED_FILE_SIZE;
+  for (uint32_t f = 0; f < NUM_FILES; f++) g_file_sizes[f] = DECLARED_FILE_SIZE;
   g_names_initialized = true;
-  set_title_utf8("Stream", 6);  // default until the phone sends a real title
+  set_title_utf8("Stream", 6);  // fixed name: song names dropped (car test 2026-09-25)
 }
 #else
 static void build_root_dir() {
@@ -818,25 +781,10 @@ static void (*g_file_switch_callback)(int direction) = nullptr;
 // only which directory entry the radio is nominally reading from, and
 // what name it shows.
 
-// Patches ONLY the 4-byte size field of one root-dir entry (bytes 28-31,
-// standard FAT least-significant-byte-first) -- everything else about the
-// entry (name, start cluster) is untouched. The declared size is the ONLY
-// thing a FAT reader uses to know where a file ends; it has no separate
-// end-of-file marker in the data itself.
-static void set_file_declared_size(uint32_t file_index, uint32_t size) {
-  g_file_sizes[file_index] = size;
-  uint8_t *entry = g_root_dir_sector + g_sfn_slot[file_index] * 32;
-  entry[28] = size & 0xFF;
-  entry[29] = (size >> 8) & 0xFF;
-  entry[30] = (size >> 16) & 0xFF;
-  entry[31] = (size >> 24) & 0xFF;
-}
-
 // Highest file-relative offset the reader has reached in the CURRENTLY
 // active file (not a byte count: a reader can start mid-file, e.g. a radio
 // resuming a remembered position). Used to tell a natural end-of-file
-// advance from a button press, and by force_track_change() to shrink the
-// file to just past where the reader already is. Reset on every switch.
+// advance from a button press. Reset on every switch.
 static volatile uint32_t g_current_file_read_end = 0;
 // Only reads that continue the previous one (or restart at 0) move
 // g_current_file_read_end. Seen on the real Kenwood (car trace 2026-09-25):
@@ -846,112 +794,6 @@ static volatile uint32_t g_current_file_read_end = 0;
 static uint32_t g_last_read_file = 0xFFFFFFFF, g_last_read_end = 0;
 static inline bool fatdisk_read_is_playback(uint32_t file_index, uint32_t file_rel_off) {
   return file_rel_off == 0 || (file_index == g_last_read_file && file_rel_off == g_last_read_end);
-}
-
-// Set right before forcing a switch, consumed (and cleared) the moment
-// fatdisk_note_file_read() below actually confirms the radio landed on the
-// next file -- suppresses that confirmation from misreading OUR OWN
-// engineered rotation as a genuine physical next/prev button press and
-// relaying a redundant command back to the phone (the real "detection-
-// logic complication" already flagged in PLAN_NEXT.md's C4 section before
-// this design existed). Also remembers the size to restore the file we're
-// LEAVING to, once the radio has genuinely finished with it -- restoring
-// any earlier (e.g. immediately in force_track_change() itself) would
-// undo the very shrink meant to force the EOF in the first place.
-static volatile bool g_suppress_next_switch_callback = false;
-static volatile uint32_t g_suppress_deadline_ms = 0;
-static volatile uint32_t g_restore_size_for_prev_file = 0;
-static volatile uint32_t g_prev_file_index_to_restore = 0;
-// A radio that honors a shrunk size reaches it within about a cluster of
-// reading (~0.26s). If no switch has happened well after that, the radio
-// cached the size at open (FatFs-style) and never will: stop suppressing,
-// so the NEXT switch -- a real button press -- still gets relayed, and put
-// the file's size back so it isn't left truncated for its next open.
-static const uint32_t SUPPRESS_WINDOW_MS = 10000;
-
-// Early end (2026-09-25). There is no "end of file" message in USB mass
-// storage -- a radio decides a file ended by comparing its position with
-// the size it read, normally at open. So force_track_change() makes the
-// open file end right after what's been read in every way the S3 can show
-// a radio mid-file, pending a test on the real Kenwood:
-//   always:               the directory entry's size shrinks (radios that
-//                         re-read the entry)
-//   EARLY_END_FAT:        the file's cluster chain ends there too (radios
-//                         that follow the FAT as they read; one that cached
-//                         the size will likely see a broken chain and skip)
-//   EARLY_END_READ_ERROR: reads past that point fail with a MEDIUM ERROR
-//                         sense (radios that skip unreadable tracks)
-// All of it is undone once the radio switches file, or after
-// SUPPRESS_WINDOW_MS.
-// EARLY_END_FAT is on by default with FATDISK_MULTI_FILE (2026-09-25, Muni):
-// ending the file's cluster chain is how we expect the Kenwood to see the
-// early end, and car_sim follows the chain the same way. -DEARLY_END_NO_FAT
-// turns it off.
-#if defined(FATDISK_MULTI_FILE) && !defined(EARLY_END_NO_FAT) && !defined(EARLY_END_FAT)
-#define EARLY_END_FAT
-#endif
-static volatile bool g_early_end_active = false;
-static volatile uint32_t g_early_end_restore_size = 0;  // the file's size before the cut
-// Per file, the size an early end gave it, kept after the size is restored:
-// a radio that opened the file while it was short stops there -- a natural
-// end, even though the directory says full size again by then. Seen live
-// 2026-09-25 (01:00:02 and 01:11:12): a GUI that opened the cut file played
-// it out ~17s later, after the 10s restore, and the switch was relayed as
-// "next". Cleared once the radio leaves that file.
-static volatile uint32_t g_file_early_end[NUM_FILES] = {0};  // 0 = none
-
-static volatile uint32_t g_early_end_file = 0;
-static volatile uint32_t g_early_end_size = 0;
-
-static void restore_early_end() {
-  if (!g_early_end_active) return;
-  g_early_end_active = false;
-  set_file_declared_size(g_early_end_file, g_early_end_restore_size);
-  FATDISK_TRACE(RESTORE_END, g_early_end_file, g_early_end_restore_size, 0);
-#ifdef EARLY_END_FAT
-  uint32_t last_rel = (g_early_end_size - 1) / CLUSTER_SIZE;
-  if (last_rel + 1 < DATA_CLUSTERS) {
-    uint32_t cluster = 2 + g_early_end_file * DATA_CLUSTERS + last_rel;
-    set_fat12_entry(cluster, (uint16_t)(cluster + 1));
-  }
-#endif
-}
-
-// Sizes the files around the playing one (see BUFFER_FILE_SIZE): after a
-// jump into a buffer, the file after it is the full-length landing file;
-// otherwise both neighbors are buffers. Never touches the playing file --
-// the radio already read its size.
-static void arrange_neighbor_sizes(uint32_t cur) {
-  if (g_early_end_active && g_early_end_file != cur) restore_early_end();
-  uint32_t next = (cur + 1) % NUM_FILES, other = (cur + 2) % NUM_FILES;
-#ifdef FATDISK_NO_BUFFER_FILES
-  (void)next; (void)other;
-  return;
-#endif
-  bool next_long = g_file_is_buffer[cur];
-  g_file_is_buffer[next] = !next_long;
-  g_file_is_buffer[other] = true;
-  set_file_declared_size(next, next_long ? DECLARED_FILE_SIZE : BUFFER_FILE_SIZE);
-  set_file_declared_size(other, BUFFER_FILE_SIZE);
-}
-
-// True when a read of file `file_index` at `file_rel_off` falls past an
-// active early end -- EARLY_END_READ_ERROR fails such reads.
-static inline bool early_end_read_blocked(uint32_t file_index, uint32_t file_rel_off) {
-#ifdef EARLY_END_READ_ERROR
-  if (!g_early_end_active) return false;
-  // Also expire here: a radio that just retries the failing read never
-  // reaches fatdisk_note_file_read()'s own expiry check.
-  if ((int32_t)(FATDISK_MILLIS() - g_suppress_deadline_ms) > 0) {
-    g_suppress_next_switch_callback = false;
-    restore_early_end();
-    return false;
-  }
-  return file_index == g_early_end_file && file_rel_off >= g_early_end_size;
-#else
-  (void)file_index; (void)file_rel_off;
-  return false;
-#endif
 }
 
 static uint32_t get_file_declared_size(uint32_t file_index) {
@@ -976,22 +818,8 @@ static volatile uint32_t g_last_file_read_ms = 0;
 static volatile bool g_any_file_read = false;
 static volatile bool g_reader_anchored = false;
 
-// A radio is playing a file right now (anchored and read recently). The
-// early end only makes sense then: with no reader -- e.g. the first title
-// right after boot, when only the PC's mount probe has read anything --
-// it would shorten a file for whoever opens it next.
-static bool fatdisk_reader_active() {
-  return g_reader_anchored && g_any_file_read &&
-         (FATDISK_MILLIS() - g_last_file_read_ms) <= READER_IDLE_RESET_MS;
-}
-
 static void fatdisk_note_file_read(uint32_t file_index, uint32_t file_rel_off, uint32_t bytes_this_read) {
   uint32_t now = FATDISK_MILLIS();
-  if (g_suppress_next_switch_callback &&
-      (int32_t)(now - g_suppress_deadline_ms) > 0) {
-    g_suppress_next_switch_callback = false;
-    restore_early_end();
-  }
   uint32_t read_end = file_rel_off + bytes_this_read;
   bool playback = fatdisk_read_is_playback(file_index, file_rel_off);
   g_last_read_file = file_index;
@@ -1017,7 +845,6 @@ static void fatdisk_note_file_read(uint32_t file_index, uint32_t file_rel_off, u
       g_current_file_index = file_index;
       g_current_file_read_end = playback ? read_end : 0;
       g_candidate_bytes_read = 0;
-      arrange_neighbor_sizes(file_index);
     }
     return;
   }
@@ -1046,94 +873,20 @@ static void fatdisk_note_file_read(uint32_t file_index, uint32_t file_rel_off, u
   // DECLARED_FILE_SIZE lap). If the reader had reached (within two clusters
   // of) the declared end of the file it left, that's end-of-file, not a
   // button.
-  // "The end" is wherever the radio thinks the file ends: the full size, or
-  // an early end the S3 set while this file was open. Only a switch right
-  // at one of those is natural; anywhere else is a button press.
-  uint32_t re = g_current_file_read_end, cut = g_file_early_end[g_current_file_index];
-  bool natural_eof = (direction == 1) &&
-      (re + 2 * CLUSTER_SIZE >= get_file_declared_size(g_current_file_index) ||
-       (cut != 0 && re + 2 * CLUSTER_SIZE >= cut && re <= cut + CLUSTER_SIZE));
-  bool suppress = g_suppress_next_switch_callback;
-  g_suppress_next_switch_callback = false;
-  if (suppress) {
-    // The switch we were waiting for just landed -- safe to restore the
-    // file we left back to full size now (the radio has, by definition,
-    // already finished reading everything up to the shrunk size).
-    restore_early_end();
-#if !defined(ARDUINO) && defined(FATDISK_LIVE_DEBUG)
-    fprintf(stderr, "[track-rotate] confirmed switch %u -> %u, restored size for %u\n",
-            g_prev_file_index_to_restore, file_index, g_prev_file_index_to_restore);
-#elif defined(ARDUINO) && defined(FATDISK_LIVE_DEBUG)
-    Serial.printf("[track-rotate] confirmed switch %u -> %u, restored size for %u\n",
-                  (unsigned)g_prev_file_index_to_restore, (unsigned)file_index,
-                  (unsigned)g_prev_file_index_to_restore);
-#endif
-  }
-  g_file_early_end[g_current_file_index] = 0;  // left it
+  uint32_t re = g_current_file_read_end;
+  bool natural_eof = (direction == 1) && re + 2 * CLUSTER_SIZE >= get_file_declared_size(g_current_file_index);
   FATDISK_TRACE(SWITCH, (g_current_file_index << 8) | file_index,
-                (natural_eof ? 1 : 0) | (suppress ? 2 : 0) |
-                    ((!suppress && !natural_eof && direction != 0) ? 4 : 0),
-                re);
+                (natural_eof ? 1 : 0) | ((!natural_eof && direction != 0) ? 4 : 0), re);
   g_current_file_index = file_index;
   g_current_file_read_end = playback ? read_end : 0;
   g_candidate_bytes_read = 0;
-  arrange_neighbor_sizes(file_index);
   // direction==0 means a non-adjacent jump (shouldn't happen with a real
   // radio's own sequential file navigation) -- still adopt the new current
   // index so debounce tracking stays correct, just don't relay a command
   // for a jump that doesn't map to a real next/previous.
-  if (!suppress && !natural_eof && direction != 0 && g_file_switch_callback) g_file_switch_callback(direction);
+  if (!natural_eof && direction != 0 && g_file_switch_callback) g_file_switch_callback(direction);
 }
 
-// Main entry point: call this the instant a real track change is known
-// (e.g. the classic's AVRCP track-change hook, forwarded over the existing
-// 'C' control channel -- wiring that up on the .ino side is a separate
-// step from this header). `new_name11` is the incoming track's 8.3 name,
-// already formatted by the caller; pass nullptr to just force an early
-// EOF without renaming anything (e.g. for a plain "loading" placeholder).
-static void force_track_change(const char *new_name11) {
-  // "Read so far, plus one cluster" -- lets whatever's already been read
-  // finish its current cluster cleanly rather than truncating mid-cluster,
-  // then the NEXT read past that hits true EOF. Never shrinks below what's
-  // already been read (which would be nonsensical -- can't un-read bytes).
-  uint32_t new_size = g_current_file_read_end + CLUSTER_SIZE;
-  if (new_size > DECLARED_FILE_SIZE) new_size = DECLARED_FILE_SIZE;
-  restore_early_end();  // a previous early end still pending
-  // The hop must land on a full-length file (it has the new name), not a buffer.
-  uint32_t landing = (g_current_file_index + 1) % NUM_FILES;
-  g_file_is_buffer[landing] = false;
-  set_file_declared_size(landing, DECLARED_FILE_SIZE);
-  uint32_t before = get_file_declared_size(g_current_file_index);
-  if (new_size > before) new_size = before;  // already ends sooner (e.g. a buffer near its end)
-  g_prev_file_index_to_restore = g_current_file_index;
-  g_restore_size_for_prev_file = before;
-  g_early_end_restore_size = before;
-  set_file_declared_size(g_current_file_index, new_size);
-#ifdef EARLY_END_FAT
-  uint32_t last_rel = (new_size - 1) / CLUSTER_SIZE;
-  if (last_rel + 1 < DATA_CLUSTERS)
-    set_fat12_entry(2 + g_current_file_index * DATA_CLUSTERS + last_rel, 0xFFF);  // end of chain
-#endif
-  g_early_end_file = g_current_file_index;
-  g_early_end_size = new_size;
-  g_early_end_active = true;
-  g_file_early_end[g_current_file_index] = new_size;
-  FATDISK_TRACE(FORCE_END, g_current_file_index, new_size, before);
-
-  uint32_t next_idx = (g_current_file_index + 1) % NUM_FILES;
-  (void)new_name11;  // names now come from set_title_utf8(), for every file at once
-  (void)next_idx;
-#if !defined(ARDUINO) && defined(FATDISK_LIVE_DEBUG)
-  fprintf(stderr, "[track-rotate] force_track_change: shrinking file %u to %u bytes (was %u), "
-                  "next file %u\n", g_current_file_index, new_size, DECLARED_FILE_SIZE, next_idx);
-#elif defined(ARDUINO) && defined(FATDISK_LIVE_DEBUG)
-  Serial.printf("[track-rotate] force_track_change: shrinking file %u to %u bytes (was %u), "
-                "next file %u\n", (unsigned)g_current_file_index, (unsigned)new_size,
-                (unsigned)DECLARED_FILE_SIZE, (unsigned)next_idx);
-#endif
-  g_suppress_next_switch_callback = true;
-  g_suppress_deadline_ms = FATDISK_MILLIS() + SUPPRESS_WINDOW_MS;
-}
 #endif  // FATDISK_MULTI_FILE
 
 // See esp32-s3-msc.ino's own comment (2026-09-17) for the full concurrency
@@ -1152,8 +905,7 @@ static void force_track_change(const char *new_name11) {
 // trigger against a real live feed, without duplicating this straddle
 // logic in a second, hand-copied place just to log it.
 static void disk_read_at(uint32_t abs_pos, uint8_t *buffer, uint32_t len,
-                          bool *out_straddled = nullptr, bool *out_lock_missed = nullptr,
-                          bool *out_read_error = nullptr) {
+                          bool *out_straddled = nullptr, bool *out_lock_missed = nullptr) {
 #ifdef FATDISK_ALWAYS_SERVE_LIVE
   (void)out_straddled;  // no "straddling a fixed offset" concept in this mode
 #endif
@@ -1213,10 +965,6 @@ static void disk_read_at(uint32_t abs_pos, uint8_t *buffer, uint32_t len,
         continue;
       }
 #ifdef FATDISK_MULTI_FILE
-      if (early_end_read_blocked(file_index, file_rel_off)) {
-        if (out_read_error) *out_read_error = true;
-        return;
-      }
       fatdisk_note_file_read(file_index, file_rel_off, n);
 #endif
 
