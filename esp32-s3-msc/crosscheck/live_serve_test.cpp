@@ -188,6 +188,53 @@ int main() {
          eof_ok ? "OK" : "FAIL", press_ok ? "OK" : "FAIL", restart_ok ? "OK" : "FAIL");
   failures += !eof_ok + !press_ok + !restart_ok;
 
+  // Title-driven early end (the .ino's TITLE: handler): a NEW title renames
+  // every file, then ends the open file just past what's been read, so the
+  // radio opens the next file -- which carries the new name. The hop must
+  // not be relayed. Plays the reader like car_sim/FatFs: stop at the
+  // declared size, then open the next file.
+  init_file_names();
+  auto play_until_eof_then_next = [](uint32_t file, uint32_t from) {
+    uint32_t off = from;
+    while (off < get_file_declared_size(file)) { fatdisk_note_file_read(file, off, CLUSTER_SIZE); off += CLUSTER_SIZE; }
+    uint32_t next = (file + 1) % NUM_FILES;
+    for (uint32_t o = 0; o < 8 * CLUSTER_SIZE; o += CLUSTER_SIZE) fatdisk_note_file_read(next, o, CLUSTER_SIZE);
+    return off;
+  };
+  auto long_name_is = [](const char *want) {
+    uint32_t n = strlen(want);
+    if (g_long_len != n) return false;
+    for (uint32_t i = 0; i < n; i++) if (g_long_name[i] != (uint8_t)want[i]) return false;
+    return true;
+  };
+  int next0 = g_callbacks_next, prev0 = g_callbacks_prev;
+  // (a) Button: radio on file 2 presses Next -> file 0 (relayed), THEN the
+  // phone's new title arrives while file 0 plays with the old name.
+  for (uint32_t off = 8 * CLUSTER_SIZE; off < 40 * CLUSTER_SIZE; off += CLUSTER_SIZE)
+    fatdisk_note_file_read(2, off, CLUSTER_SIZE);
+  for (uint32_t off = 0; off < 8 * CLUSTER_SIZE; off += CLUSTER_SIZE)
+    fatdisk_note_file_read(0, off, CLUSTER_SIZE);
+  bool a_relayed = g_callbacks_next == next0 + 1 && g_current_file_index == 0;
+  bool a_changed = set_title_utf8("Song B", 6);
+  if (a_changed) force_track_change(nullptr);
+  uint32_t shrunk = get_file_declared_size(0);
+  play_until_eof_then_next(0, 8 * CLUSTER_SIZE);
+  bool a_ok = a_relayed && a_changed && shrunk < DECLARED_FILE_SIZE && g_current_file_index == 1 &&
+              g_callbacks_next == next0 + 1 && get_file_declared_size(0) == DECLARED_FILE_SIZE &&
+              long_name_is("Song B.mp3");
+  // (b) The same title resent (every 5s) must not hop again.
+  bool b_ok = !set_title_utf8("Song B", 6) && get_file_declared_size(1) == DECLARED_FILE_SIZE;
+  // (c) Song changes on the phone mid-file (no button): hop, not relayed.
+  for (uint32_t off = 8 * CLUSTER_SIZE; off < 60 * CLUSTER_SIZE; off += CLUSTER_SIZE)
+    fatdisk_note_file_read(1, off, CLUSTER_SIZE);
+  if (set_title_utf8("Song C", 6)) force_track_change(nullptr);
+  play_until_eof_then_next(1, 60 * CLUSTER_SIZE);
+  bool c_ok = g_current_file_index == 2 && g_callbacks_next == next0 + 1 && g_callbacks_prev == prev0 &&
+              get_file_declared_size(1) == DECLARED_FILE_SIZE && long_name_is("Song C.mp3");
+  printf("title after Next hops once, unrelayed: %s; resent title no hop: %s; mid-file song change hops: %s\n",
+         a_ok ? "OK" : "FAIL", b_ok ? "OK" : "FAIL", c_ok ? "OK" : "FAIL");
+  failures += !a_ok + !b_ok + !c_ok;
+
   printf(failures ? "FAILED (%d)\n" : "ALL OK\n", failures);
   return failures ? 1 : 0;
 }

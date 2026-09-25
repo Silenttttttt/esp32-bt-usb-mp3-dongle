@@ -633,7 +633,8 @@ class RadioGuiState:
                     self.lap_bytes, self.reader_alive, self.paused)
 
 
-def gui_read_loop(transport, layout, state, player, capture_f, volume_serial, bursty_pacing=False, level_proc=None):
+def gui_read_loop(transport, layout, state, player, capture_f, volume_serial, bursty_pacing=False, level_proc=None,
+                  recheck_size=False):
     """Same read-decode-loop shape as main()'s existing single-file loop
     below, generalized to react to state.requested_index changing (a button
     press) by switching which file's cluster chain it's pulling from, always
@@ -703,6 +704,19 @@ def gui_read_loop(transport, layout, state, player, capture_f, volume_serial, bu
                 f["name"] = e["name"]
                 f["size"] = e["size"]
                 break
+        return f["size"]
+
+    def current_declared_size():
+        # --recheck-size: models a radio that re-checks the open file's
+        # directory entry (size only -- the displayed name stays what was
+        # read at open) as it reads, so a file the S3 shortens mid-play ends
+        # early. Unknown whether the real Kenwood does this; the default
+        # (size read once at open, like FatFs) is unchanged.
+        f = state.files[state.current_index]
+        root = transport.read(layout["root_dir_lba"], layout["root_dir_sectors"])
+        for e in find_all_file_entries(root):
+            if e["first_cluster"] == f["first_cluster"]:
+                return e["size"]
         return f["size"]
 
     # Thread start = drive (re)inserted: resume position applies. Every
@@ -830,6 +844,8 @@ def gui_read_loop(transport, layout, state, player, capture_f, volume_serial, bu
                 file_size = open_current_file()
                 file_bytes = 0
                 state.lap_bytes = 0
+            if recheck_size:
+                file_size = current_declared_size()
             if file_bytes >= file_size:
                 # EOF at the declared size (not the cluster chain's end): a
                 # real radio moves on to the next file in directory order.
@@ -1194,7 +1210,7 @@ def run_gui_mode(transport, layout, fat, root_dir, args):
     reader_thread = threading.Thread(
         target=gui_read_loop,
         args=(transport, layout, state, player, capture_f, volume_serial, args.bursty),
-        kwargs={"level_proc": level_proc},
+        kwargs={"level_proc": level_proc, "recheck_size": args.recheck_size},
         daemon=True)
     reader_thread.start()
 
@@ -1240,7 +1256,7 @@ def run_gui_mode(transport, layout, fat, root_dir, args):
                     target=gui_read_loop,
                     args=(new_transport, layout, state, player, capture_f,
                           volume_serial, args.bursty),
-                    kwargs={"level_proc": level_proc},
+                    kwargs={"level_proc": level_proc, "recheck_size": args.recheck_size},
                     daemon=True).start()
             reconnect_stop.wait(0.5)
 
@@ -1588,6 +1604,13 @@ def main():
                           "real firmware bug (a boot-primer tail-gap) through undetected on a "
                           "prior bench test. Only skip this for a quick, repeat test where the "
                           "file's already been validated once this session.")
+    ap.add_argument("--recheck-size", action="store_true",
+                     help="--gui only: re-check the open file's declared size in the directory "
+                          "before every cluster read, like a radio that doesn't cache it at open, so "
+                          "the S3 shortening the file on a new title (to hop to the next, renamed "
+                          "file) takes effect. The name shown still comes from the open. Whether "
+                          "the real Kenwood behaves this way is unconfirmed; off = size read once at "
+                          "open (FatFs-style), the previous behavior.")
     ap.add_argument("--bursty", action="store_true",
                      help="--gui only: let reads race up to BURST_AHEAD_SECONDS ahead of the "
                           "real-time playback schedule (pausing only once that bound would be "

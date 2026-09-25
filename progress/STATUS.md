@@ -5765,3 +5765,21 @@ constants `common/link_protocol.h`, commit 6057b27). Phone streaming real music:
   underruns.
 - S3 status LED: with the flag, link health = PCM freshness; new fast-red "S3 encoder
   failed" state; `progress/LED_STATUS_TABLE.md` resynced.
+
+## 2026-09-25 ~00:45 GMT-3: full song titles (VFAT long names) + the file hops to pick up the new name
+
+- **Long names:** `<title>.mp3` VFAT long filenames on the same FAT12 volume (64 root entries
+  under `FATDISK_MULTI_FILE`). Checked with fsck.fat and on the live device.
+- **Name after Next/Back/song change:** radios read a file's name when they open it, and the
+  new title always arrives after that (~0.5-1 s after a relayed Next). Muni's design: once a new
+  title is written, the S3 ends the open file right after what's been read, so the radio opens
+  the next file, which has the new name. This is now driven by the title *changing* (not by
+  TRACK_CHANGED), so the rename lands before the hop whichever the classic sends first. The hop
+  isn't relayed to the phone. Host test covers title-after-Next, resent-title (no hop), and a
+  mid-file song change.
+- **Verified live 00:42:** GUI Next → one `radio_next` relayed → phone sent "Too Much To Ask"
+  → the GUI hopped to file 3/3 showing `Too Much To Ask.mp3`, song advanced exactly once.
+- **Open:** the hop only works on a radio that re-checks the open file's size while playing.
+  car_sim needs `--recheck-size` for that (default is still size-read-at-open). **Whether the
+  real Kenwood does this is untested**, and it's the one thing to check in the car. If it doesn't,
+  the fallback is shorter declared files, so a new name shows up at the next natural file end.

@@ -585,9 +585,9 @@ static void build_root_dir() {
 }
 
 // Sets every file's long name to "<title>.mp3" and its 8.3 alias to
-// <first 6 of A-Z0-9>~<n>.MP3, then rebuilds the directory. No-op when the
-// title is unchanged (the classic resends the current title every 5s).
-static void set_title_utf8(const char *title, uint32_t len) {
+// <first 6 of A-Z0-9>~<n>.MP3, then rebuilds the directory. Returns false
+// (no-op) when the title is unchanged (the classic resends it every 5s).
+static bool set_title_utf8(const char *title, uint32_t len) {
   static uint16_t name[LFN_MAX_CHARS];  // static: off the UART task stack
   uint32_t n = 0;
   const uint32_t max_base = LFN_MAX_CHARS - 4;  // room for ".mp3"
@@ -613,7 +613,7 @@ static void set_title_utf8(const char *title, uint32_t len) {
   const char *ext = ".mp3";
   for (const char *p = ext; *p; p++) full[full_len++] = *p;
 
-  if (full_len == g_long_len && memcmp(full, g_long_name, full_len * 2) == 0) return;
+  if (full_len == g_long_len && memcmp(full, g_long_name, full_len * 2) == 0) return false;
   memcpy(g_long_name, full, full_len * 2);
   g_long_len = full_len;
 
@@ -634,6 +634,7 @@ static void set_title_utf8(const char *title, uint32_t len) {
     sfn[11] = 0;
   }
   build_root_dir();
+  return true;
 }
 
 static void init_file_names() {

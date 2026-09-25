@@ -358,7 +358,8 @@ static void link_task(void *) {
         // file (fat_disk_shared.h's force_track_change()). Renaming is now
         // handled separately below (TITLE:), not passed here -- see that
         // branch's own comment for why.
-        force_track_change(nullptr);
+        // 2026-09-25: the early end now happens on the TITLE change below
+        // instead, so it always follows the rename (see there).
       } else if (msg_len > 6 && memcmp(msg, "TITLE:", 6) == 0) {
         // C1/Step 2 (2026-09-22, Muni: "yes ofc i want it, its part of the
         // plan"): the classic already sends this exact message (see
@@ -385,7 +386,21 @@ static void link_task(void *) {
         // The classic resends the title every 5s, so this also recovers
         // after an S3 reboot.
         // Written as a VFAT long filename ("<title>.mp3"), still FAT12.
-        set_title_utf8((const char *)(msg + 6), msg_len - 6);
+        //
+        // Early end on a NEW title (2026-09-25, Muni's design): radios read a
+        // file's name when they open it, and the title always arrives after
+        // the radio has already opened the file it's playing -- after a Next/
+        // Back press (the phone only changes song once we relay it), and
+        // possibly after a natural song change too. So once the new name is
+        // in the directory, end the open file right after what's been read:
+        // the radio opens the next file, which carries the new name. The
+        // hop is not relayed to the phone (force_track_change() suppresses
+        // it, and it's a natural EOF anyway). Driven by the title rather
+        // than TRACK_CHANGED so the rename always lands before the hop,
+        // whichever of the two the classic sends first.
+        if (set_title_utf8((const char *)(msg + 6), msg_len - 6)) {
+          force_track_change(nullptr);
+        }
 #endif
       }
     }
