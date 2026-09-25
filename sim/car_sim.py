@@ -695,6 +695,24 @@ def gui_read_loop(transport, layout, state, player, capture_f, volume_serial, bu
     """
     cluster_bytes = layout["sectors_per_cluster"] * SECTOR_SIZE
 
+    eoc = end_of_chain_marker(layout["fat_type"])
+
+    def live_next_cluster(prev):
+        # Follows the cluster chain as it reads, like a FAT driver does at
+        # each cluster boundary: reads the FAT entry for `prev` from the
+        # device now, not from the chain mapped at open. An end-of-chain
+        # marker here ends the file, whatever size the directory gave.
+        # (2026-09-25: this is how we expect the Kenwood to take the S3's
+        # early end -- EARLY_END_FAT.)
+        off = prev * 2 if layout["fat_type"] == "FAT16" else prev + prev // 2
+        sec, local = divmod(off, SECTOR_SIZE)
+        data = transport.read(layout["reserved_sectors"] + sec, 2)
+        if layout["fat_type"] == "FAT16":
+            return int.from_bytes(data[local:local + 2], "little")
+        if prev % 2 == 0:
+            return data[local] | ((data[local + 1] & 0x0F) << 8)
+        return (data[local] >> 4) | (data[local + 1] << 4)
+
     def open_current_file():
         # A real head unit's FAT layer (e.g. FatFs f_open) reads the file's
         # directory entry when it OPENS the file -- the name it displays and
@@ -854,6 +872,9 @@ def gui_read_loop(transport, layout, state, player, capture_f, volume_serial, bu
                     time.sleep(0.1)
                 continue
             cluster_list = state.files[state.current_index]["cluster_list"]
+            if cluster_pos > 0 and live_next_cluster(cluster_list[cluster_pos - 1]) >= eoc:
+                file_bytes = file_size  # chain ended early: end of file
+                continue
             cluster = cluster_list[cluster_pos]
             lba = layout["data_lba"] + (cluster - 2) * layout["sectors_per_cluster"]
             if bursty_pacing:

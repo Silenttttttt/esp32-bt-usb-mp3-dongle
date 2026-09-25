@@ -859,6 +859,13 @@ static const uint32_t SUPPRESS_WINDOW_MS = 10000;
 //                         sense (radios that skip unreadable tracks)
 // All of it is undone once the radio switches file, or after
 // SUPPRESS_WINDOW_MS.
+// EARLY_END_FAT is on by default with FATDISK_MULTI_FILE (2026-09-25, Muni):
+// ending the file's cluster chain is how we expect the Kenwood to see the
+// early end, and car_sim follows the chain the same way. -DEARLY_END_NO_FAT
+// turns it off.
+#if defined(FATDISK_MULTI_FILE) && !defined(EARLY_END_NO_FAT) && !defined(EARLY_END_FAT)
+#define EARLY_END_FAT
+#endif
 static volatile bool g_early_end_active = false;
 static volatile uint32_t g_early_end_restore_size = 0;  // the file's size before the cut
 // Per file, the size an early end gave it, kept after the size is restored:
