@@ -359,6 +359,15 @@ arduino-cli upload -p /dev/ttyACM<N> --fqbn "esp32:esp32:esp32s3:USBMode=default
   Both are undone once the radio switches file, or after 10 s. Test one at a time in the car.
   Host test: build `crosscheck/live_serve_test.cpp` with the flag(s) added.
 - S3 debug console: `serial_logger.py --baud 115200 --mode line`.
+- **Car capture build, `MSC_TRACE` (2026-09-25)**: `esp32-s3-msc/flash_trace.sh [extra -D flags]`
+  builds and flashes the current S3 flags (incl. `ENCODE_ON_S3`) plus `-DMSC_TRACE` and the
+  `-Wl,--wrap=...` link flags it needs (`msc_trace.h`; without them the link fails on purpose).
+  It logs every SCSI command the USB host sends (CDB, status, bytes, timing, region hit), bus
+  resets, descriptor/control requests and stalls, plus file switch/early-end/title events. The
+  debug serial is **921600** in this build. Run the session with `logs/car_capture.sh
+  start|mark|replay|status|stop` (both loggers, markers, and `replay` re-prints the first 4096
+  records since power-on, for cold boots captured with no laptop attached). Use
+  `/usr/bin/python3` for the loggers on the laptop: the pyenv `python3` has no pyserial.
 
 **A required local library patch lives OUTSIDE this repo and can be silently lost.** The
 classic ESP32 firmware will not compile at all without a 2-line patch in

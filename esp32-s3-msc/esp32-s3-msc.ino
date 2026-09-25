@@ -53,7 +53,9 @@
 #include "USBMSC.h"
 #include "esp_heap_caps.h"
 #include "silence_primer.h"
+#include "msc_trace.h"  // MSC_TRACE: declarations the shared header's hooks need
 #include "fat_disk_shared.h"
+#include "msc_trace.h"  // MSC_TRACE: the rest
 #include "../common/link_protocol.h"  // LINK_BAUD + frame types, shared with the classic
 #ifdef ENCODE_ON_S3
 #include "../common/mp3_pipeline.h"   // the shared encoder (same source the classic uses by default)
@@ -168,6 +170,7 @@ static volatile uint32_t g_cmd_flash_until_ms = 0;
 // convention (see that call's own comment for the wiring/protocol history).
 static void on_file_switch_detected(int direction) {
   ReturnTxSerial.printf("RADIO_CMD:%s\n", direction > 0 ? "next" : "prev");
+  FATDISK_TRACE(RELAY, direction > 0 ? 1 : 0, 0, 0);
   g_cmd_flash_until_ms = millis() + 600;
 }
 #endif
@@ -427,6 +430,7 @@ static void link_task(void *) {
         // open it end ~17s in (01:00:02 and 01:11:12, 2026-09-25).
         static bool s_title_seen = false;
         bool changed = set_title_utf8((const char *)(msg + 6), msg_len - 6);
+        if (changed) FATDISK_TRACE(TITLE, 1, msg_len - 6, 0);
         if (changed && s_title_seen && fatdisk_reader_active()) force_track_change(nullptr);
         s_title_seen = true;
 #endif
@@ -442,15 +446,22 @@ static void usb_event_callback(void *arg, esp_event_base_t event_base, int32_t e
   (void)arg; (void)event_data;
   if (event_base == ARDUINO_USB_EVENTS) {
     switch (event_id) {
-      case ARDUINO_USB_STARTED_EVENT: Serial.println("[s3] USB PLUGGED"); g_native_usb_connected = true; break;
-      case ARDUINO_USB_STOPPED_EVENT: Serial.println("[s3] USB UNPLUGGED"); g_native_usb_connected = false; break;
+      case ARDUINO_USB_STARTED_EVENT: Serial.println("[s3] USB PLUGGED"); g_native_usb_connected = true; FATDISK_TRACE(USB_STARTED, 0, 0, 0); break;
+      case ARDUINO_USB_STOPPED_EVENT: Serial.println("[s3] USB UNPLUGGED"); g_native_usb_connected = false; FATDISK_TRACE(USB_STOPPED, 0, 0, 0); break;
+      case ARDUINO_USB_SUSPEND_EVENT: FATDISK_TRACE(USB_SUSPEND, 0, 0, 0); break;
+      case ARDUINO_USB_RESUME_EVENT: FATDISK_TRACE(USB_RESUME, 0, 0, 0); break;
       default: break;
     }
   }
 }
 
 void setup() {
+#ifdef MSC_TRACE
+  Serial.setTxBufferSize(16384);
+  Serial.begin(MSC_TRACE_BAUD);  // the trace needs more than 115200 (see msc_trace.h)
+#else
   Serial.begin(115200);  // USB CDC debug console (separate from the UART link)
+#endif
   delay(200);
   Serial.println("[s3] booting");
 
@@ -583,6 +594,9 @@ void setup() {
   // before the slower USB enumeration work below.
   xTaskCreatePinnedToCore(link_task, "link_task", 8192, nullptr, 2, nullptr, 1);
 
+#ifdef MSC_TRACE
+  msc_trace_begin();
+#endif
   USB.onEvent(usb_event_callback);
   MSC.vendorID("PHANTOMD");     // max 8 chars
   MSC.productID("USB_MSC");     // max 16 chars

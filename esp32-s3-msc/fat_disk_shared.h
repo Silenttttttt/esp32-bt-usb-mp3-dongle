@@ -21,6 +21,11 @@
 #include <stdint.h>
 #include <string.h>
 
+// Timeline hook for the S3's MSC_TRACE build (msc_trace.h); a no-op otherwise.
+#ifndef FATDISK_TRACE
+#define FATDISK_TRACE(ev, a, b, c) ((void)0)
+#endif
+
 #ifdef ARDUINO
   // ---- ESP32-S3 / FreeRTOS ----
   #define FATDISK_MUTEX_T SemaphoreHandle_t
@@ -883,6 +888,7 @@ static void restore_early_end() {
   if (!g_early_end_active) return;
   g_early_end_active = false;
   set_file_declared_size(g_early_end_file, g_early_end_restore_size);
+  FATDISK_TRACE(RESTORE_END, g_early_end_file, g_early_end_restore_size, 0);
 #ifdef EARLY_END_FAT
   uint32_t last_rel = (g_early_end_size - 1) / CLUSTER_SIZE;
   if (last_rel + 1 < DATA_CLUSTERS) {
@@ -981,6 +987,7 @@ static void fatdisk_note_file_read(uint32_t file_index, uint32_t file_rel_off, u
     }
     if (g_candidate_bytes_read >= SWITCH_DEBOUNCE_BYTES) {
       g_reader_anchored = true;
+      FATDISK_TRACE(ANCHOR, file_index, 0, 0);
       g_current_file_index = file_index;
       g_current_file_read_end = read_end;
       g_candidate_bytes_read = 0;
@@ -1037,6 +1044,10 @@ static void fatdisk_note_file_read(uint32_t file_index, uint32_t file_rel_off, u
 #endif
   }
   g_file_early_end[g_current_file_index] = 0;  // left it
+  FATDISK_TRACE(SWITCH, (g_current_file_index << 8) | file_index,
+                (natural_eof ? 1 : 0) | (suppress ? 2 : 0) |
+                    ((!suppress && !natural_eof && direction != 0) ? 4 : 0),
+                re);
   g_current_file_index = file_index;
   g_current_file_read_end = read_end;
   g_candidate_bytes_read = 0;
@@ -1081,6 +1092,7 @@ static void force_track_change(const char *new_name11) {
   g_early_end_size = new_size;
   g_early_end_active = true;
   g_file_early_end[g_current_file_index] = new_size;
+  FATDISK_TRACE(FORCE_END, g_current_file_index, new_size, before);
 
   uint32_t next_idx = (g_current_file_index + 1) % NUM_FILES;
   (void)new_name11;  // names now come from set_title_utf8(), for every file at once

@@ -26,7 +26,26 @@ SCSI command we answer wrong?), what makes a file "unsupported" (the 80 KB buffe
 FAT chain? the MP3 header at byte 0?), why Next stops at file 3, whether it reads LFN
 entries at all, and where the extra ~5 s of latency comes from (radio read-ahead?).
 
-## Capture plan (nothing built yet)
+## Capture tooling (built and bench-tested on the laptop, 2026-09-25 ~12:20 GMT-3)
+
+- S3 is flashed with the `MSC_TRACE` build (`esp32-s3-msc/flash_trace.sh`, see CLAUDE.md).
+  The classic is unchanged (ENCODE_ON_S3, as the car test).
+- `logs/car_capture.sh start <name>` -> `logs/car/<ts>_<name>/{s3,classic}.log`;
+  `mark "pressed Next"` before/after each action; `replay` for the boot records.
+- Bench check against the laptop's own Linux host: full enumeration + INQUIRY/READ CAPACITY/
+  MODE SENSE(6) page 0x3f (we answer 4 of 192 bytes and stall; Linux clears the halt and goes
+  on)/PREVENT_ALLOW/READ10s all captured; 0 records dropped; 32 KB reads take ~33 ms, the
+  S3's normal full-speed rate.
+- Bench findings to check against the Kenwood: (1) Linux's mount probe reads across files
+  and the switch detector relayed a spurious `RADIO_CMD:prev` to the phone -- a radio mount
+  scan could do the same; (2) with no metadata all three files get the same long name
+  ("Not Provided.mp3" x3) -- duplicate long names are invalid FAT, a possible "unsupported
+  file" / LFN-not-shown cause.
+- Cold boot as installed (S3 powered only by the radio): leave the debug cable out, power
+  the car, then plug the laptop in and run `replay`. Opening the port doesn't reset the S3
+  (checked 3x); whether plugging the cable in does is untested -- the T timestamps show it.
+
+## Capture plan (original, step 1 now done)
 
 The S3 has two USB ports: native USB goes to the radio (MSC), the debug USB-serial goes to
 the laptop. So the S3 can log everything the radio does while the laptop records it:
