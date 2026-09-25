@@ -200,6 +200,10 @@ static bool msc_on_start_stop(uint8_t power_condition, bool start, bool load_eje
 volatile uint32_t g_link_bytes_read = 0;
 volatile uint32_t g_link_frames_ok = 0;
 volatile uint32_t g_link_frames_bad = 0;
+// LinkSerial receive errors by hardwareSerial_error_t (break, buffer full,
+// FIFO overflow, framing, parity), for the heartbeat: tells a byte lost to
+// the S3 falling behind (full/overflow) from one lost on the wire (framing).
+static volatile uint32_t g_uart_errs[6] = {0};
 
 // RGB status LED state, updated from link_task below. g_link_last_frame_ms
 // (ANY frame, 'A' or 'C') is "are we hearing from the classic ESP32 at
@@ -321,6 +325,13 @@ static void link_task(void *) {
 #endif
     if (!known || length > MAX_FRAME_LEN) {
       g_link_frames_bad++;
+      static uint32_t last_bad_log_ms = 0;  // one line per burst, for matching against clicks
+      if (millis() - last_bad_log_ms > 2000) {
+        last_bad_log_ms = millis();
+        Serial.printf("[s3] link resync: bad header type=0x%02x len=%lu (uart errs full=%lu ovf=%lu frame=%lu)\n",
+                      (unsigned)(uint8_t)frame_type, (unsigned long)length, (unsigned long)g_uart_errs[2],
+                      (unsigned long)g_uart_errs[3], (unsigned long)g_uart_errs[4]);
+      }
       continue;  // bad header -- rescan from find_sync(), same as the Python side
     }
     if (length) read_exact(payload, length);
@@ -541,6 +552,9 @@ void setup() {
   // ReturnTxSerial above for why (moved to its own dedicated, slower,
   // noise-resilient UART instance instead).
   LinkSerial.begin(UART_BAUD, SERIAL_8N1, UART_S3_RX_PIN, -1);
+  LinkSerial.onReceiveError([](hardwareSerial_error_t e) {
+    if ((unsigned)e < 6) g_uart_errs[e]++;
+  });
   ReturnTxSerial.begin(RETURN_TX_BAUD, SERIAL_8N1, -1, UART_S3_TX_PIN);
 
   // REAL BUG FOUND (fresh adversarial review, 2026-09-17): link_task used
@@ -833,6 +847,9 @@ void loop() {
                   (unsigned long)g_total_written, (unsigned long)g_last_read_offset,
                   (unsigned)g_diag_write_byte, (unsigned long)g_diag_write_count,
                   (unsigned)g_diag_read_byte, (unsigned long)g_diag_read_count);
+    Serial.printf("[s3] uart: brk=%lu full=%lu ovf=%lu frame=%lu parity=%lu\n",
+                  (unsigned long)g_uart_errs[1], (unsigned long)g_uart_errs[2],
+                  (unsigned long)g_uart_errs[3], (unsigned long)g_uart_errs[4], (unsigned long)g_uart_errs[5]);
     Serial.printf("[s3] mem: int_total=%u int_free=%u int_largest=%u int_min=%u psram_total=%u psram_free=%u psram_largest=%u\n",
                   (unsigned)heap_caps_get_total_size(MALLOC_CAP_INTERNAL),
                   (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
