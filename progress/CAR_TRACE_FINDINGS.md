@@ -80,4 +80,8 @@ the old and the new header, then flash and retest Next in the car.
   Test planned: stick with `FILENAME TEST.mp3` (ID3 title `TAG TITLE TEST`) + `NO TAGS HERE.mp3`.
 
 ## Open questions for Muni
+- Car fully off: the radio stayed on (Muni: normal for this car). At 13:43:48 the S3 saw a USB
+  *suspend*, not a disconnect -> the radio's USB port may keep VBUS on with the car off. In the
+  real install both boards (~0.25 A) run from that port: check whether the S3 LED is still lit
+  10+ min after the car is fully off (battery drain).
 - Is there a DISP / text button that cycles what's shown?
