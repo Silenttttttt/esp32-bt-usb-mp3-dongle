@@ -5755,7 +5755,7 @@ post-mount probe noise). All pass.
 ## 2026-09-25: ENCODE_ON_S3 verified with real music
 
 Both boards flashed with `-DENCODE_ON_S3` (shared encoder `common/mp3_pipeline.h`, link
-constants `common/link_protocol.h`, commit 6057b27). Phone streaming real music:
+constants `common/link_protocol.h`, commit 44e14ce). Phone streaming real music:
 - Link at 2 Mbaud: 4,249 frames, 0 bad. PCM 88,064 B/s as expected.
 - S3 encode per 20 ms of audio: avg 5.9 ms, max 8.3 ms (4.2 ms on silence). S3 internal free
   174 KB (was 278 KB before Shine moved there).
@@ -5798,7 +5798,7 @@ constants `common/link_protocol.h`, commit 6057b27). Phone streaming real music:
 
 ## 2026-09-25 ~01:40 GMT-3: FIRST CAR TEST OF THE MULTI-FILE BUILD -- only playback worked
 
-Build: S3 `d8726ed` (MULTI_FILE, buffer files, LFN, EARLY_END_FAT default), classic with
+Build: S3 `d60e014` (MULTI_FILE, buffer files, LFN, EARLY_END_FAT default), classic with
 ENCODE_ON_S3. Reported by Muni from the real Kenwood:
 - First plug-in: radio showed "N/A device". Unplug/replug -> it started playing.
 - **Live streaming WORKS on the real Kenwood** (FATDISK_ALWAYS_SERVE_LIVE): first time on the
@@ -5841,7 +5841,7 @@ Second-device BT pairing reproduced as broken (legacy PIN, classic reboots durin
 - car_sim rewritten as a Kenwood model from the trace (2 KB reads, 3.7 s read-ahead, open-time
   probes, EOF pause, Back restart/previous, wrap, remembered track, F01 T-0N display).
 - Host test: switch detector driven by a Kenwood model (14 checks) -- all pass.
-- Bench (both boards on b6eb486): Next relayed, single Back not, double Back relayed prev, no
+- Bench (both boards on 4f05d0e): Next relayed, single Back not, double Back relayed prev, no
   false Next at mount. One car_sim bug of my own found and fixed on the way (mount peek did a
   full open of the last file, which relayed a Next).
 
@@ -5858,12 +5858,12 @@ every pairing-related GAP event (`GAP:acl_conn/acl_disconn/pin_req/cfm_req/auth_
 Phones and the desktop use SSP numeric comparison, which the classic already auto-accepted --
 that's why the phone "asks about a PIN, I hit pair, it works".
 
-Verified (firmware `6027620`):
+Verified (firmware `cf17547`):
 - Laptop pairs while the phone is bonded but off: 0.6 s pair + 0.5 s connect (was: timeout).
 - Phone reconnects after the laptop goes off (Muni, 14:37).
 - `sim/bt_switch_test.py`: desktop/laptop alternate as "the phone", 12/12 switches OK
   (6 Bluetooth-off, 6 clean disconnect), 0 classic resets; usually 1-3 s to reconnect.
-  Re-run on 6027620: 12/12 OK, all on the first attempt, 0 resets.
+  Re-run on cf17547: 12/12 OK, all on the first attempt, 0 resets.
 - Fresh re-pair (forget + pair again) of the laptop with the desktop off, and of the desktop
   with the laptop off: both OK.
 
@@ -5877,7 +5877,7 @@ Harness gotcha: bluetoothctl registers its own agent and swallows confirmations;
   (-30 dB), 0 classic reboots. Gotcha: the laptop's Bluetooth output starts at 0% volume,
   which sends pure silence (the first run showed AUDIO_LIVE with PCM_PEAK 0).
 
-## 2026-09-25 evening: underrun silence at every file open -- fixed (`1b45712`)
+## 2026-09-25 evening: underrun silence at every file open -- fixed (`e9c9d9c`)
 
 Bench S3 counter showed +45..55 underrun reads (several seconds of silence) at every car_sim
 file open: the open pattern (probes, 40 KB head, 58 KB read-ahead burst -- the real Kenwood
@@ -5886,5 +5886,22 @@ Would have meant seconds of silence at every Next/Back/file change in the car.
 
 Fix in `fat_disk_shared.h` (see CLAUDE.md "Serving the radio's file opens"). Host test drives
 the Kenwood pattern through the real serve path: mount/Next/Back 0 underrun reads, natural end
-~1 s (seamless continuity), 0 violations. On the bench (S3 `1b45712`): Next, Back restart and a
+~1 s (seamless continuity), 0 violations. On the bench (S3 `e9c9d9c`): Next, Back restart and a
 double Back -- 5 opens, **0** new underruns (was ~50 each).
+
+## 2026-09-25 ~21:00: v1 + S3 encoder profile, a classic PCM bug, docs
+
+- `flash.sh --v1 --s3-encode` (both boards): v1 with the S3 encoding. Works on the bench with
+  the phone (tested with the 25.6 s ring), but crackles at every v1 file end and has up to ~30 s delay (v1's offset serving). v1's profile uses the default ~4 min ring (Muni: v1 ran the bigger ring after the first test).
+  Crackle root cause: v1's unread-data protection makes each ring write retry for ~1 s inside the
+  UART task while the radio pauses at a file end; at 88 KB/s the 16 KB RX buffer overflows (S3
+  FIFO overflows in bursts ~26 s apart). Not fixed -- v2 is the target (Muni). See BUILD_FLAGS.md.
+- **Real classic bug fixed** (all profiles): A2DP callbacks bigger than a 4 KB PCM slot were
+  clamped, silently dropping the rest (an 11-frame SBC packet lost 27%). Phones' ~7-frame packets
+  fit. Now split across slots.
+- `sim/bt_desktop_source.py` can stream a tone (`kill -USR1`), so the desktop is a full audio
+  source for tests.
+- Docs: `BUILD_FLAGS.md` (every flag: intent/expected/observed/status, profiles, combinations),
+  `docs/KENWOOD_RADIO.md`, `docs/HARDWARE_USAGE.md` (v2 measured: classic flash 83%, heap 61%
+  used; S3 heap 50%, PSRAM 46%, encoder 18-25% of a core, link 45%).
+- Both boards back on v2 (`9c03c6c`).

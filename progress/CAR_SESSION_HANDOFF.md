@@ -10,7 +10,7 @@ most of the bench assumptions wrong (`car_sim.py` was built on guesses). Capture
 access pattern, then redesign the multi-file / song-name / button-detection features, and
 car_sim, from that trace. Don't tune anything from the bench until then.
 
-## What the car test showed (S3 build `d8726ed`, classic with ENCODE_ON_S3)
+## What the car test showed (S3 build `d60e014`, classic with ENCODE_ON_S3)
 
 | Area | Result |
 |---|---|
@@ -72,7 +72,7 @@ the laptop. So the S3 can log everything the radio does while the laptop records
 
 ## Laptop setup done from the desktop (2026-09-25)
 
-- Repo rsynced to `~/Documents/Computarias/digispark-msc` (with `.git`, at `cb8d283`;
+- Repo rsynced to `~/Documents/Computarias/digispark-msc` (with `.git`, at `72523fb`;
   logs not copied). `sim/.sudo_password` is included (git-ignored, never commit it).
 - Arduino libraries copied: audio-tools (with the local BaseConverter.h `int32_t` patch that
   CLAUDE.md describes), codec-shine, ESP32-A2DP, libhelix, libLAME, Adafruit_NeoPixel.

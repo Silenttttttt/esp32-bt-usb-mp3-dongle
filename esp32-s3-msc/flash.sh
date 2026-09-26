@@ -24,10 +24,10 @@ V2_FLAGS=(
   -DLED_RAINBOW_PLAYING        # rainbow LED while playing
   -DENCODE_ON_S3               # the S3 runs the MP3 encoder; classic sends PCM at 2 Mbaud
 )
-# v1, exactly as car-proven 2026-09-18: one file served by requested offset, 25.6 s ring.
-V1_FLAGS=(
-  -DFATDISK_DATA_CLUSTERS=100
-)
+# v1: one file served by requested offset from the ~4 min ring (938 clusters, the default).
+# The first car test (2026-09-18) ran a 25.6 s ring; it was raised to ~4 min right after,
+# at Muni's request, to make the wrap splice rare. For that original: -DFATDISK_DATA_CLUSTERS=100.
+V1_FLAGS=()
 
 SERIAL=${S3_SERIAL:-5CE5146685}  # USB serial number of the board to flash
 PORT=/dev/serial/by-id/usb-1a86_USB_Single_Serial_${SERIAL}-if00

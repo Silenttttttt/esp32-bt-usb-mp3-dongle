@@ -24,7 +24,7 @@ Read this first when you pick the project back up. Detailed event-by-event log w
 - Engine start / car off-on: radio re-mounts, classic reboots and reconnects BT, no hands.
 
 **Commits** (laptop, `main`, NOT pushed -- Muni said ask before pushing; bring them back with
-`git bundle`/rsync or push if he says so): `8031b1f`..`757c6c9` (7 commits after `4dd0207`).
+`git bundle`/rsync or push if he says so): `b5926a5`..`6cb6a72` (7 commits after `efb9183`).
 
 ## What the Kenwood actually does (the facts car_sim should be rebuilt from)
 
@@ -73,7 +73,7 @@ Read this first when you pick the project back up. Detailed event-by-event log w
 **Done 2026-09-25 afternoon (desktop):** #1 (car build is the default: song-name, buffer-file and
 early-end code removed; flags in `esp32-s3-msc/flash.sh` / `esp32-bt-mp3-test/flash.sh`; both
 boards report commit + flags at boot and every 60 s; `logs/flash_history.log`), and #5 (car_sim
-rewritten as a Kenwood model; see CLAUDE.md). Both boards flashed with `b6eb486` and bench-checked
+rewritten as a Kenwood model; see CLAUDE.md). Both boards flashed with `4f05d0e` and bench-checked
 with car_sim: Next relayed, single Back not relayed, double Back relayed `prev`, no false Next at
 mount.
 

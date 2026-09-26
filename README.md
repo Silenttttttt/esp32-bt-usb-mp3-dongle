@@ -149,6 +149,8 @@ Both boards have onboard LED status for debugging without a laptop attached:
 Use the flash scripts; each board's flags live in one list inside its script (a bare
 `arduino-cli compile .` silently drops them). **[BUILD_FLAGS.md](BUILD_FLAGS.md)** explains
 the two known-good profiles, v1 and v2, every flag, and which combinations work.
+[docs/KENWOOD_RADIO.md](docs/KENWOOD_RADIO.md) records how the real car radio behaves (measured),
+and [docs/HARDWARE_USAGE.md](docs/HARDWARE_USAGE.md) what each board has and what the car build uses.
 
 ```
 esp32-bt-mp3-test/flash.sh [--v1] [--no-upload]     # classic ESP32

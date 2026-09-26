@@ -294,8 +294,9 @@ esp32-s3-msc/flash.sh [--v1] [--trace] [--no-upload] [-DEXTRA ...]
 esp32-bt-mp3-test/flash.sh [--v1] [--no-upload] [-DEXTRA ...]
 ```
 
-**`BUILD_FLAGS.md` is the reference for the known-good profiles (v1, v2), every flag and which
-combinations work.** v2 is the default; `--v1` reproduces the 2026-09-18 car-proven build.
+**`BUILD_FLAGS.md` is the reference for the profiles (v2, v1, v1 + S3 encoder), every flag
+(intent / expected / observed / status) and which combinations work. `docs/KENWOOD_RADIO.md` is
+the measured radio behavior; `docs/HARDWARE_USAGE.md` the boards' resources and v2's usage.** v2 is the default; `--v1` reproduces the 2026-09-18 car-proven build.
 
 **Car build flags (verified in the real Kenwood, 2026-09-25):**
 
