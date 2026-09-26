@@ -3,13 +3,14 @@
 **Keep this in sync with the code.** The authoritative table is the comment in
 `esp32-s3-msc/esp32-s3-msc.ino`'s `loop()` RGB status LED block; this file mirrors it.
 
-Last synced: 2026-09-25 (encoder-location-aware link health, S3-encoder-failed state, next/prev flash).
+Last synced: 2026-09-25 (USB-suspended state added).
 
 Rows are in priority order (first match wins).
 
 | State | Color | Meaning |
 |---|---|---|
 | Native USB-OTG port disconnected | solid WHITE | Bench-only: the radio/PC port has no host while the board is powered via the debug port. Can't happen in the car (no power at all there). |
+| USB suspended | slow-blinking VIOLET (1s) | A host had the drive, then suspended the bus, so the radio isn't reading. Either the car is off with the radio still powered (seen in the car trace), or the data wires came loose with power still on; the S3 can't tell these apart. Clears as soon as the host reads again. |
 | S3 encoder failed (`ENCODE_ON_S3` only) | fast-blinking RED (250ms) | The S3's MP3 encoder didn't start; no audio can reach the radio. |
 | Link to classic never seen | blinking WHITE (250ms) | No audio input from the classic since S3 boot. By default any frame counts; with `ENCODE_ON_S3` only PCM frames count. Also what you see while the two boards run mismatched builds (different link baud). |
 | Link to classic lost | blinking CYAN (250ms) | Was receiving, now nothing for 2s+ (classic crash/reset/wire). Same frame rule as above. |

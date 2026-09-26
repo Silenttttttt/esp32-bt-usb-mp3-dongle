@@ -242,6 +242,10 @@ volatile uint32_t g_return_ack_last_ms = 0;
 // already fired (only to Serial.println, never reflected in the LED) --
 // no new detection mechanism needed, just wiring up what already existed.
 volatile bool g_native_usb_connected = false;
+// USB bus suspended by the host: no reads coming. Electrically the same
+// whether the radio put the bus to sleep (car off, radio still powered --
+// seen in the car trace) or the data wires came loose with power still on.
+volatile bool g_usb_suspended = false;
 // Tried making the "now playing" rainbow react to a real audio-level
 // signal (2026-09-21) -- built and flashed, but live-tested it didn't
 // actually feel connected to the song in any meaningful way. Muni's call:
@@ -381,10 +385,10 @@ static void usb_event_callback(void *arg, esp_event_base_t event_base, int32_t e
   (void)arg; (void)event_data;
   if (event_base == ARDUINO_USB_EVENTS) {
     switch (event_id) {
-      case ARDUINO_USB_STARTED_EVENT: Serial.println("[s3] USB PLUGGED"); g_native_usb_connected = true; FATDISK_TRACE(USB_STARTED, 0, 0, 0); break;
-      case ARDUINO_USB_STOPPED_EVENT: Serial.println("[s3] USB UNPLUGGED"); g_native_usb_connected = false; FATDISK_TRACE(USB_STOPPED, 0, 0, 0); break;
-      case ARDUINO_USB_SUSPEND_EVENT: FATDISK_TRACE(USB_SUSPEND, 0, 0, 0); break;
-      case ARDUINO_USB_RESUME_EVENT: FATDISK_TRACE(USB_RESUME, 0, 0, 0); break;
+      case ARDUINO_USB_STARTED_EVENT: Serial.println("[s3] USB PLUGGED"); g_native_usb_connected = true; g_usb_suspended = false; FATDISK_TRACE(USB_STARTED, 0, 0, 0); break;
+      case ARDUINO_USB_STOPPED_EVENT: Serial.println("[s3] USB UNPLUGGED"); g_native_usb_connected = false; g_usb_suspended = false; FATDISK_TRACE(USB_STOPPED, 0, 0, 0); break;
+      case ARDUINO_USB_SUSPEND_EVENT: Serial.println("[s3] USB SUSPENDED"); g_usb_suspended = true; FATDISK_TRACE(USB_SUSPEND, 0, 0, 0); break;
+      case ARDUINO_USB_RESUME_EVENT: Serial.println("[s3] USB RESUMED"); g_usb_suspended = false; FATDISK_TRACE(USB_RESUME, 0, 0, 0); break;
       default: break;
     }
   }
@@ -694,6 +698,10 @@ void loop() {
   //                                  |                   | car install (no debug-port power there -- losing
   //                                  |                   | this port means the whole board loses power and
   //                                  |                   | goes dark, not white).
+  //   USB suspended                  | slow-blinking     | a host had the drive, then suspended the bus: no
+  //                                  | VIOLET (1s)       | reads. Car off with the radio still powered, or
+  //                                  |                   | data wires loose with power on (same signal).
+  //                                  |                   | Clears as soon as the host reads again.
   //   S3 encoder failed              | fast-blinking RED | ENCODE_ON_S3 only: the S3's own MP3 encoder
   //   (ENCODE_ON_S3 only)            | (250ms)           | didn't start -- no audio can reach the radio.
   //                                  |                   | NOTE for the two rows below: with ENCODE_ON_S3,
@@ -776,6 +784,13 @@ void loop() {
       // variant here stays consistent with that convention instead of
       // introducing a genuinely new hue every time a new state is added.
       status_led.setPixelColor(0, 255, 255, 255);  // solid white -- native USB-OTG (car radio/PC) port disconnected
+    } else if (g_usb_suspended) {
+      // Host suspended the bus: the radio isn't reading. Either the radio
+      // put USB to sleep (car off, radio powered) or the data wires came
+      // loose with power still on -- indistinguishable here. Slow blink:
+      // not necessarily a fault. Violet, not magenta (Muni rejected magenta).
+      bool on = ((now_ms / 1000) % 2) == 0;
+      status_led.setPixelColor(0, on ? 110 : 0, 0, on ? 255 : 0);  // slow-blinking violet -- USB suspended
 #ifdef ENCODE_ON_S3
     } else if (!g_s3_encoder_ok) {
       // The S3 runs the encoder in this mode; if it failed to start, nothing
