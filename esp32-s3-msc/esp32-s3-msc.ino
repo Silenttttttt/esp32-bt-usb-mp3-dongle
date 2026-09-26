@@ -699,7 +699,7 @@ void loop() {
   //                                  |                   | this port means the whole board loses power and
   //                                  |                   | goes dark, not white).
   //   USB suspended                  | slow-blinking     | a host had the drive, then suspended the bus: no
-  //                                  | VIOLET (1s)       | reads. Car off with the radio still powered, or
+  //                                  | GREEN (1s)        | reads. Car off with the radio still powered, or
   //                                  |                   | data wires loose with power on (same signal).
   //                                  |                   | Clears as soon as the host reads again.
   //   S3 encoder failed              | fast-blinking RED | ENCODE_ON_S3 only: the S3's own MP3 encoder
@@ -788,9 +788,12 @@ void loop() {
       // Host suspended the bus: the radio isn't reading. Either the radio
       // put USB to sleep (car off, radio powered) or the data wires came
       // loose with power still on -- indistinguishable here. Slow blink:
-      // not necessarily a fault. Violet, not magenta (Muni rejected magenta).
+      // not necessarily a fault. Green: far from the board's always-on red
+      // power LED, which makes purples and even blue read as magenta
+      // (Muni rejected magenta, then violet). Solid green is unused with
+      // LED_RAINBOW_PLAYING, and the slow blink tells it apart anyway.
       bool on = ((now_ms / 1000) % 2) == 0;
-      status_led.setPixelColor(0, on ? 110 : 0, 0, on ? 255 : 0);  // slow-blinking violet -- USB suspended
+      status_led.setPixelColor(0, 0, on ? 255 : 0, 0);  // slow-blinking green -- USB suspended
 #ifdef ENCODE_ON_S3
     } else if (!g_s3_encoder_ok) {
       // The S3 runs the encoder in this mode; if it failed to start, nothing
