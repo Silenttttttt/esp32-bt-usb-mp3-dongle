@@ -1283,7 +1283,13 @@ def run_gui_mode(transport, layout, fat, root_dir, args):
         else:
             now_playing_var.set(f"F01 T-{idx + 1:02d}")
         elapsed_secs = lap_bytes // ASSUMED_BYTES_PER_SEC
-        elapsed_var.set(f"{elapsed_secs // 60}:{elapsed_secs % 60:02d}")
+        # Elapsed / length of the file being played (its declared size at the
+        # stream's ~16000 B/s -- the same way the radio times a file).
+        total_secs = state.files[idx].get("size", 0) // ASSUMED_BYTES_PER_SEC
+
+        def mmss(t):
+            return f"{t // 3600}:{t // 60 % 60:02d}:{t % 60:02d}" if t >= 3600 else f"{t // 60}:{t % 60:02d}"
+        elapsed_var.set(f"{mmss(elapsed_secs)} / {mmss(total_secs)}")
         # "reconnecting" not "reader stopped" (2026-09-22): with
         # reconnect_supervisor() now auto-restarting playback once the
         # device reappears, `alive=False` is a transient in-progress state,
