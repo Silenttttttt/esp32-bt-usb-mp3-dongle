@@ -1,7 +1,7 @@
 # Hardware usage (v2, the car build)
 
 Measured 2026-09-25 on the bench:
-- Firmware: classic and S3 at commit `9c03c6c`, flags from
+- Firmware: classic at `9c03c6c`, S3 at `ce23a07` (the maximum ring, 1360 clusters per file), flags from
   [BUILD_FLAGS.md](../BUILD_FLAGS.md).
 - Load: steady streaming, both with the phone connected and with a laptop playing a tone.
 - Build-time numbers are from the compiler. Runtime numbers are from the boards' own heartbeat
@@ -25,7 +25,7 @@ Measured 2026-09-25 on the bench:
 | Classic app flash | 1,084,884 B | 1,310,720 B | **83%** |
 | Classic static RAM (globals) | 56,568 B | 327,680 B | 17% |
 | S3 app flash | 494,228 B | 1,310,720 B | 38% |
-| S3 static RAM (globals) | 77,008 B | 327,680 B | 23% |
+| S3 static RAM (globals) | 81,080 B | 327,680 B | 25% |
 
 The classic's flash is the tightest resource: ~220 KB left. The Bluetooth stack (Bluedroid, A2DP,
 AVRCP) is most of it.
@@ -35,17 +35,17 @@ AVRCP) is most of it.
 | | Total | Free (typical) | Used | Lowest free seen | Largest free block |
 |---|---|---|---|---|---|
 | Classic heap | 254,832 B | ~100,000 B (39%) | ~155,000 B (**61%**) | 70,468 B (during a laptop tone) | ~78-82 KB |
-| S3 internal heap | 331,408 B | 166,392 B (50%) | 165,016 B (**50%**) | 166,196 B | 124,916 B |
-| S3 PSRAM | 8,388,608 B | 4,497,392 B (54%) | 3,891,216 B (**46%**) | constant | 4.45 MB |
+| S3 internal heap | 327,336 B | 162,320 B (50%) | 165,016 B (**50%**) | 162,128 B | 120,820 B |
+| S3 PSRAM | 8,388,608 B | 2,727,920 B (33%) | 5,660,688 B (**67%**) | constant | 2.69 MB |
 
 What uses it:
 
 | Item | Where | Size | Note |
 |---|---|---|---|
-| Audio ring (the "files") | S3 PSRAM | 3,842,048 B (938 clusters × 4 KB, ~240 s at 128 kbps) | Almost all of the PSRAM use. 3 files alias it |
+| Audio ring (the "files") | S3 PSRAM | 5,570,560 B (1360 clusters × 4 KB, ~348 s at 128 kbps) | Almost all of the PSRAM use. 3 files alias it. The maximum FAT12 allows with 3 files; a single-file (v1) build uses 8,192,000 B |
 | Shine MP3 encoder | S3 internal heap (allocations under 256 KB stay internal; `heap_caps_malloc_extmem_enable(256 KB)`) | ~80 KB | On the classic it starved AVRCP; on the S3 it fits comfortably |
 | UART receive buffer | S3 internal heap | 16 KB | ~0.18 s of PCM at 88 KB/s |
-| FAT metadata (boot sector, FAT, 64-entry root dir) | S3 static | ~7 KB | |
+| FAT metadata (boot sector, FAT, 64-entry root dir) | S3 static | ~8.5 KB | |
 | Bluetooth stack (Bluedroid + A2DP + AVRCP) | Classic heap | most of the ~155 KB in use (not measured separately) | Why the encoder had to move off the classic |
 | PCM slots | Classic static | 3 × 4 KB | The A2DP callback -> loop() handoff |
 

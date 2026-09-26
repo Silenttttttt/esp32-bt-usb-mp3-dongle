@@ -50,4 +50,4 @@ table. Change them only to match new observations.
 | Build | Delay | Where it comes from |
 |---|---|---|
 | v2 | ~5 s | ~0.8 s S3 live lag + ~3.7 s radio read-ahead + Bluetooth/encoder |
-| v1 | ~10 s (car, 2026-09-18, 25.6 s ring) | The radio trails the writer by up to the ring length (now ~4 min) |
+| v1 | ~10 s (car, 2026-09-18, 25.6 s ring) | The radio trails the writer by up to the ring length (now ~8.5 min) |

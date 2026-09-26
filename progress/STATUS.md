@@ -5905,3 +5905,7 @@ double Back -- 5 opens, **0** new underruns (was ~50 each).
   `docs/KENWOOD_RADIO.md`, `docs/HARDWARE_USAGE.md` (v2 measured: classic flash 83%, heap 61%
   used; S3 heap 50%, PSRAM 46%, encoder 18-25% of a core, link 45%).
 - Both boards back on v2 (`9c03c6c`).
+- Ring raised to the maximum (Muni: "the bigger the better", `ce23a07`): 1360 clusters per
+  file with 3 files (FAT12's 4084-cluster cap, 5.57 MB, ~5.8 min), 2000 single-file (PSRAM cap,
+  8.19 MB, ~8.5 min). Bench: PSRAM allocation OK (2.73 MB left), 16 MB FAT12 disk, 0 underruns
+  at car_sim opens. Not yet in the car.

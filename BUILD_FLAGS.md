@@ -28,17 +28,17 @@ Related: [docs/KENWOOD_RADIO.md](docs/KENWOOD_RADIO.md) (how the real car radio 
 | S3 flags | `FATDISK_ALWAYS_SERVE_LIVE FATDISK_MULTI_FILE LED_RAINBOW_PLAYING ENCODE_ON_S3` | none (bare) | `ENCODE_ON_S3` |
 | MP3 encoder on | S3 | classic | S3 |
 | Classic -> S3 link | mono PCM, 2,000,000 baud | MP3, 921,600 baud | mono PCM, 2,000,000 baud |
-| Disk | 3 files `Stream.mp3`, ~4 min each, served from the live stream | 1 file `STREAM.MP3`, the ~4 min ring (938 clusters) served by requested offset | same as v1 |
+| Disk | 3 files `Stream.mp3`, ~5.8 min each (1360 clusters, the FAT12 maximum), served from the live stream | 1 file `STREAM.MP3`, a ~8.5 min ring (2000 clusters, the PSRAM maximum) served by requested offset | same as v1 |
 | Radio Next/Back | Relayed to the phone | Moves around the ring; phone not told | same as v1 |
 | AVRCP | On (auto-resume, near-end skip, button relay) | Off | Off |
 | Delay, phone to speaker | ~5 s in the car, ~4-5 s on the bench | ~10 s in the car on 2026-09-18 (25.6 s ring); with the ~4 min ring, whatever the reader happens to trail by, up to minutes | Up to ~30 s on the bench (25.6 s ring) |
-| Known issues | Up to ~1 s of silence once per natural file end (every ~4 min) when the radio's pause is short | Audible splice at every ring wrap (every ~4 min; was every 25.6 s). Long, variable delay. No phone control | Crackle at every file end (measured every ~26 s with the 25.6 s ring; would be every ~4 min with the default ring); long delay |
+| Known issues | Up to ~1 s of silence once per natural file end (every ~5.8 min) when the radio's pause is short | Audible splice at every ring wrap (every ~8.5 min; was every 25.6 s). Long, variable delay. No phone control | Crackle at every file end (measured every ~26 s with the 25.6 s ring; every ~8.5 min with the default ring); long delay |
 
 Why v1's delay is long and variable: v1 serves the radio exactly the byte offset it asks for,
 from a ring the writer keeps overwriting. How far the reader trails the writer is whatever it
 happens to be, up to the ring's length. The first car test used a 25.6 s ring (~10 s delay, a
-splice every 25.6 s). The ring was then raised to ~4 min (938 clusters) to make the splice rare,
-which also raises the possible delay. That's the problem v2 was built to solve: it serves from a
+splice every 25.6 s). The ring was then raised to ~4 min (938 clusters), and on 2026-09-25 to the
+maximum, ~8.5 min (2000 clusters), to make the splice rare; that also raises the possible delay. That's the problem v2 was built to solve: it serves from a
 cursor kept ~0.8 s behind the newest audio, whatever offset the radio asks for. The bench test of
 "v1 + S3 encoder" used `-DFATDISK_DATA_CLUSTERS=100` (the original 25.6 s ring).
 
@@ -72,7 +72,7 @@ overwrite).
 | `FATDISK_MULTI_FILE` | v2 | Detect the radio's Next/Back: 3 files alias the live stream, and a file switch is a button press | Mid-file switch relayed as `RADIO_CMD:next/prev`; a switch at the file's end not relayed; a reader starting after a >3 s gap adopted silently | First car test: never relayed (every open reads the last 2 KB, so every switch looked like a file end); fixed (only playback reads count). Car 2026-09-25: Next and Back relayed with the right direction incl. wrap, natural ends not relayed. Bench: no false relay at mount | v2. Needs the classic's `RADIO_CMD_RELAY` (in `V2_ALL`) |
 | `ENCODE_ON_S3` | v2, v1 + S3 enc | S3 half of the classic flag | Shine encoder on the S3 + a 16 KB UART receive buffer | See the classic row | Must match the classic |
 | `LED_RAINBOW_PLAYING` | v2 | Muni's preference | Rainbow LED while playing instead of solid green | Works | Cosmetic |
-| `FATDISK_DATA_CLUSTERS=N` | all (default 938) | File/ring length in 4 KB clusters | 100 = 25.6 s, 938 = ~4 min, 118 = ~30 s | 100: v1's first car test, splice at every wrap. 938: default since 2026-09-18 (v1 and v2). 118: one car test | Tuning. FAT12 caps the total at 4084 clusters (< ~1361 per file with 3 files) |
+| `FATDISK_DATA_CLUSTERS=N` | all (default: 1360 with 3 files, 2000 with 1) | File/ring length in 4 KB clusters. The defaults are the maximums (Muni: bigger is better) | 1360 = 5.57 MB, ~5.8 min (FAT12 caps the total at 4084 clusters); 2000 = 8.19 MB, ~8.5 min (the ring is one PSRAM block, ~8.3 MB usable). 100 = 25.6 s, 118 = ~30 s | 100: v1's first car test. 938 (~4 min): default 2026-09-18 to 2026-09-25, car-tested in v2. 1360: bench-verified 2026-09-25 (PSRAM alloc OK, 16 MB FAT12 disk, 0 underruns at opens); not yet in the car. 118: one car test | Tuning |
 | `MSC_TRACE` | opt-in (`--trace`) | Car capture of how the radio reads the disk | Every SCSI command (CDB, status, bytes, timing, region), bus resets, descriptor/control requests, file switches. Debug serial at 921600 | Produced the whole Kenwood behavior table (2026-09-25), 0 records dropped | Diagnostic only. Run with `logs/car_capture.sh` |
 | `FATDISK_LIVE_TARGET_LAG=N` | v2 (default 12288) | How far behind live the cursor sits | ~0.77 s of cushion against Bluetooth stalls, paid for in delay | Tuned by the host-test sweep | Tuning |
 | `FATDISK_RADIO_READAHEAD=N` | v2 (default 61440) | The radio's read-ahead burst at a file open | After Next/Back/mount, the file starts this far back so the burst reads real audio | Kenwood's burst is ~58 KB; with this, 0 underruns at opens (bench) | Tuning |
