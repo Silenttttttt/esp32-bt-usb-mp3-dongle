@@ -163,12 +163,26 @@ static const char FILE_NAME[12] = "STREAM  MP3";  // 8.3, space-padded (11 bytes
 // cluster ceiling (see the static_assert below) and well inside the
 // real S3 module's 8MB PSRAM budget.
 // -DFATDISK_DATA_CLUSTERS=118 gives ~30 s files (car test 2026-09-25).
+//
+// RAISED TO THE MAXIMUM (2026-09-25, Muni: "the bigger the ring size the
+// better"). Two hard limits, whichever is lower:
+// - FAT12: at most 4084 clusters in total, minus 2 reserved: NUM_FILES *
+//   DATA_CLUSTERS + 2 < 4085 (static_assert below). With 3 files that's
+//   1360 each: 5,570,560 B per file, ~5.8 min at 16000 B/s.
+// - PSRAM: the ring is one block in the 8 MB PSRAM, ~8.3 MB usable. With
+//   one file (v1) that caps it at 2000 clusters: 8,192,000 B, ~8.5 min.
+// In v2 the delay doesn't depend on this (live serving); a longer file only
+// means fewer natural file ends. In v1 it's also the ceiling on the delay.
 #ifndef FATDISK_DATA_CLUSTERS
-#define FATDISK_DATA_CLUSTERS 938
+#ifdef FATDISK_MULTI_FILE
+#define FATDISK_DATA_CLUSTERS 1360
+#else
+#define FATDISK_DATA_CLUSTERS 2000
+#endif
 #endif
 static const uint32_t DATA_CLUSTERS = FATDISK_DATA_CLUSTERS;
 static const uint32_t CLUSTER_SIZE = SECTORS_PER_CLUSTER * SECTOR_SIZE;
-static const uint32_t DECLARED_FILE_SIZE = DATA_CLUSTERS * CLUSTER_SIZE;  // 409600
+static const uint32_t DECLARED_FILE_SIZE = DATA_CLUSTERS * CLUSTER_SIZE;
 
 // FATDISK_MULTI_FILE (new, 2026-09-19): opt-in, off by default -- the real
 // esp32-s3-msc.ino's build command never defines this, so its behavior is

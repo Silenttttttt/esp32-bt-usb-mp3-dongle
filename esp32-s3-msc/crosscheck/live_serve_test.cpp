@@ -177,10 +177,13 @@ static KwResult run_kenwood(bool verbose) {
     last_end = at + RD;
   };
   // Script (ms of simulated time -> action).
-  const int T_START = 5000, T_NEXT = 270000, T_BACK_RESTART = 290000, T_DOUBLE_BACK = 310000;
+  // Times follow the file length, so the natural end always happens first.
+  const int FILE_MS = (int)((uint64_t)DECLARED_FILE_SIZE * 1000 / 16000);
+  const int T_START = 5000, T_NEXT = T_START + FILE_MS + 30000;
+  const int T_BACK_RESTART = T_NEXT + 20000, T_DOUBLE_BACK = T_NEXT + 40000;
   bool did_next = false, did_restart = false, did_double = false, started = false;
   uint32_t burst_left = 0;
-  for (int t = 0; t < 330000; t++) {
+  for (int t = 0; t < T_DOUBLE_BACK + 20000; t++) {
     owed += 16000 / 1000.0;
     while (owed >= FRAME) {
       for (uint32_t i = 0; i < FRAME; i++) frame[i] = stream_byte(written + i);

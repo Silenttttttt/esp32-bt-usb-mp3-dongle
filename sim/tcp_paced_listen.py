@@ -53,7 +53,7 @@ try:
         except BrokenPipeError:
             print("[tcp-paced] player exited", file=sys.stderr)
             break
-        pos = (pos + cluster_size) % (938 * cluster_size)
+        pos = (pos + cluster_size) % (2000 * cluster_size)  # the single-file (v1) ring: 2000 clusters
         next_send_time += cluster_size / BITRATE_BYTES_PER_SEC
         sleep_for = next_send_time - time.monotonic()
         if sleep_for > 0:
