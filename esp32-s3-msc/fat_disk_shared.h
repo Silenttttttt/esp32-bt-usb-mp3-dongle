@@ -91,7 +91,28 @@ static const uint32_t SECTOR_SIZE = 512;
 // moment to try increasing it here (and re-tuning READ_MARGIN_BYTES
 // alongside it, not independently) -- not before, since only the real
 // hardware can show whether cluster count was ever actually the cause.
-static const uint32_t SECTORS_PER_CLUSTER = 8;  // 4KB clusters
+// Cluster size (2026-09-25, Muni: 32 KB, as a parameter). FAT12 caps the
+// NUMBER of clusters (~4082), so bigger clusters mean longer files: with 3
+// files, 4 KB -> ~5.8 min each, 32 KB -> ~46 min. The 4 KB default was the
+// Python prototype's, never a requirement: v2 serves content from the live
+// cursor, not from file offsets, and the Kenwood always reads 2 KB whatever
+// the cluster size (car trace). 32 KB FAT12 clusters played correctly on the
+// Kenwood from a real stick (2026-09-17). The margins that used to scale
+// with the cluster size are pinned to bytes (NATURAL_EOF_TOLERANCE_BYTES,
+// LIVE_SAFETY_MARGIN_BYTES) so v2 behaves the same at any cluster size.
+// v1 (offset-served) keeps 4 KB: its READ_MARGIN_BYTES is 2 clusters of a
+// ring the file IS.
+#ifndef FATDISK_SECTORS_PER_CLUSTER
+#if defined(FATDISK_MULTI_FILE) && defined(FATDISK_ALWAYS_SERVE_LIVE)
+#define FATDISK_SECTORS_PER_CLUSTER 64  // 32 KB
+#else
+#define FATDISK_SECTORS_PER_CLUSTER 8   // 4 KB
+#endif
+#endif
+static const uint32_t SECTORS_PER_CLUSTER = FATDISK_SECTORS_PER_CLUSTER;
+static_assert(SECTORS_PER_CLUSTER >= 1 && SECTORS_PER_CLUSTER <= 64 &&
+              (SECTORS_PER_CLUSTER & (SECTORS_PER_CLUSTER - 1)) == 0,
+              "FAT cluster size must be a power of two, 1..64 sectors (512 B..32 KB)");
 static const uint32_t RESERVED_SECTORS = 1;
 static const uint32_t NUM_FATS = 2;
 #ifdef FATDISK_MULTI_FILE
@@ -184,6 +205,27 @@ static const uint32_t DATA_CLUSTERS = FATDISK_DATA_CLUSTERS;
 static const uint32_t CLUSTER_SIZE = SECTORS_PER_CLUSTER * SECTOR_SIZE;
 static const uint32_t DECLARED_FILE_SIZE = DATA_CLUSTERS * CLUSTER_SIZE;
 
+// The audio ring in PSRAM. With live serving (v2) it is independent of the
+// file size: content comes from the live cursor, so a 44 MB file doesn't
+// need a 44 MB ring. Default: the 5.57 MB v2 ring from before the files grew
+// (~348 s of history, far more than the lag and read-ahead need). v1 serves
+// the ring BY file offset, so there the ring must be exactly the file.
+#ifdef FATDISK_ALWAYS_SERVE_LIVE
+#ifndef FATDISK_RING_BYTES
+#define FATDISK_RING_BYTES (1360u * 4096u)
+#endif
+static const uint32_t RING_SIZE = (FATDISK_RING_BYTES < DECLARED_FILE_SIZE) ? FATDISK_RING_BYTES : DECLARED_FILE_SIZE;
+#else
+static const uint32_t RING_SIZE = DECLARED_FILE_SIZE;
+#endif
+
+// How close to a file's end the radio's last playback read must be for a
+// switch to count as the file ending on its own (not a button). 8 KB = the
+// 2 x 4 KB clusters it always was; pinned to bytes so bigger clusters don't
+// widen it (at 32 KB clusters it would have swallowed Next presses in the
+// last ~4 s of a file).
+static const uint32_t NATURAL_EOF_TOLERANCE_BYTES = 8192;
+
 // FATDISK_MULTI_FILE (new, 2026-09-19): opt-in, off by default -- the real
 // esp32-s3-msc.ino's build command never defines this, so its behavior is
 // byte-for-byte unchanged (NUM_FILES=1 makes every formula below reduce to
@@ -263,7 +305,7 @@ static const uint32_t LINK_STALE_MS = 2000;  // matches the existing status-LED 
 // already comfortably larger than a single Shine-encoded chunk (~416-420
 // bytes), so this has real margin to spare without adding meaningfully to
 // perceived latency.
-static const uint32_t LIVE_SAFETY_MARGIN_BYTES = CLUSTER_SIZE;
+static const uint32_t LIVE_SAFETY_MARGIN_BYTES = 4096;  // was one 4 KB cluster; pinned to bytes
 
 // REAL BUG FOUND AND FIXED (2026-09-20, live test with real music): the
 // FIRST version of FATDISK_ALWAYS_SERVE_LIVE recomputed "the most recent N
@@ -413,10 +455,10 @@ static uint8_t *g_ring = nullptr;
 static volatile uint32_t g_write_pos = 0;
 // Where the most recently COMPLETED lap actually ended. disk_append() never
 // splits a chunk across the physical end of the ring -- it restarts at 0
-// instead -- so [g_ring_lap_end, DECLARED_FILE_SIZE) holds bytes from an
+// instead -- so [g_ring_lap_end, RING_SIZE) holds bytes from an
 // even older lap, not the end of the previous one. The live-serve reader
 // uses this as the logical wrap point so it never plays that stale tail.
-static volatile uint32_t g_ring_lap_end = DECLARED_FILE_SIZE;
+static volatile uint32_t g_ring_lap_end = RING_SIZE;
 static volatile uint32_t g_total_written = 0;
 static volatile uint32_t g_last_read_offset = 0;
 
@@ -725,13 +767,13 @@ static void build_root_dir() {
 // overflow bug this capping behavior fixes, and the second bug (the
 // capping addition itself overflowing) caught in the first fix attempt.
 static bool disk_append(const uint8_t *data, uint32_t n, bool unread_protect) {
-  if (n >= DECLARED_FILE_SIZE) {
+  if (n >= RING_SIZE) {
     if (unread_protect) return false;
     FATDISK_MUTEX_TAKE_BLOCKING(g_ring_mutex);
-    memcpy(g_ring, data + (n - DECLARED_FILE_SIZE), DECLARED_FILE_SIZE);
+    memcpy(g_ring, data + (n - RING_SIZE), RING_SIZE);
     g_write_pos = 0;
-    g_ring_lap_end = DECLARED_FILE_SIZE;
-    g_total_written = DECLARED_FILE_SIZE;
+    g_ring_lap_end = RING_SIZE;
+    g_total_written = RING_SIZE;
     FATDISK_MUTEX_GIVE(g_ring_mutex);
     return true;
   }
@@ -756,11 +798,11 @@ static bool disk_append(const uint8_t *data, uint32_t n, bool unread_protect) {
   // pointed here instead). Fixed by never splitting a chunk across the
   // wrap: if this append would cross the boundary, skip straight to
   // position 0 and write the WHOLE chunk there as one unbroken unit,
-  // leaving whatever's between the old write_pos and DECLARED_FILE_SIZE
+  // leaving whatever's between the old write_pos and RING_SIZE
   // untouched (a real, complete, still-valid frame from one lap earlier)
   // instead of a byte-split, invalid one. Safe on the writer side (unlike
   // the read path) since this thread is allowed to do real work.
-  if (end > DECLARED_FILE_SIZE) {
+  if (end > RING_SIZE) {
     g_ring_lap_end = wp;
     wp = 0;
     end = n;
@@ -784,7 +826,7 @@ static bool disk_append(const uint8_t *data, uint32_t n, bool unread_protect) {
   // confirmed by direct reasoning, not yet needed to hit live to know it'd
   // be real) even though there's no actual unread content being clobbered
   // in the old sense anymore. Skip the check entirely in this mode.
-  if (unread_protect && g_total_written >= DECLARED_FILE_SIZE) {
+  if (unread_protect && g_total_written >= RING_SIZE) {
     bool unsafe = (wp <= g_last_read_offset && g_last_read_offset < end);
     if (unsafe) {
       FATDISK_MUTEX_GIVE(g_ring_mutex);
@@ -794,15 +836,15 @@ static bool disk_append(const uint8_t *data, uint32_t n, bool unread_protect) {
 #endif
   memcpy(g_ring + wp, data, n);
   g_write_pos = end;
-  if (g_total_written < DECLARED_FILE_SIZE) {
-    g_total_written = min(g_total_written + n, DECLARED_FILE_SIZE);
+  if (g_total_written < RING_SIZE) {
+    g_total_written = min(g_total_written + n, RING_SIZE);
   }
   FATDISK_MUTEX_GIVE(g_ring_mutex);
   return true;
 }
 
 static inline uint32_t disk_valid_bytes() {
-  return g_total_written;  // already capped at DECLARED_FILE_SIZE by disk_append()
+  return g_total_written;  // already capped at RING_SIZE by disk_append()
 }
 
 #ifdef FATDISK_MULTI_FILE
@@ -924,7 +966,7 @@ static void fatdisk_note_file_read(uint32_t file_index, uint32_t file_rel_off, u
   // of) the declared end of the file it left, that's end-of-file, not a
   // button.
   uint32_t re = g_current_file_read_end;
-  bool natural_eof = (direction == 1) && re + 2 * CLUSTER_SIZE >= get_file_declared_size(g_current_file_index);
+  bool natural_eof = (direction == 1) && re + NATURAL_EOF_TOLERANCE_BYTES >= get_file_declared_size(g_current_file_index);
   FATDISK_TRACE(SWITCH, (g_current_file_index << 8) | file_index,
                 (natural_eof ? 1 : 0) | ((!natural_eof && direction != 0) ? 4 : 0), re);
   g_current_file_index = file_index;
@@ -1018,7 +1060,7 @@ static void disk_read_at(uint32_t abs_pos, uint8_t *buffer, uint32_t len,
       // Classified BEFORE the detector sees this read (it updates both).
       bool playback_read = fatdisk_read_is_playback(file_index, file_rel_off);
       bool open_after_natural_end = g_reader_anchored &&
-          g_current_file_read_end + 2 * CLUSTER_SIZE >= get_file_declared_size(g_current_file_index);
+          g_current_file_read_end + NATURAL_EOF_TOLERANCE_BYTES >= get_file_declared_size(g_current_file_index);
 #endif
 #ifdef FATDISK_MULTI_FILE
       fatdisk_note_file_read(file_index, file_rel_off, n);
@@ -1050,7 +1092,7 @@ static void disk_read_at(uint32_t abs_pos, uint8_t *buffer, uint32_t len,
         // same as a straddle/lock-miss already does elsewhere.
         if (n_safe > 0 && avail > LIVE_SAFETY_MARGIN_BYTES + n_safe) {
           // Logical ring, in stream order: the previous lap is [wp, lap_end),
-          // the current lap is [0, wp). [lap_end, DECLARED_FILE_SIZE) is an
+          // the current lap is [0, wp). [lap_end, RING_SIZE) is an
           // older lap's leftover tail (see g_ring_lap_end) and is never
           // served. `behind` = written bytes between the cursor and the live
           // edge. History of this path (persistent cursor, catch-up

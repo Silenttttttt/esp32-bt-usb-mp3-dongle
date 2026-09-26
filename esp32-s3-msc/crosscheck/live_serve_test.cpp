@@ -48,10 +48,14 @@ struct Result { int real, underrun_reads, bridged, violations, jumps, episodes; 
 
 // rate: writer bytes per simulated second; stall: every stall_every_ms the
 // writer produces nothing for stall_ms (a Bluetooth delivery gap).
+// The steady reader's read size: 4 KB every 256 ms = 16000 B/s (independent
+// of the cluster size, which is only a FAT addressing unit).
+static const uint32_t READ_BYTES = 4096;
+
 static Result run(double rate, int stall_every_ms, int stall_ms, bool burst, int sim_seconds,
                   uint32_t reader_file, bool verbose, int outage_at_ms = -1, int outage_ms = 0) {
-  memset(g_ring, 0, DECLARED_FILE_SIZE);
-  g_write_pos = 0; g_total_written = 0; g_ring_lap_end = DECLARED_FILE_SIZE;
+  memset(g_ring, 0, RING_SIZE);
+  g_write_pos = 0; g_total_written = 0; g_ring_lap_end = RING_SIZE;
   g_live_read_cursor = 0; g_live_read_cursor_init = false;
   g_live_underrun = false; g_live_underruns = 0; g_silence_bridge_remaining = 0;
 
@@ -64,7 +68,7 @@ static Result run(double rate, int stall_every_ms, int stall_ms, bool burst, int
   int64_t expect_next = -1;   // stream offset the next real read should start at
   Result r{0, 0, 0, 0, 0, 0};
   bool in_underrun = false;
-  std::vector<uint8_t> buf(CLUSTER_SIZE);
+  std::vector<uint8_t> buf(READ_BYTES);
 
   for (int t = 0; t < sim_seconds * 1000; t++) {
     bool stalled = stall_every_ms > 0 && (t % stall_every_ms) < stall_ms;
@@ -83,28 +87,28 @@ static Result run(double rate, int stall_every_ms, int stall_ms, bool burst, int
     if (t % 256 == 0 && t > 3000) {  // steady 4096 B every 256 ms = 16000 B/s
       uint32_t under_before = g_live_underruns;
       uint32_t bridge_before = g_silence_bridge_remaining;
-      disk_read_at(data_start + reader_file * DECLARED_FILE_SIZE + file_rel, buf.data(), CLUSTER_SIZE);
-      file_rel = (file_rel + CLUSTER_SIZE) % DECLARED_FILE_SIZE;
+      disk_read_at(data_start + reader_file * DECLARED_FILE_SIZE + file_rel, buf.data(), READ_BYTES);
+      file_rel = (file_rel + READ_BYTES) % DECLARED_FILE_SIZE;
       bool underrun = g_live_underruns != under_before;
       bool bridged = bridge_before > 0 || g_silence_bridge_remaining > 0;
       if (underrun && !in_underrun) r.episodes++;
       in_underrun = underrun;
       if (underrun) { r.underrun_reads++; continue; }
-      int64_t at = locate(buf.data(), CLUSTER_SIZE, written);
+      int64_t at = locate(buf.data(), READ_BYTES, written);
       if (bridged || at == -1) {
         // A bridged read's leading bytes are silence; check just the tail.
         // A jump inside this very call sets a fresh bridge that overwrites
         // this read's first SILENCE_BRIDGE_BYTES too.
         uint32_t fresh = (bridge_before == 0 && g_silence_bridge_remaining > 0) ? SILENCE_BRIDGE_BYTES : bridge_before;
-        uint32_t skip = std::min<uint32_t>(fresh, CLUSTER_SIZE);
+        uint32_t skip = std::min<uint32_t>(fresh, READ_BYTES);
         if (bridge_before == 0 && g_silence_bridge_remaining > 0) r.jumps++;
-        if (bridged && skip < CLUSTER_SIZE) {
-          int64_t at2 = locate(buf.data() + skip, CLUSTER_SIZE - skip, written);
-          if (at2 < 0 && CLUSTER_SIZE - skip >= 12) {
+        if (bridged && skip < READ_BYTES) {
+          int64_t at2 = locate(buf.data() + skip, READ_BYTES - skip, written);
+          if (at2 < 0 && READ_BYTES - skip >= 12) {
             r.violations++;
             if (verbose) printf("  t=%d VIOLATION in bridged tail\n", t);
           } else if (at2 >= 0) {
-            expect_next = at2 + (CLUSTER_SIZE - skip);
+            expect_next = at2 + (READ_BYTES - skip);
           }
         } else if (!bridged) {
           r.violations++;
@@ -114,9 +118,9 @@ static Result run(double rate, int stall_every_ms, int stall_ms, bool burst, int
         continue;
       }
       if (expect_next >= 0 && at != expect_next) r.jumps++;
-      if ((uint64_t)at + CLUSTER_SIZE > written) r.violations++;           // unwritten bytes
-      if (written - (uint64_t)at > DECLARED_FILE_SIZE) r.violations++;     // overwritten bytes
-      expect_next = at + CLUSTER_SIZE;
+      if ((uint64_t)at + READ_BYTES > written) r.violations++;           // unwritten bytes
+      if (written - (uint64_t)at > RING_SIZE) r.violations++;     // overwritten bytes
+      expect_next = at + READ_BYTES;
       r.real++;
     }
   }
@@ -132,8 +136,8 @@ static Result run(double rate, int stall_every_ms, int stall_ms, bool burst, int
 // full size (~4 simulated minutes). Returns problems found (0 = pass).
 struct KwResult { int underrun_reads, underrun_after_button, violations, seam_breaks, opens; };
 static KwResult run_kenwood(bool verbose) {
-  memset(g_ring, 0, DECLARED_FILE_SIZE);
-  g_write_pos = 0; g_total_written = 0; g_ring_lap_end = DECLARED_FILE_SIZE;
+  memset(g_ring, 0, RING_SIZE);
+  g_write_pos = 0; g_total_written = 0; g_ring_lap_end = RING_SIZE;
   g_live_read_cursor = 0; g_live_read_cursor_init = false;
   g_live_underrun = false; g_live_underruns = 0; g_silence_bridge_remaining = 0;
   g_open_file = 0xFFFFFFFF; g_live_max_lag = 0; g_live_grace_left = 0;
@@ -214,7 +218,7 @@ static KwResult run_kenwood(bool verbose) {
 }
 
 int main() {
-  g_ring = (uint8_t *)malloc(DECLARED_FILE_SIZE);
+  g_ring = (uint8_t *)malloc(RING_SIZE);
   g_ring_mutex = FATDISK_MUTEX_CREATE();
   build_boot_sector(); build_fat(); build_root_dir();
   int failures = 0;

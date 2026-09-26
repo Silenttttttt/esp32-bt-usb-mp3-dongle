@@ -271,7 +271,7 @@ static uint32_t be32(const uint8_t *p) { return ((uint32_t)p[0] << 24) | ((uint3
 
 // Bytes the served data sat behind the live write edge (ring distance).
 static uint32_t live_lag(const TraceRec &r) {
-  return (r.a + DECLARED_FILE_SIZE - (r.b % DECLARED_FILE_SIZE)) % DECLARED_FILE_SIZE;
+  return (r.a + RING_SIZE - (r.b % RING_SIZE)) % RING_SIZE;
 }
 
 // Pending merged READ10 run.

@@ -398,7 +398,7 @@ static void usb_event_callback(void *arg, esp_event_base_t event_base, int32_t e
 // Printed at boot and once a minute, since a logger started after a flash
 // misses the boot line.
 static void print_build_line() {
-  Serial.printf("[s3] build: commit %07lx%s flags:%s%s%s%s%s file=%lu clusters (%lu B)\n", (unsigned long)BUILD_GIT_SHA,
+  Serial.printf("[s3] build: commit %07lx%s flags:%s%s%s%s%s file=%lu x %lu KB clusters (%lu B) ring=%lu B\n", (unsigned long)BUILD_GIT_SHA,
                 BUILD_GIT_DIRTY ? "+dirty" : "",
 #ifdef FATDISK_ALWAYS_SERVE_LIVE
                 " ALWAYS_SERVE_LIVE",
@@ -425,7 +425,8 @@ static void print_build_line() {
 #else
                 "",
 #endif
-                (unsigned long)DATA_CLUSTERS, (unsigned long)DECLARED_FILE_SIZE);
+                (unsigned long)DATA_CLUSTERS, (unsigned long)(CLUSTER_SIZE / 1024),
+                (unsigned long)DECLARED_FILE_SIZE, (unsigned long)RING_SIZE);
 }
 
 void setup() {
@@ -452,13 +453,13 @@ void setup() {
   build_root_dir();
 
   g_ring_mutex = xSemaphoreCreateMutex();
-  g_ring = (uint8_t *)heap_caps_malloc(DECLARED_FILE_SIZE, MALLOC_CAP_SPIRAM);
+  g_ring = (uint8_t *)heap_caps_malloc(RING_SIZE, MALLOC_CAP_SPIRAM);
   if (!g_ring) {
     Serial.println("[s3] FATAL: PSRAM allocation for ring buffer failed -- "
                     "is PSRAM enabled in board settings?");
     while (true) delay(1000);
   }
-  memset(g_ring, 0, DECLARED_FILE_SIZE);
+  memset(g_ring, 0, RING_SIZE);
 #ifdef ENCODE_ON_S3
   // Shine's working state is hot, table-heavy data: keep it in internal RAM.
   // With PSRAM enabled, malloc() otherwise sends allocations above the
@@ -518,14 +519,14 @@ void setup() {
   // minor, already-accepted glitch as the ring's own intentional,
   // once-per-lap wrap splice (see DATA_CLUSTERS's own history), not raw
   // zero-fill with zero sync headers across a real stretch of the file.
-  while (g_write_pos + SILENCE_PRIMER_LEN <= DECLARED_FILE_SIZE) {
+  while (g_write_pos + SILENCE_PRIMER_LEN <= RING_SIZE) {
     disk_append(SILENCE_PRIMER, SILENCE_PRIMER_LEN, false);
   }
-  uint32_t primer_tail_remaining = DECLARED_FILE_SIZE - g_write_pos;
+  uint32_t primer_tail_remaining = RING_SIZE - g_write_pos;
   if (primer_tail_remaining > 0) {
     memcpy(g_ring + g_write_pos, SILENCE_PRIMER, primer_tail_remaining);
-    g_write_pos = (g_write_pos + primer_tail_remaining) % DECLARED_FILE_SIZE;
-    g_total_written = DECLARED_FILE_SIZE;
+    g_write_pos = (g_write_pos + primer_tail_remaining) % RING_SIZE;
+    g_total_written = RING_SIZE;
   }
 
   // Default HardwareSerial RX buffer (256B) is far too small at 921600
