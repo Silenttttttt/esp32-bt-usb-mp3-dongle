@@ -1,7 +1,7 @@
 # Hardware usage (v2, the car build)
 
 Measured 2026-09-25 on the bench:
-- Firmware: classic at `9c03c6c`, S3 at `ce23a07` (the maximum ring, 1360 clusters per file), flags from
+- Firmware: classic at `9c03c6c`, S3 at `42695d8` (32 KB clusters: 3 files of 44.6 MB; ring 5.57 MB), flags from
   [BUILD_FLAGS.md](../BUILD_FLAGS.md).
 - Load: steady streaming, both with the phone connected and with a laptop playing a tone.
 - Build-time numbers are from the compiler. Runtime numbers are from the boards' own heartbeat
@@ -42,7 +42,7 @@ What uses it:
 
 | Item | Where | Size | Note |
 |---|---|---|---|
-| Audio ring (the "files") | S3 PSRAM | 5,570,560 B (1360 clusters × 4 KB, ~348 s at 128 kbps) | Almost all of the PSRAM use. 3 files alias it. The maximum FAT12 allows with 3 files; a single-file (v1) build uses 8,192,000 B |
+| Audio ring | S3 PSRAM | 5,570,560 B (~348 s at 128 kbps, `FATDISK_RING_BYTES`) | Almost all of the PSRAM use. The 3 files (44.6 MB each, 32 KB clusters) alias it through the live cursor; a single-file (v1) build uses its 8,192,000 B file as the ring |
 | Shine MP3 encoder | S3 internal heap (allocations under 256 KB stay internal; `heap_caps_malloc_extmem_enable(256 KB)`) | ~80 KB | On the classic it starved AVRCP; on the S3 it fits comfortably |
 | UART receive buffer | S3 internal heap | 16 KB | ~0.18 s of PCM at 88 KB/s |
 | FAT metadata (boot sector, FAT, 64-entry root dir) | S3 static | ~8.5 KB | |

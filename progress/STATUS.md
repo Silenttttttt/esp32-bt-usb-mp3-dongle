@@ -5909,3 +5909,10 @@ double Back -- 5 opens, **0** new underruns (was ~50 each).
   file with 3 files (FAT12's 4084-cluster cap, 5.57 MB, ~5.8 min), 2000 single-file (PSRAM cap,
   8.19 MB, ~8.5 min). Bench: PSRAM allocation OK (2.73 MB left), 16 MB FAT12 disk, 0 underruns
   at car_sim opens. Not yet in the car.
+- **32 KB clusters (`42695d8`, Muni):** 4 KB was the Python prototype's default, never a
+  requirement -- v2 serves from the live cursor and the Kenwood reads 2 KB regardless; the
+  2026-09-17 4 KB stick failure had other confounders, and 32 KB FAT12 played on the Kenwood.
+  Now `FATDISK_SECTORS_PER_CLUSTER` (64 for v2) and a separate `FATDISK_RING_BYTES` ring
+  (5.57 MB): 3 files of 44.6 MB (~46 min each) on a 133.7 MB FAT12 disk. Cluster-scaled margins
+  pinned to bytes. Bench: fsck OK, car_sim plays, Next/Back relayed, 0 underruns at opens.
+  Car test pending.
