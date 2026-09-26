@@ -1,5 +1,7 @@
 # Car capture session: results and handoff (2026-09-25, 12:00-13:58 GMT-3, on the laptop)
 
+> **Snapshot of 2026-09-25.** The builds, commits and to-do list below are from that day. Since then: pushed, trace flags removed from the default build, 32 KB clusters, green USB-suspend LED. Current build: `BUILD_FLAGS.md`.
+
 Read this first when you pick the project back up. Detailed event-by-event log with timestamps:
 `progress/CAR_TRACE_FINDINGS.md` (33 numbered observations). Raw traces: `logs/car/*/s3.log`
 (**on the laptop only**, git-ignored; copy them to the desktop).

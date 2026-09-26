@@ -1,139 +1,168 @@
 # Architecture
 
-Diagrams of the real hardware design as actually built and confirmed working end-to-end
-— including on the real target car radio — and of the PC-based bench-test tooling used
-to validate logic changes along the way. GitHub renders the Mermaid blocks below
-natively.
+This covers the v2 build, the one in the car since 2026-09-25. GitHub renders the Mermaid blocks.
+Flags are in [BUILD_FLAGS.md](BUILD_FLAGS.md). The radio behavior it's designed around is in
+[docs/KENWOOD_RADIO.md](docs/KENWOOD_RADIO.md), and resource usage in
+[docs/HARDWARE_USAGE.md](docs/HARDWARE_USAGE.md).
 
-## Real hardware design (as actually built and confirmed working)
+## Hardware
 
-Two ESP32 boards, permanently, by hardware design — not a temporary test setup. The
-classic ESP32 does Bluetooth + encoding; the ESP32-S3 does the USB-MSC device role,
-since only S2/S3 chips have the USB-OTG peripheral that requires. No single ESP32 chip
-does both halves: the classic chip has Bluetooth Classic (A2DP) but no USB-OTG; the S2/S3
-chips have USB-OTG but only BLE, not Bluetooth Classic.
+Two ESP32 boards are needed. The classic ESP32 has Bluetooth Classic (A2DP, AVRCP) but no USB
+device port. The ESP32-S3 has native USB but only BLE.
 
 ```mermaid
 graph LR
-    Phone["📱 Phone<br/>real audio source"]
-    Classic["Classic ESP32<br/>(esp32-bt-mp3-test.ino)<br/>BT A2DP sink +<br/>real-time Shine MP3 encoder<br/>+ LED status (GPIO2)"]
-    S3["ESP32-S3<br/>(esp32-s3-msc.ino)<br/>USB-MSC device +<br/>FAT12 ring-buffer disk<br/>+ RGB LED status (GPIO48)"]
-    Radio["🚗 Car Radio<br/>Kenwood KDC-MP8090U<br/>real hardware, never modified<br/>USB-stick MP3 playback only"]
-    PowerA["🔌 12V accessory outlet<br/>USB charger<br/>(CONFIRMED — used in the<br/>successful real-radio test)"]
-    PowerB["🔌 Radio's own USB port<br/>(bus power)"]
+    Phone["📱 Phone"]
+    Classic["Classic ESP32<br/>esp32-bt-mp3-test.ino<br/>A2DP sink + AVRCP<br/>mono downmix"]
+    S3["ESP32-S3 N16R8<br/>esp32-s3-msc.ino<br/>MP3 encoder (Shine)<br/>FAT12 USB drive<br/>RGB status LED"]
+    Radio["🚗 Kenwood KDC-MP8090U<br/>USB MP3 playback only<br/>never modified"]
+    PowerA["🔌 12 V outlet USB charger"]
 
-    Phone -- "Bluetooth A2DP<br/>(real audio)" --> Classic
-    Classic -- "wired UART<br/>TX0 (GPIO1) → GPIO8<br/>+ shared ground wire" --> S3
-    S3 -- "USB-OTG<br/>(presents as a USB flash drive)" --> Radio
-    PowerA -. "5V/GND" .-> Classic
-    PowerB -. "5V/GND (bus power)" .-> S3
+    Phone -- "A2DP audio" --> Classic
+    Classic -- "AVRCP next / previous / play" --> Phone
+    Classic -- "UART0 TX GPIO1 → GPIO8<br/>mono PCM, 2 Mbaud" --> S3
+    S3 -- "UART2 TX GPIO4 → GPIO19<br/>RADIO_CMD, S3_HB, 9600 baud" --> Classic
+    S3 -- "USB mass storage<br/>(and bus power)" --> Radio
+    PowerA -. "5 V" .-> Classic
 ```
 
-**Data path**: the classic ESP32 receives real PCM over Bluetooth A2DP, encodes it to MP3
-in real time (Shine), and streams the encoded bytes out over a plain wired UART to the
-S3. The S3 appends those bytes into a fixed-size ring buffer and presents itself to the
-radio as a USB mass-storage device holding one huge, still-growing MP3 file — the radio
-just keeps reading further into a file that looks large but is really a rolling
-few-minute window of real content (FAT12 primary; the ring size was tuned up from an
-original ~25.6s after real car-radio testing found an audible stutter at the wrap point —
-see `fat_disk_shared.h`'s own comments for the full reasoning).
+A direct ground wire between the boards is required.
 
-**Wiring**: classic ESP32's TX0 (GPIO1) → S3's GPIO8, one-way (the S3 never talks back),
-plus a direct ground wire between the two boards. That ground wire is required regardless
-of how each board is powered — the UART link's signal integrity depends on a clean, short
-ground reference, not an indirect one through the vehicle's chassis wiring.
+## Data path
 
-**Power**: the setup actually used in the first successful real-radio test runs the two
-boards from **two separate power sources** — the S3 plugged directly into the radio's USB
-port (drawing bus power automatically), and the classic ESP32 powered from a separate 12V
-accessory-outlet USB charger. This sidesteps a real, unmeasured risk that was flagged
-earlier in this project's history: whether a cheap radio's USB port can supply enough
-current (inrush at power-up, specifically) for two active ESP32 boards at once. With
-separate supplies, the radio's own port only ever has to power one board.
+1. **Phone → classic.** The classic is an A2DP sink. Its PCM callback copies each chunk into one
+   of three 4 KB slots; `loop()` drains them (`DIAG_LOOP_DRAIN`: a separate task broke Bluetooth
+   connectability). Chunks larger than a slot are split across slots.
+2. **Classic → S3.** The classic downmixes to mono 44.1 kHz and sends it as `P` frames
+   (`common/link_protocol.h`) at 2 Mbaud, ~89 KB/s, 45% of the link. When the phone is silent
+   or disconnected, it sends silence, so the stream never stops.
+3. **Encoding on the S3.** The S3 runs Shine (`common/mp3_pipeline.h`) at 128 kbps mono, 18-25%
+   of one core. It appends the MP3 frames to the ring. The encoder used to run on the classic,
+   where its ~80 KB starved Bluetooth and AVRCP (`ENCODE_ON_S3` moved it).
+4. **S3 → radio.** The S3 is a USB mass-storage device (TinyUSB `USBMSC`). Every `READ10` is
+   answered by `disk_read_at()` in `esp32-s3-msc/fat_disk_shared.h`.
+5. **Radio → phone.** When the radio opens a different file, the S3 works out Next or Back and
+   sends `RADIO_CMD:next` / `RADIO_CMD:prev` on the return link. The classic sends the AVRCP
+   command to the phone.
 
-An alternative, single-cable design (S3 draws bus power from the radio, classic ESP32
-taps its 5V/GND straight off the S3's own pins) was the original plan — **tried on real
-hardware and confirmed NOT viable, root-caused against the official Espressif schematic,
-not just abandoned as untested.** The S3's "5V" header pin sits downstream of a Schottky
-diode (D7 in the official ESP32-S3-DevKitC-1 schematic, SCH_ESP32-S3-DevKitC-1_V1.1)
-between it and the S3's own native USB port — a normal, deliberate part of the board's
-design (it OR-gates the board's two USB ports so neither backfeeds the other), but it
-means voltage pushed OUT through that pin, while the S3 is powered via its own USB, has
-already dropped below 5V before it even leaves the board. Live-tested: classic → S3
-power (through the same pin, opposite direction) works cleanly, since that path never
-passes through the diode at all; S3 → classic consistently produced a weak/brownout
-classic boot (glows on reset, doesn't stay running) regardless of how strong the
-upstream charger was — expected, since the bottleneck is a fixed voltage drop, not
-available current. A real fix exists (an independent third 5V source Y-split to both
-boards' power pins in parallel, bypassing the S3's onboard diode entirely; or physically
-bridging D7, at the cost of losing its port-isolation protection) but wasn't pursued —
-two separate power sources, already proven working, was preferred instead.
+Delay from the phone to the speaker is ~5 s: ~0.8 s of live lag on the S3, ~3.7 s of the radio's
+own read-ahead, plus Bluetooth and encoding.
 
-## PC-based bench-test tooling
+## The disk
 
-Used throughout development to validate logic changes against the real, flashed classic
-ESP32 and (once it existed) the real, flashed S3 — without needing a physical car radio
-for every single test cycle.
+| | Value |
+|---|---|
+| File system | FAT12, read-only in practice (writes are accepted and dropped) |
+| Cluster size | 32 KB (`FATDISK_SECTORS_PER_CLUSTER=64`; 4 KB without it) |
+| Files | 3, named `Stream.mp3` (8.3 aliases `STREAM~1.MP3`..`STREAM~3.MP3`) |
+| File size | 1360 clusters = 44,564,480 B, ~46 min at 128 kbps (the FAT12 cluster limit shared by 3 files) |
+| Volume | 133.7 MB |
+| Ring | 5,570,560 B in PSRAM (`FATDISK_RING_BYTES`), ~5.8 min of audio |
+
+The files are much bigger than the ring. That works because the radio never gets bytes by file
+offset: `FATDISK_ALWAYS_SERVE_LIVE` answers every read from a live cursor that stays ~12 KB
+(`FATDISK_LIVE_TARGET_LAG`) behind the newest audio. The file offset only tells the S3 which file
+the radio is in and where in the open sequence it is. Bigger files mean the radio's natural file
+end (a 1.9-3.5 s pause) comes around less often, once every ~46 min.
+
+The Kenwood reads a file's size and cluster chain only at open, so the files can't be resized or
+ended early while playing. Song names were dropped: the radio shows only `F01 T-0N`, and a long
+file name made it refuse files.
+
+### Serving a file open
+
+The radio's open sequence (from the in-car trace) is: re-read the root directory and FAT, read the
+file's start, read a 2 KB probe every 512 KB and the last 2 KB, read ~40 KB of the head, then
+read from 0 again with a ~58 KB read-ahead burst.
+
+| Read | What the S3 serves |
+|---|---|
+| Probes and the tail | Silent frames. The live cursor doesn't move |
+| Offset 0 after a natural file end | Continues the stream seamlessly |
+| Offset 0 after Next / Back / mount | Starts `FATDISK_RADIO_READAHEAD` (60 KB) earlier, so the burst is real audio (the radio dropped what it had read ahead) |
+| Re-reads within the same open | The same bytes as the first time |
+
+The result is 0 underruns at Next/Back/mount, and about 1 s once per natural file end. The
+heartbeat `[s3] live: underruns= opens= probes=` counts them.
+
+### Next / Back detection
+
+`FATDISK_MULTI_FILE` watches which file the reads fall in. A switch to the next file (with wrap)
+is Next; to the previous one is Back. A natural end is not relayed. A re-open of the same file is
+the radio's "Back restarts the song" and is also not relayed. `live_serve_test.cpp` in
+`esp32-s3-msc/crosscheck/` tests this against a model of the Kenwood.
+
+## Robustness
+
+| Problem | Handling |
+|---|---|
+| Radio doesn't re-enumerate after an S3 reset | No host after 4 s: `tud_disconnect()`/`tud_connect()`, retried every 10 s |
+| Car off / engine start | USB suspend (green LED), bus resets, re-enumerate. The radio re-opens its remembered track |
+| Classic reboots | `auto_reconnect` brings the phone back without touching it |
+| A second device pairs | Legacy PIN requests get `0000`, SSP confirms are accepted. The watchdog only counts a successful connection as activity, not pairing attempts |
+| Heap fragmentation on the classic | The encoder moved to the S3; `FRAG:` heartbeat line tracks it |
+| S3 UART overflow at 2 Mbaud | RX FIFO threshold 32 B (0 overflows since) |
+| Which build is on a board | Boot line with commit + flags (S3 also every 60 s), `logs/flash_history.log` |
+
+## Power
+
+The boards run from **two separate supplies**: the S3 from the radio's USB port (bus power), the
+classic from a 12 V outlet USB charger.
+
+The original plan was one cable, with the classic powered from the S3's 5V pin. **Tried on real
+hardware and not viable.** On the ESP32-S3-DevKitC-1, the 5V header pin sits behind a Schottky
+diode (D7 in the official schematic, SCH_ESP32-S3-DevKitC-1_V1.1) that OR-gates the board's two
+USB ports. Power going *out* through that pin has already dropped below 5 V. Classic → S3 works
+(it doesn't cross the diode). S3 → classic gave a brownout boot every time, whatever the charger:
+the limit is a fixed voltage drop, not current. Fixes exist but weren't pursued: a third 5 V
+source split to both boards, or bridging D7 (losing its port isolation).
+
+Open: with the car off, USB goes to suspend but the port may stay powered. Draw in that state
+isn't measured.
+
+## Bench tooling
 
 ```mermaid
 graph LR
-    Phone["📱 Phone<br/>real audio source"]
-    Classic["Classic ESP32<br/>REAL, flashed, running"]
-    S3["ESP32-S3<br/>REAL, flashed, running<br/>USB-MSC device"]
-    PC["🖥️ This PC<br/>sim/real_s3_listen.py<br/>reads the REAL mounted<br/>USB block device (O_DIRECT,<br/>no root, via UDisks2)"]
-    Speakers["🔊 PC speakers<br/>via mpg123"]
+    Src["📱 Phone, or the desktop<br/>(sim/bt_desktop_source.py)"]
+    Classic["Classic ESP32"]
+    S3["ESP32-S3"]
+    Sim["🖥️ sim/car_sim.py --gui<br/>Kenwood model, reads the<br/>real S3 drive over USB"]
+    Speakers["🔊 PC speakers"]
 
-    Phone -- "Bluetooth A2DP<br/>(real audio)" --> Classic
-    Classic -- "wired UART" --> S3
-    S3 -- "USB-OTG<br/>(real USB-MSC device)" --> PC
-    PC --> Speakers
+    Src -- "A2DP" --> Classic
+    Classic -- "UART" --> S3
+    S3 -- "USB mass storage" --> Sim
+    Sim --> Speakers
+    S3 -. "RADIO_CMD when car_sim switches file" .-> Classic
 ```
 
-`real_s3_listen.py` reads the real S3's real USB-MSC block device directly and paces
-itself at the real encode bitrate, wrapping at the ring's end — the same sequential,
-real-time read pattern a real dumb car-radio reader would use. Never touches
-`car_sim.py`/`s3_sim_serial.py`/`fat12_disk.py`. Its one non-obvious implementation
-detail: it uses `O_DIRECT` reads, because standard buffered reads against the raw block
-device were found to be served from a stale Linux kernel cache on repeat reads at the
-same offset — a PC-desktop-OS artifact with no equivalent on the real car radio's own
-embedded USB host stack, but one that made the real, working hardware look broken during
-bench testing until it was found and fixed.
+- **`sim/car_sim.py`** models the real Kenwood and nothing else. It does 2 KB reads, the ~58 KB
+  read-ahead, the open probes, the end-of-file pause, Back restart / quick double Back, folder
+  wrap, the remembered track, and the `F01 T-0N` display with elapsed / file length. `kill -USR1`
+  = Next, `-USR2` = Back. Change it only to match observed radio behavior.
+- **Bluetooth tests** (`sim/`): `bt_desktop_source.py` makes the desktop an A2DP source with an
+  auto-accept agent. `bt_switch_test.py` switches the board between devices. `bt_audio_round_test.py`
+  plays audio rounds through the laptop. `bt_pair_laptop.py` pairs the laptop.
+- **Host tests** (`esp32-s3-msc/crosscheck/`): the disk logic compiled on the PC, in particular
+  `live_serve_test.cpp`. Run them after touching `fat_disk_shared.h`.
+- **Car captures**: `esp32-s3-msc/flash.sh --trace` plus `logs/car_capture.sh` log every SCSI
+  command the radio sends. That's where `docs/KENWOOD_RADIO.md` comes from.
+- **Serial logs**: `logs/serial_logger.py` (classic: `--baud 2000000 --mode framed`; S3:
+  `--baud 115200 --mode line`, 921600 with the trace).
 
-An earlier-generation PC-based setup (before the physical S3 board existed) ran the real
-firmware's actual disk logic on the PC itself (`sim/s3_real_firmware_host.cpp`, sharing
-source with the `.ino` via `fat_disk_shared.h`) against `car_sim.py`. That tooling still
-exists and still works — useful for testing disk-logic changes without needing to reflash
-real hardware for every iteration — but is no longer the primary way this project gets
-validated, now that real S3 hardware exists and has been confirmed working end-to-end.
+Older tools (`real_s3_listen.py`, `s3_real_firmware_host*.cpp`, `fat12_disk.py`, the
+`s3_sim*.py` prototypes) came before the S3 board existed or before car_sim read the real drive.
+They're kept for reference.
 
-## FAT12 primary vs. FAT16 fallback
+## History
 
-```mermaid
-graph TD
-    Start{"Real car radio<br/>mounts FAT12?"}
-    FAT12["✅ FAT12 primary<br/>CONFIRMED working end-to-end<br/>on the real target radio"]
-    FAT16["FAT16 fallback<br/>~2.2min worst-case catch-up lag<br/>only if FAT12 is ever rejected<br/>(it hasn't been)"]
+| Build | Date | Shape |
+|---|---|---|
+| Stage 1 | early | Digispark/ATtiny (V-USB) proof that a fixed-size FAT12 drive served on demand works (`firmware/`) |
+| v1 | 2026-09-18 | Classic encodes. One big file on the ring, radio reads by offset. First car success, ~10 s delay |
+| v2 | 2026-09-25 | S3 encodes. Three files served live, Next/Back relayed. ~5 s delay |
 
-    Start -- "yes (confirmed)" --> FAT12
-    Start -. "no (never observed)" .-> FAT16
-```
-
-FAT12 was chosen as primary specifically because its cluster-count ceiling (<4085
-clusters) lets the declared ring volume stay small, directly bounding the "how stale can
-content be" catch-up-lag window. FAT16 needs ≥4085 clusters no matter the cluster size,
-forcing a much bigger minimum volume and a correspondingly worse lag bound — it exists
-purely as insurance against a real, researched compatibility risk (some cheap embedded
-USB-MSC host stacks only fully support FAT16/32), not because it's otherwise preferable.
-That risk did not materialize: FAT12 has been confirmed working on the real target car
-radio (a Kenwood KDC-MP8090U), both as a standalone thumb-drive test and via the full
-real end-to-end pipeline.
-
-## What's still genuinely open
-
-- **The wrap-point audio splice** is mitigated (a much larger ring makes it rare) but not
-  structurally eliminated.
-- Everything else that used to be listed here as "unverified" — real TinyUSB timing under
-  actual USB host read pressure, the final UART pin choice — has since been confirmed
-  directly on real hardware, including a real car radio.
-
-See `progress/STATUS.md` for the full, detailed history.
+The FAT16 fallback (`esp32-s3-msc-fat16-fallback/`) was insurance in case the radio rejected
+FAT12. It didn't, and the fallback predates v2. The full history is in
+[progress/STATUS.md](progress/STATUS.md).

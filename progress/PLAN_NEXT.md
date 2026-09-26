@@ -1,5 +1,7 @@
 # Plan — requested features/fixes
 
+> **Historical.** Most of this was built or dropped by 2026-09-25 (v2). Current state: `README.md`, `progress/CAR_SESSION_RESULTS.md`.
+
 This file tracks things Muni has asked for but not yet fully built. Once implementation starts
 on an item, move its writeup into `STATUS.md`'s normal session log and delete/shrink the entry
 here — this file should always reflect what's still open, not a historical record.

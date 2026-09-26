@@ -1,5 +1,11 @@
 # S3 firmware cross-checks (host-only, no ESP32 hardware needed)
 
+**For the v2 car build, the tests that matter are `live_serve_test.cpp` (run it after any change
+to `fat_disk_shared.h`) and `lfn_image_test.cpp` without a title (the real disk layout: 3 ×
+`Stream.mp3`, checked with `fsck.fat`).** Both are at the end of this file. The sections before
+them date from 2026-09-17, before the S3 board existed. They check the v1 offset-served ring
+against the Python prototype, and their numbers are from that time.
+
 `esp32-s3-msc.ino` was written before any ESP32-S3 board existed to test
 it on. These scripts verify its core FAT12/ring-buffer logic is a
 byte-for-byte, step-for-step faithful port of `../../sim/fat12_disk.py`
@@ -189,7 +195,10 @@ target lag with `-DFATDISK_LIVE_TARGET_LAG=<bytes>`. Added 2026-09-24.
 g++ -O2 -std=c++17 -Wall -Wno-unused-function -DFATDISK_ALWAYS_SERVE_LIVE -DFATDISK_MULTI_FILE -o lfn_image_test lfn_image_test.cpp
 ./lfn_image_test /tmp/lfn.img "Arctic Monkeys - 505" && fsck.fat -n -v -l /tmp/lfn.img
 ```
-fsck.fat must list `/Arctic Monkeys - 505.mp3 (ARCTIC~1.MP3)` and `~2`, `~3` with no errors
+Without a title (what the firmware ships since song names were dropped on 2026-09-25), fsck.fat
+must list `/Stream.mp3 (STREAM~1.MP3)`, `~2`, `~3` and `3 files, 4080/4080 clusters` with no errors
+(re-checked 2026-09-26 with 32 KB clusters). The title path below is no longer called by the
+firmware. With a title, fsck.fat must list `/Arctic Monkeys - 505.mp3 (ARCTIC~1.MP3)` and `~2`, `~3` with no errors
 (the "no volume label in root directory" notice predates the long names). Confirmed
 2026-09-25 with an empty title, ASCII, non-ASCII with forbidden characters, and a 300-char title
 (truncated to 255). The single-file build's metadata is byte-identical to before, apart from the

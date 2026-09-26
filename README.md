@@ -2,178 +2,145 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-Stream Bluetooth audio from a phone into an aftermarket car radio that only accepts
-USB-stick MP3 playback — no Bluetooth input, no AUX. The radio is never modified or
-opened up; instead it's tricked into thinking a real USB flash drive holding one huge
-MP3 file is plugged in, and the bytes of that "file" are generated live, on demand,
-from whatever's currently playing over Bluetooth.
+This project streams Bluetooth audio from a phone into a car radio that can only play MP3s from a
+USB stick. The radio has no Bluetooth and no AUX input, and it is never modified. Two ESP32 boards
+make it think a USB flash drive is plugged in. The MP3 files on that "drive" are generated live
+from whatever the phone is playing. The radio's own Next and Back buttons skip tracks on the phone.
 
-This is exactly the project [requested in `arduino-audio-tools` discussion
-#566](https://github.com/pschatzmann/arduino-audio-tools/discussions/566) back in 2023 —
-"Bluetooth AD2P + Mp3 Encoder + USB Mass Storage Class" — as a fix for commercial BT-to-USB-MP3
-dongles that have "BIG delays and sometimes the sound is skipped." Same idea, built and
-confirmed working end-to-end on real hardware.
+It's the project asked for in [`arduino-audio-tools` discussion
+#566](https://github.com/pschatzmann/arduino-audio-tools/discussions/566), "Bluetooth AD2P + Mp3
+Encoder + USB Mass Storage Class", built and used daily in a real car.
 
-## ✅ Status: working end-to-end on real hardware, confirmed on the actual car radio
+## Status
 
-Real phone → real Bluetooth → real classic ESP32 (A2DP sink + live MP3 encode) → real
-wired UART → real ESP32-S3 (USB-MSC device) → **the actual target car radio** (a Kenwood
-KDC-MP8090U) — plugged in and played correctly, with clean, continuous audio and roughly
-a 10-second delay from power-up to hearing sound. See `progress/STATUS.md` for the full
-build history, every bug found along the way, and how each one was root-caused.
+It works in the target car, a Kenwood KDC-MP8090U, with the v2 build (2026-09-25):
 
-**See `ARCHITECTURE.md`** for full diagrams of the real hardware design and the PC-based
-bench-test tooling used to validate everything before every real-radio test.
+| What | Result |
+|---|---|
+| Live audio, phone to speaker | Continuous, ~5 s delay |
+| Radio Next / Back | Relayed to the phone over AVRCP, including folder wrap. A single Back restarts the song and is not relayed; a quick double Back goes to the previous track |
+| Pause on the radio | Resumes where it stopped |
+| Car off / engine start | The radio re-mounts the drive, the boards reconnect Bluetooth, nobody has to touch anything |
+| Second phone or computer pairing | Works (legacy PIN 0000 or confirm) |
+
+Still to test in the car: 32 KB clusters (bench-verified), the green "USB suspended" LED, pairing a
+real second phone, and "Next while the phone is paused resumes playback".
 
 ## How it works
 
 ```
-PHONE --Bluetooth A2DP--> ESP32 (classic) --wired UART--> ESP32-S3 --USB-OTG (as USB-MSC)--> CAR RADIO
-        real audio           BT sink +                    presents a FAT12                 real hardware,
-                              Shine MP3 encode              "virtual disk" with               never modified
-                                                             one huge declared-
-                                                             size MP3 file;
-                                                             bytes generated
-                                                             on-demand from
-                                                             the live stream
+PHONE --A2DP + AVRCP--> classic ESP32 --UART 2 Mbaud, mono PCM--> ESP32-S3 --USB mass storage--> CAR RADIO
+                            ^                                          |
+                            +------ UART 9600 baud: RADIO_CMD:next/prev, heartbeat ---+
 ```
 
-A classic ESP32 acts as a Bluetooth A2DP sink and encodes incoming PCM to MP3 in
-real time (via Shine). Those encoded bytes get sent over a wired UART to an ESP32-S3,
-which presents itself to the car radio as a standard USB mass-storage device — a "flash
-drive" with one MP3 file on it. The trick: the file's declared size is fixed at mount
-time (real USB-MSC host drivers cache the size and never re-check it), but the actual
-bytes are served from a live ring buffer that's continuously overwritten with fresh
-audio. The radio just keeps reading further into a file that appears large but is
-really only ever a rolling few-minute window of real content.
+- The **classic ESP32** is a Bluetooth A2DP sink with AVRCP. It downmixes the audio to mono and
+  sends the PCM to the S3 at 2 Mbaud. It receives the radio's Next/Back from the S3 and sends
+  them to the phone.
+- The **ESP32-S3** encodes the PCM to 128 kbps MP3 (Shine) into a 5.57 MB ring in PSRAM. It
+  presents a FAT12 USB drive with three files, all named `Stream.mp3`, of 44.6 MB (~46 min) each.
+  Whatever offset the radio asks for, the S3 answers from a live cursor ~0.8 s behind the newest
+  audio. So the radio always plays "now", while believing it is reading a normal file.
+- When the radio switches file, the S3 tells which way it went and relays `RADIO_CMD:next` or
+  `RADIO_CMD:prev` to the classic.
 
-Two ESP32 boards are required, permanently, by hardware design — not a temporary test
-setup. The classic ESP32 has Bluetooth Classic (A2DP) but no USB-OTG; the ESP32-S3 has
-USB-OTG but only BLE, not Bluetooth Classic. Neither chip alone can do both halves of
-this.
+Two boards are needed. The classic ESP32 has Bluetooth Classic but no USB device port. The S3 has
+the USB port but only BLE. Details and diagrams: [ARCHITECTURE.md](ARCHITECTURE.md).
 
-## Real bugs found and fixed along the way
+## Documentation
 
-A representative sample — the full list with root-cause detail is in `progress/STATUS.md`:
-
-- **Ring-wrap frame splitting**: the ring buffer used to byte-split an MP3 frame across
-  its physical wrap boundary, corrupting exactly the frame every playback attempt reads
-  first (real dumb USB-MSC readers always start at file position 0). Fixed by never
-  splitting a chunk across the wrap.
-- **ID3-tagged silence primer**: the pre-encoded silence used to prime the ring at boot
-  had a stray ID3v2 tag baked in, breaking sync for readers that start at byte 0.
-- **Bluetooth reconnect crashes**: root-caused to a heap allocation failure during AVRCP
-  traffic on reconnect — fixed by disabling AVRCP (the phone already owns playback
-  state, so nothing real is lost). Went from ~15-19% crash rate to 0/52 in stress
-  testing.
-- **Cold-boot / pause staleness**: a continuously-overwritten ring means whatever's
-  sitting at position 0 can be stale by up to a full ring duration. A synthetic-silence
-  injector keeps the ring "live" through any pause, and the ring size was tuned
-  specifically to bound this worst case.
-- **Stale kernel cache in the PC bench-test tool** (not a firmware bug): standard
-  buffered reads against the raw USB block device on Linux were being served from a
-  stale kernel cache instead of hitting the real device on repeat reads at the same
-  offset — made the real, working hardware *look* broken during PC testing. Fixed by
-  switching the bench tool to `O_DIRECT`. This bug is structurally impossible on the
-  real car radio's own embedded USB host stack, which has no such cache layer.
-- **Wrap-point audio stutter**: inherent to any fixed-size looping ring — the byte just
-  before wrap and the byte just after it aren't temporally adjacent in the source audio,
-  so a sequential reader always audibly splices two unrelated moments together there.
-  Not eliminated, just made much rarer by sizing the ring to several minutes instead of
-  tens of seconds.
-
-## LED status indicators
-
-Both boards have onboard LED status for debugging without a laptop attached:
-
-- **Classic ESP32** (existing GPIO2 LED): off when not Bluetooth-connected, solid when
-  connected but injecting silence (paused/idle), blinking ~1Hz when real audio is
-  actively flowing.
-- **ESP32-S3** (onboard RGB LED, GPIO48): off when no data has arrived from the classic
-  ESP32 recently, solid blue when linked but in silence, breathing green when real audio
-  is flowing.
-
-## Repo layout
-
-- `esp32-bt-mp3-test/` — real, flashed firmware for the classic ESP32 (Bluetooth A2DP
-  sink + real-time Shine MP3 encoding + LED status). `bisect1_shine/` and
-  `minimal_a2dp_test/` are earlier bisection/debug sketches from the Bluetooth-reconnect
-  crash investigation, kept for reference.
-- `esp32-serial-test/` — a minimal early bring-up sketch, superseded once the real
-  classic ESP32 firmware existed. Kept for reference.
-- `esp32-s3-msc/` — real, flashed firmware for the ESP32-S3 (USB-MSC device role, FAT12
-  primary, RGB LED status). `fat_disk_shared.h` holds the core ring-buffer/FAT12 disk
-  logic, shared verbatim with the PC-hosted bench-test stand-in below — one source of
-  truth, not a hand-copied duplicate. `crosscheck/` holds host-only tests proving the
-  logic matches the original Python reference, holds up under real concurrent load, and
-  — mounted with Linux's own real vfat kernel driver — produces a genuinely valid FAT12
-  volume a real independent MP3 decoder can play.
-- `esp32-s3-msc-fat16-fallback/` — a ready, tested FAT16 fallback, only for if the real
-  car radio ever rejects FAT12 (it doesn't — FAT12 is confirmed working). Brought to the
-  same real-tested rigor as the primary. Never flashed to real hardware; not the
-  default.
-- `sim/` — PC-side tooling:
-  - `real_s3_listen.py` — reads the real, flashed S3's real mounted USB-MSC device
-    directly (no root, via UDisks2) and plays it back live on the PC — the tool used to
-    bench-test the real hardware before every real car-radio test.
-  - `real_s3_passthrough.py` — a pure pass-through transport letting `car_sim.py` (see
-    below) talk to the real S3's real disk content, live, with zero simulation.
-  - `car_sim.py` — a genuine FAT12/FAT16 client standing in for the real car radio:
-    parses the boot sector, walks the FAT chain, reads sectors exactly like a real
-    USB-MSC host driver would.
-  - `fat12_disk.py` / `s3_sim_serial.py` — the original Python reference implementation
-    and a full software simulation of the S3+radio side (talking to the real classic
-    ESP32 over serial) — useful for testing the classic ESP32's own BT/encoding pipeline
-    without needing any S3 hardware at all.
-  - `s3_sim.py` / `esp32_sim.py` / `s3_sim_wifi.py` — earlier, fully-synthetic
-    both-sides-simulated prototypes from before the real classic ESP32 existed at all
-    (`s3_sim_wifi.py` specifically modeled the WiFi transport that was tried and
-    abandoned). Superseded by the tools above; kept for reference.
-  - `s3_real_firmware_host.cpp` / `s3_real_firmware_host_fat16.cpp` — PC-hosted programs
-    that compile and run the **real firmware's actual disk logic** (shared source with
-    the `.ino` files) against the real classic ESP32 — used throughout development
-    before every real-hardware milestone, to validate logic changes without needing to
-    reflash and re-test on physical boards every time.
-- `progress/` — the full, detailed session-by-session development log (`STATUS.md`),
-  research notes, and `MORNING_RUNBOOK.md`.
-- `firmware/` — historical "Stage 1" proof-of-concept on a Digispark/ATtiny board
-  (V-USB), done before the ESP32 phase, kept for reference only. Its vendored
-  V-USB/DigiCDC/micronucleus dependencies are intentionally not checked in here.
-- `ARCHITECTURE.md` — diagrams of the real hardware design and PC-based bench-test
-  tooling.
-- `CLAUDE.md` — project context and working conventions for AI-assisted development on
-  this repo.
+| File | What's in it |
+|---|---|
+| [ARCHITECTURE.md](ARCHITECTURE.md) | Data path, wiring, power, the disk layout and live serving, bench tooling |
+| [BUILD_FLAGS.md](BUILD_FLAGS.md) | The v2 build, every flag (intent / expected / observed / status), working combinations |
+| [docs/KENWOOD_RADIO.md](docs/KENWOOD_RADIO.md) | How the real radio behaves, measured from a USB trace in the car |
+| [docs/HARDWARE_USAGE.md](docs/HARDWARE_USAGE.md) | Each board's flash / RAM / CPU / link usage in the car build |
+| [progress/LED_STATUS_TABLE.md](progress/LED_STATUS_TABLE.md) | The S3's RGB LED colors |
+| [progress/STATUS.md](progress/STATUS.md) | The full development log, every bug and its root cause (append-only) |
+| [esp32-s3-msc/crosscheck/README.md](esp32-s3-msc/crosscheck/README.md) | Host tests for the disk logic |
+| [CLAUDE.md](CLAUDE.md) | Working notes for AI-assisted development on this repo |
 
 ## Build & flash
 
-Use the flash scripts; each board's flags live in one list inside its script (a bare
-`arduino-cli compile .` silently drops them). **[BUILD_FLAGS.md](BUILD_FLAGS.md)** explains
-the two known-good profiles, v1 and v2, every flag, and which combinations work.
-[docs/KENWOOD_RADIO.md](docs/KENWOOD_RADIO.md) records how the real car radio behaves (measured),
-and [docs/HARDWARE_USAGE.md](docs/HARDWARE_USAGE.md) what each board has and what the car build uses.
+Always use the flash scripts. Each board's flags live in one list at the top of its script; a bare
+`arduino-cli compile .` silently drops them.
 
 ```
-esp32-bt-mp3-test/flash.sh [--v1] [--no-upload]     # classic ESP32
-esp32-s3-msc/flash.sh      [--v1] [--no-upload]     # ESP32-S3
+esp32-bt-mp3-test/flash.sh [--no-upload] [-DEXTRA ...]            # classic ESP32
+esp32-s3-msc/flash.sh      [--trace] [--no-upload] [-DEXTRA ...]  # ESP32-S3
 ```
 
-Flash both boards with the same profile (v2 is the default). The scripts pick the board by its
-USB serial number; set `CLASSIC_SERIAL` / `S3_SERIAL` for your own boards.
+- The scripts pick each board by its USB serial number. Set `CLASSIC_SERIAL` / `S3_SERIAL` for
+  your own boards.
+- Each flash is appended to `logs/flash_history.log`.
+- Both boards print their commit and flags at boot (the S3 again every 60 s).
+- `ENCODE_ON_S3` must be on both boards or on neither. The scripts' defaults already match.
+- `--trace` on the S3 logs every SCSI command the radio sends, for car capture sessions.
+- The classic needs a small local patch to the `audio-tools` library to compile. See
+  [CLAUDE.md](CLAUDE.md).
 
-Wiring: classic ESP32's TX0 (GPIO1) → S3's GPIO8, plus a shared ground wire between the
-two boards. If powering the two boards from separate sources (e.g. the S3 from the
-radio's own USB port, the classic from a separate 12V accessory outlet), the direct
-ground wire between the boards is required regardless — the UART link needs a clean,
-short ground reference, not just an indirect one through the vehicle's chassis.
+Toolchain: `esp32:esp32` core 3.3.x, `ESP32-A2DP` (classic), `arduino-audio-tools` with its Shine
+MP3 codec (both boards), `Adafruit_NeoPixel` (S3). The S3 board is an ESP32-S3-WROOM-1 N16R8 DevKitC-1
+(`PSRAM=opi`).
+
+## Wiring
+
+| From | To | Purpose |
+|---|---|---|
+| Classic TX0 (GPIO1) | S3 GPIO8 | Audio (PCM), 2 Mbaud |
+| S3 GPIO4 | Classic GPIO19 | Return link: Next/Back, heartbeat, 9600 baud |
+| Classic GND | S3 GND | Required, even with separate power supplies |
+| S3 native USB port | Radio's USB port | The drive (and the S3's power) |
+| Classic USB | A 12 V-outlet USB charger | The classic's power |
+
+The S3 can't power the classic from its 5V pin (a diode on the DevKitC-1 drops the voltage), so
+the boards use two supplies. See [ARCHITECTURE.md](ARCHITECTURE.md#power).
+
+## LEDs
+
+The S3's RGB LED (GPIO48) shows the whole system's state. In priority order:
+
+| Color | Meaning |
+|---|---|
+| Solid white | Native USB not connected |
+| Slow-blinking green | USB suspended: the radio is off/asleep, or the data wires are loose |
+| Fast red | MP3 encoder failed to start |
+| Blinking white | No data from the classic yet (check wiring, or mismatched `ENCODE_ON_S3`) |
+| Blinking cyan | The link from the classic was lost |
+| Blinking orange / yellow | Return link never seen / lost (only Next/Back are affected) |
+| Solid red | No phone paired/connected |
+| Slow blue | Resyncing |
+| Solid blue | Phone connected, no audio |
+| Rainbow | Playing |
+| Three white flashes | Next/Back relayed to the phone (on top of the current color) |
+
+The full table with causes is in [progress/LED_STATUS_TABLE.md](progress/LED_STATUS_TABLE.md). The
+classic's GPIO2 LED is off with no phone, solid when connected but silent, and blinks at ~1 Hz while
+audio is flowing.
+
+## Repo layout
+
+| Path | What |
+|---|---|
+| `esp32-bt-mp3-test/` | Classic ESP32 firmware: A2DP sink, AVRCP relay, PCM link, pairing handling. `bisect1_shine/` and `minimal_a2dp_test/` are old debug sketches |
+| `esp32-s3-msc/` | S3 firmware: USB mass storage, the MP3 encoder, LEDs. `fat_disk_shared.h` is the disk logic (FAT12 layout, ring, live serving, Next/Back detection), shared with the host tests and PC stand-ins. `msc_trace.h` is the SCSI trace |
+| `esp32-s3-msc/crosscheck/` | Host tests: `live_serve_test.cpp` (live serving against a model of the Kenwood), `lfn_image_test.cpp`, FAT image generators, ring/link cross-checks |
+| `common/` | Shared between the boards: `link_protocol.h` (the UART frame format), `mp3_pipeline.h` (the encoder) |
+| `sim/car_sim.py` | Bench model of the Kenwood: 2 KB reads, its read-ahead, open probes, end-of-file pause, Next/Back semantics, `F01 T-0N` display with elapsed / length. Plays the real S3 drive through the PC speakers. `--gui`; `kill -USR1` = Next, `-USR2` = Back |
+| `sim/bt_*.py` | Bluetooth test tools: a desktop A2DP source, multi-device pairing/switch test, audio rounds through the laptop, laptop pairing |
+| `sim/` (rest) | Older PC stand-ins and prototypes (`fat12_disk.py`, `s3_real_firmware_host*.cpp`, `real_s3_listen.py`, ...), kept for reference |
+| `logs/` | `serial_logger.py`, `car_capture.sh` (car trace sessions), `flash_history.log` |
+| `docs/`, `progress/` | Reference docs and the development log (see the table above) |
+| `esp32-s3-msc-fat16-fallback/` | FAT16 variant, unused (FAT12 works on the radio). It predates v2 |
+| `esp32-serial-test/`, `firmware/` | Early bring-up sketch and the original Digispark/ATtiny proof of concept |
 
 ## Known open items
 
-- **USB port power draw was never measured on a real meter** — only estimated on paper.
-  If both boards are powered from the same USB port (rather than two separate supplies,
-  as used in the first successful real-radio test), verify the port can actually supply
-  enough current before relying on it.
-- **The wrap-point audio splice is mitigated, not eliminated** — raising the ring size
-  makes it rare, not impossible. A future fix could special-case the read logic to avoid
-  landing exactly on the splice, but this hasn't been attempted.
-- **RGB LED pin (GPIO48) is confirmed correct** on the tested board, but hasn't been
-  checked against every possible ESP32-S3-DevKitC-1 hardware revision.
+- The v2 changes listed under Status still need a car test.
+- About 1 s of silence once per natural file end (every ~46 min): the radio's read-ahead burst
+  after its end-of-file pause outruns the live audio. The alternative would be replaying audio
+  already heard.
+- Current draw with the car off: USB goes to suspend, but the port may keep powering both boards.
+  Not measured.
+- `v1` (2026-09-18: one file, the classic encodes, ~10 s delay) is legacy and kept only for
+  reference; see [BUILD_FLAGS.md](BUILD_FLAGS.md).

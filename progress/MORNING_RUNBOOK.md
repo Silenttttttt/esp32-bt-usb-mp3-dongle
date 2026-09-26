@@ -1,5 +1,7 @@
 # Morning runbook — when the ESP32-S3 board arrives
 
+> **Historical (2026-09-17).** The S3 arrived and the system is in the car. Current docs: `README.md`, `ARCHITECTURE.md`, `BUILD_FLAGS.md`.
+
 Everything below is scattered across CLAUDE.md/STATUS.md in more detail; this is the single
 ordered checklist to actually follow. If something here contradicts CLAUDE.md, trust
 CLAUDE.md (it's the maintained source of truth) and fix this file.
