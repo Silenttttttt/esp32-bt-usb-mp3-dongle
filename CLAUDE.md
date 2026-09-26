@@ -32,7 +32,7 @@ PHONE --A2DP + AVRCP--> classic ESP32 --UART 2 Mbaud, mono PCM--> ESP32-S3 --USB
   supplies (the S3's 5V pin can't power the classic: diode D7, see ARCHITECTURE.md).
 - v1 (one file, the classic encodes, 2026-09-18) is legacy. Muni: "forget about v1".
 
-Waiting on a car test: 32 KB clusters (bench-verified), the green "USB suspended" LED, a real
+32 KB clusters car-verified 2026-09-26. Waiting on a car test: the green "USB suspended" LED, a real
 second phone pairing, "Next while the phone is paused resumes".
 
 ## Safety-critical: which board is which

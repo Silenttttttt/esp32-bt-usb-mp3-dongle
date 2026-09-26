@@ -23,7 +23,7 @@ It works in the target car, a Kenwood KDC-MP8090U, with the v2 build (2026-09-25
 | Car off / engine start | The radio re-mounts the drive, the boards reconnect Bluetooth, nobody has to touch anything |
 | Second phone or computer pairing | Works (legacy PIN 0000 or confirm) |
 
-Still to test in the car: 32 KB clusters (bench-verified), the green "USB suspended" LED, pairing a
+32 KB clusters (3 × ~46 min files) worked in the car on 2026-09-26. Still to test there: the green "USB suspended" LED, pairing a
 real second phone, and "Next while the phone is paused resumes playback".
 
 ## How it works

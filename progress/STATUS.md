@@ -5916,3 +5916,10 @@ double Back -- 5 opens, **0** new underruns (was ~50 each).
   (5.57 MB): 3 files of 44.6 MB (~46 min each) on a 133.7 MB FAT12 disk. Cluster-scaled margins
   pinned to bytes. Bench: fsck OK, car_sim plays, Next/Back relayed, 0 underruns at opens.
   Car test pending.
+
+### 2026-09-26 -- 32 KB clusters car-verified
+
+Muni tested the v2 build with 32 KB clusters (3 files of 44.6 MB, 133.7 MB FAT12 disk) in the
+Kenwood: "32 was a success". Docs updated (README, CLAUDE.md, BUILD_FLAGS.md). Still open for a
+car test: the green USB-suspended LED, a real second phone pairing, Next-while-paused resumes.
+Project paused here until new bugs show up.
