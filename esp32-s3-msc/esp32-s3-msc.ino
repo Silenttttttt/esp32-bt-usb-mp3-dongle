@@ -398,7 +398,7 @@ static void usb_event_callback(void *arg, esp_event_base_t event_base, int32_t e
 // Printed at boot and once a minute, since a logger started after a flash
 // misses the boot line.
 static void print_build_line() {
-  Serial.printf("[s3] build: commit %07lx%s flags:%s%s%s%s%s%s\n", (unsigned long)BUILD_GIT_SHA,
+  Serial.printf("[s3] build: commit %07lx%s flags:%s%s%s%s%s file=%lu clusters (%lu B)\n", (unsigned long)BUILD_GIT_SHA,
                 BUILD_GIT_DIRTY ? "+dirty" : "",
 #ifdef FATDISK_ALWAYS_SERVE_LIVE
                 " ALWAYS_SERVE_LIVE",
@@ -425,12 +425,7 @@ static void print_build_line() {
 #else
                 "",
 #endif
-#ifdef FATDISK_DATA_CLUSTERS
-                " DATA_CLUSTERS(set)"
-#else
-                ""
-#endif
-                );
+                (unsigned long)DATA_CLUSTERS, (unsigned long)DECLARED_FILE_SIZE);
 }
 
 void setup() {
