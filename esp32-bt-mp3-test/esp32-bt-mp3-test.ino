@@ -374,24 +374,33 @@ Mp3Pipeline mp3_out(serial_sink);  // the shared encoder, output as 'A' frames
 // Every path that hands mono PCM downstream goes through here: encoded on
 // this board (default) or shipped raw to the S3 as 'P' frames (ENCODE_ON_S3).
 #ifdef ENCODE_ON_S3
-// 'Q': the 'P' PCM frame plus a CRC-16 trailer over type + length + payload
-// (link_protocol.h), so the S3 can drop a frame corrupted on the wire.
+// 'Q' frames (link_protocol.h): PCM split into LINK_Q_MAX_PCM-byte pieces, each
+// with a sequence number and a CRC-16, so the S3 can drop a piece corrupted
+// on the wire and fill exactly the audio that went missing.
 static void send_pcm_crc(const uint8_t *pcm, uint32_t len) {
-  uint8_t header[6];
-  header[0] = FRAME_MAGIC;
-  header[1] = (uint8_t)LINK_FRAME_PCM_CRC;
-  header[2] = (len >> 24) & 0xFF;
-  header[3] = (len >> 16) & 0xFF;
-  header[4] = (len >> 8) & 0xFF;
-  header[5] = len & 0xFF;
-  uint16_t crc = link_crc16(header + 1, 5);
-  crc = link_crc16(pcm, len, crc);
-  uint8_t trailer[2] = {(uint8_t)(crc >> 8), (uint8_t)(crc & 0xFF)};
-  xSemaphoreTakeRecursive(serial_mutex, portMAX_DELAY);
-  Serial.write(header, 6);
-  if (len) Serial.write(pcm, len);
-  Serial.write(trailer, 2);
-  xSemaphoreGiveRecursive(serial_mutex);
+  static uint8_t seq = 0;
+  while (len) {
+    uint32_t n = len < LINK_Q_MAX_PCM ? len : LINK_Q_MAX_PCM;
+    uint32_t plen = n + 1;
+    uint8_t header[7];
+    header[0] = FRAME_MAGIC;
+    header[1] = (uint8_t)LINK_FRAME_PCM_CRC;
+    header[2] = (plen >> 24) & 0xFF;
+    header[3] = (plen >> 16) & 0xFF;
+    header[4] = (plen >> 8) & 0xFF;
+    header[5] = plen & 0xFF;
+    header[6] = seq++;
+    uint16_t crc = link_crc16(header + 1, 6);
+    crc = link_crc16(pcm, n, crc);
+    uint8_t trailer[2] = {(uint8_t)(crc >> 8), (uint8_t)(crc & 0xFF)};
+    xSemaphoreTakeRecursive(serial_mutex, portMAX_DELAY);
+    Serial.write(header, 7);
+    Serial.write(pcm, n);
+    Serial.write(trailer, 2);
+    xSemaphoreGiveRecursive(serial_mutex);
+    pcm += n;
+    len -= n;
+  }
 }
 #endif
 

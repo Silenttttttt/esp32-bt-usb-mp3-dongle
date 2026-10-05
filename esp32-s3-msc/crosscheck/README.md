@@ -204,14 +204,21 @@ firmware. With a title, fsck.fat must list `/Arctic Monkeys - 505.mp3 (ARCTIC~1.
 (truncated to 255). The single-file build's metadata is byte-identical to before, apart from the
 per-boot volume serial.
 
-## PCM link CRC + loss concealment (`Q` frames, `common/pcm_conceal.h`)
+## PCM link CRC + loss concealment (`Q` frames, `common/pcm_link_rx.h`, `common/pcm_conceal.h`)
 
 ```
 g++ -O2 -std=c++17 -Wall -o pcm_crc_test pcm_crc_test.cpp && ./pcm_crc_test
 ```
-Encodes ~46 s of two-tone PCM as `Q` frames, sprays 40 bursts of 1-300 garbage bytes over the
-wire (a wobbling plug), and parses it with a copy of `link_task`'s logic. Must print `ALL OK`:
-CRC check value 0x29B1, a clean stream bit-exact, every received frame an original frame, no
-sample step bigger than the signal's own, at most one replacement per burst, and the same
-corruption through the old `P` path producing full-scale steps. 2026-10-05: 40/40 bursts caught,
-max step 2501 = the signal's (old path: 65118).
+Runs the same receive code as the S3 (`pcm_link_rx.h`). Encodes ~23 s of PCM as `Q` frames
+(512 B + sequence number + CRC-16), sprays 40 bursts of 1-300 garbage bytes over the wire (a
+wobbling plug), and parses it like `link_task`. Two signals: two tones, and a non-harmonic chord
+with tremolo and noise. Must print `ALL OK`:
+- CRC check value 0x29B1; a clean stream is bit-exact;
+- no corrupted sample reaches the encoder;
+- the output keeps the input's length;
+- no sample step bigger than the signal's own;
+- the fill is closer to the lost audio than silence;
+- the same corruption through the old `P` path gives full-scale steps.
+
+2026-10-05: 40/40 bursts caught, 51 frames filled (1.3% of the audio). Fill error vs silence:
+0.07 (tones), 0.98 (chord + noise). Max step = the signal's own (old path: 65118).

@@ -5945,3 +5945,25 @@ and soft dropouts instead of cracks.
 
 Hardware recommendations (the real fix) are in ARCHITECTURE.md's Power section: strain-relieve
 the plug, a 470-1000 µF cap on the classic's 5V/GND, or solder power to the header pins.
+
+### 2026-10-05 (later) -- Link: smaller frames, sequence numbers, pitch-repeat concealment, lifetime counters
+
+Software-only follow-up to the CRC change (Muni: "lets focus on non physical things now"):
+- `Q` frames carry 5.8 ms (512 B) instead of up to 23 ms: a glitch costs a quarter of the audio.
+  The S3 rejects any `Q` length other than seq + 2..512 bytes, so a corrupted length is dropped
+  at once instead of eating several frames.
+- 1-byte sequence number: the S3 fills exactly the frames that went missing (up to 16, ~93 ms;
+  longer is an outage, faded in from silence). No timing skip.
+- Fill (`common/pcm_conceal.h`): repeats the last pitch period (best normalized cross-correlation
+  over 23 ms of history, 5.8 ms window), joined with a decaying offset, fading out over 23 ms;
+  the next good frame cross-fades in. If the match is weak (corr < 0.6) it fades to silence in
+  ~3 ms instead, because an out-of-phase copy measured worse than silence.
+  The first version (mirrored replay) measured 1.41x silence's error and was replaced; a 64-sample
+  window was too short for bass (any low note matched any lag).
+- Receive logic in `common/pcm_link_rx.h`, used by both the S3 and the host test.
+- Lifetime totals in NVS (`[s3] link lifetime: boots= crc_bad= lost_frames= outages=`), at boot
+  and every minute, saved at most once a minute when changed: shows whether a drive had errors
+  without a laptop in the car.
+
+Verified: pcm_crc_test ALL OK (numbers in crosscheck/README.md); live_serve_test ALL OK; both
+firmwares compile (S3 38% flash, 25% RAM). Not on hardware yet; flash both boards together.

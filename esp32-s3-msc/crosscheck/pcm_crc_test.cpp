@@ -1,58 +1,79 @@
-// Host test for the 'Q' PCM frames (CRC-16) and pcm_conceal.h.
+// Host test for the 'Q' PCM frames: CRC-16, sequence numbers, and loss
+// concealment (common/pcm_link_rx.h, pcm_conceal.h -- the same code the S3 runs).
 //
 //   g++ -O2 -std=c++17 -Wall -o pcm_crc_test pcm_crc_test.cpp && ./pcm_crc_test
 //
-// Builds a stream of 'Q' frames the way the classic's send_pcm_crc() does,
-// corrupts it with bursts of garbage (a wobbling plug on the wire), and parses
-// it with a copy of link_task's logic (find_sync, header check, CRC, conceal).
-// Checks: the CRC matches the published check value; a clean stream comes out
-// bit-exact; every output frame is either an original frame or a replacement
-// (no corrupted audio gets through); the output has no step bigger than the
-// signal's own; and the same corruption through the old unchecked 'P' path
-// does produce big steps (so the test would notice the protection missing).
+// Builds the byte stream the classic's send_pcm_crc() produces, sprays bursts
+// of garbage over it (a wobbling plug on the wire), and parses it the way
+// link_task does (find_sync, header check, link_q_len_ok, link_q_crc_ok, then
+// PcmLinkRx). Checks:
+//   - the CRC matches the published check value; a clean stream is bit-exact;
+//   - no corrupted audio reaches the encoder; the output keeps the input's
+//     length (lost frames are filled, not skipped);
+//   - the output has no step bigger than the signal's own (+ cross-fade slack);
+//   - the fill is closer to the lost audio than silence, on two signals;
+//   - the same corruption through the old unchecked 'P' path makes big spikes.
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <vector>
-#include "../../common/link_protocol.h"
-#include "../../common/pcm_conceal.h"
+#include "../../common/pcm_link_rx.h"
 
 static const uint8_t MAGIC = 0xAA;
 static const uint32_t MAX_FRAME_LEN = 4096;
-static const uint32_t FRAME = 2048;  // one mono slot, 1024 samples
+static const uint32_t CHUNK = 2048;  // what the classic's loop() hands emit_mono (1024 samples)
 
 static int fails = 0;
 static void check(bool ok, const char *what) {
-  printf("  %-62s %s\n", what, ok ? "OK" : "FAIL");
+  printf("  %-66s %s\n", what, ok ? "OK" : "FAIL");
   if (!ok) fails++;
 }
 
-static std::vector<uint8_t> make_pcm(int frames) {
-  std::vector<uint8_t> pcm(frames * FRAME);
+static int16_t sample(const std::vector<uint8_t> &p, size_t i) { return (int16_t)(p[2 * i] | (p[2 * i + 1] << 8)); }
+
+// kind 0: two tones. kind 1: a non-harmonic chord (A3, C#4 slightly sharp,
+// F4 + a 2.7 kHz partial) with a slow tremolo and ~10% noise -- less periodic.
+static std::vector<uint8_t> make_pcm(int chunks, int kind) {
+  std::vector<uint8_t> pcm(chunks * CHUNK);
+  srand(99);
   for (size_t i = 0; i < pcm.size() / 2; i++) {
-    // two tones, ~-6 dBFS: a realistic max step between samples
     double t = i / 44100.0;
-    int16_t v = (int16_t)(12000 * sin(2 * M_PI * 440 * t) + 4000 * sin(2 * M_PI * 3100 * t));
+    double x = kind == 0 ? 12000 * sin(2 * M_PI * 440 * t) + 4000 * sin(2 * M_PI * 3100 * t)
+                         : (1 + 0.3 * sin(2 * M_PI * 3 * t)) *
+                               (5000 * sin(2 * M_PI * 220 * t) + 4000 * sin(2 * M_PI * 279.3 * t) +
+                                3500 * sin(2 * M_PI * 349.2 * t) + 1500 * sin(2 * M_PI * 2700 * t)) +
+                           1500.0 * (rand() / (double)RAND_MAX * 2 - 1);
+    int16_t v = (int16_t)x;
     pcm[2 * i] = v & 0xFF;
     pcm[2 * i + 1] = (uint16_t)v >> 8;
   }
   return pcm;
 }
 
-static void frame_into(std::vector<uint8_t> &wire, char type, const uint8_t *p, uint32_t len) {
-  uint8_t h[6] = {MAGIC, (uint8_t)type, (uint8_t)(len >> 24), (uint8_t)(len >> 16), (uint8_t)(len >> 8), (uint8_t)len};
-  wire.insert(wire.end(), h, h + 6);
-  wire.insert(wire.end(), p, p + len);
-  if (type == LINK_FRAME_PCM_CRC) {
-    uint16_t crc = link_crc16(h + 1, 5);
-    crc = link_crc16(p, len, crc);
+// The classic's send_pcm_crc().
+static void send_q(std::vector<uint8_t> &wire, uint8_t &seq, const uint8_t *pcm, uint32_t len) {
+  while (len) {
+    uint32_t n = len < LINK_Q_MAX_PCM ? len : LINK_Q_MAX_PCM, plen = n + 1;
+    uint8_t h[7] = {MAGIC, (uint8_t)LINK_FRAME_PCM_CRC, (uint8_t)(plen >> 24), (uint8_t)(plen >> 16),
+                    (uint8_t)(plen >> 8), (uint8_t)plen, seq++};
+    uint16_t crc = link_crc16(pcm, n, link_crc16(h + 1, 6));
+    wire.insert(wire.end(), h, h + 7);
+    wire.insert(wire.end(), pcm, pcm + n);
     wire.push_back(crc >> 8);
     wire.push_back(crc & 0xFF);
+    pcm += n;
+    len -= n;
   }
 }
 
-// Bursts of random bytes at fixed positions (same seed for both paths).
+static void send_p(std::vector<uint8_t> &wire, const uint8_t *pcm, uint32_t len) {
+  uint8_t h[6] = {MAGIC, (uint8_t)LINK_FRAME_PCM, (uint8_t)(len >> 24), (uint8_t)(len >> 16), (uint8_t)(len >> 8), (uint8_t)len};
+  wire.insert(wire.end(), h, h + 6);
+  wire.insert(wire.end(), pcm, pcm + len);
+}
+
+// Bursts of random bytes; returns the wire byte ranges hit.
 static void corrupt(std::vector<uint8_t> &wire, int bursts, unsigned seed) {
   srand(seed);
   for (int b = 0; b < bursts; b++) {
@@ -62,31 +83,21 @@ static void corrupt(std::vector<uint8_t> &wire, int bursts, unsigned seed) {
   }
 }
 
-struct Parsed {
+struct Out {
   std::vector<uint8_t> pcm;
-  std::vector<int> kind;  // per output frame: 1 = received, 0 = replacement
-  uint32_t crc_bad = 0, bad_headers = 0;
+  std::vector<bool> filled;  // per output sample: concealment, not received
+  PcmLinkRx rx;
+  uint32_t bad_headers = 0;
 };
 
-// Copy of link_task (ENCODE_ON_S3): "time since last PCM < 100 ms" becomes
-// "the previous frame was PCM".
-static Parsed parse(const std::vector<uint8_t> &wire) {
-  Parsed out;
-  PcmConceal conceal;
-  bool in_loss = false, pcm_recent = false;
+// link_task, ENCODE_ON_S3. Time: each byte takes 5 us at 2 Mbaud.
+static void parse(const std::vector<uint8_t> &wire, Out &out) {
   size_t pos = 0;
   uint8_t payload[MAX_FRAME_LEN];
-  auto emit = [&](const uint8_t *p, uint32_t n, int k) {
+  bool filling = false;
+  auto emit = [&](const uint8_t *p, uint32_t n) {
     out.pcm.insert(out.pcm.end(), p, p + n);
-    out.kind.push_back(k);
-  };
-  auto loss = [&]() {
-    if (in_loss) return;
-    in_loss = true;
-    uint8_t fill[MAX_FRAME_LEN];
-    uint32_t n = conceal.last_len();
-    conceal.lost(fill, n);
-    emit(fill, n, 0);
+    for (uint32_t i = 0; i < n / 2; i++) out.filled.push_back(filling);
   };
   while (true) {
     while (pos < wire.size() && wire[pos] != MAGIC) pos++;
@@ -96,34 +107,32 @@ static Parsed parse(const std::vector<uint8_t> &wire) {
     pos += 5;
     char type = (char)header[0];
     uint32_t len = ((uint32_t)header[1] << 24) | (header[2] << 16) | (header[3] << 8) | header[4];
-    bool known = type == LINK_FRAME_PCM || type == LINK_FRAME_PCM_CRC || type == LINK_FRAME_CONTROL;
-    if (!known || len > MAX_FRAME_LEN) {
-      out.bad_headers++;
-      if (pcm_recent) loss();
-      continue;
-    }
+    bool known = type == LINK_FRAME_CONTROL || type == LINK_FRAME_PCM ||
+                 (type == LINK_FRAME_PCM_CRC && link_q_len_ok(len));
+    if (!known || len > MAX_FRAME_LEN) { out.bad_headers++; continue; }
     uint32_t need = len + (type == LINK_FRAME_PCM_CRC ? 2 : 0);
     if (pos + need > wire.size()) break;
     memcpy(payload, &wire[pos], len);
     pos += len;
+    uint32_t now_ms = (uint32_t)(pos * 5 / 1000);
     if (type == LINK_FRAME_PCM_CRC) {
-      uint16_t crc = link_crc16(header, 5);
-      crc = link_crc16(payload, len, crc);
-      uint16_t got = (uint16_t)((wire[pos] << 8) | wire[pos + 1]);
+      const uint8_t *trailer = &wire[pos];
       pos += 2;
-      if (crc != got) { out.crc_bad++; loss(); continue; }
-    }
-    if (type == LINK_FRAME_PCM || type == LINK_FRAME_PCM_CRC) {
-      pcm_recent = true;
-      in_loss = false;
-      if (type == LINK_FRAME_PCM_CRC) conceal.good(payload, len);  // 'P' = the old path, untouched
-      emit(payload, len, 1);
+      if (!link_q_crc_ok(header, payload, len, trailer)) { out.rx.on_crc_bad(); continue; }
+      // Mark samples emitted before the good frame's own as filled.
+      size_t before = out.pcm.size();
+      filling = true;
+      out.rx.on_good(payload[0], payload + 1, len - 1, now_ms, [&](const uint8_t *p, uint32_t n) {
+        if (p == payload + 1) filling = false;  // the good frame itself
+        emit(p, n);
+      });
+      (void)before;
+      filling = false;
+    } else if (type == LINK_FRAME_PCM) {
+      emit(payload, len);
     }
   }
-  return out;
 }
-
-static int16_t sample(const std::vector<uint8_t> &p, size_t i) { return (int16_t)(p[2 * i] | (p[2 * i + 1] << 8)); }
 
 static int max_step(const std::vector<uint8_t> &p) {
   int m = 0;
@@ -132,56 +141,73 @@ static int max_step(const std::vector<uint8_t> &p) {
 }
 
 int main() {
-  printf("CRC\n");
+  printf("CRC and frame checks\n");
   check(link_crc16((const uint8_t *)"123456789", 9) == 0x29B1, "CRC-16/CCITT-FALSE check value 0x29B1");
+  check(link_q_len_ok(513) && link_q_len_ok(3) && !link_q_len_ok(514) && !link_q_len_ok(512) && !link_q_len_ok(0x0A000201),
+        "'Q' length: seq + 2..512 bytes of whole samples only");
 
-  const int FRAMES = 2000;  // ~46 s
-  std::vector<uint8_t> src = make_pcm(FRAMES);
-  int src_step = max_step(src);
+  const int CHUNKS = 1000;  // ~23 s
+  for (int kind = 0; kind < 2; kind++) {
+    std::vector<uint8_t> src = make_pcm(CHUNKS, kind);
+    int src_step = max_step(src);
 
-  std::vector<uint8_t> clean;
-  for (int f = 0; f < FRAMES; f++) frame_into(clean, LINK_FRAME_PCM_CRC, &src[f * FRAME], FRAME);
-  printf("Clean 'Q' stream\n");
-  Parsed c = parse(clean);
-  check(c.pcm == src && c.crc_bad == 0 && c.bad_headers == 0, "bit-exact, no CRC failures");
+    std::vector<uint8_t> clean;
+    uint8_t seq = 0;
+    for (int c = 0; c < CHUNKS; c++) send_q(clean, seq, &src[c * CHUNK], CHUNK);
 
-  printf("'Q' stream with 40 garbage bursts (1-300 bytes each)\n");
-  std::vector<uint8_t> q = clean;
-  corrupt(q, 40, 7);
-  Parsed r = parse(q);
-  printf("  crc_bad=%u bad_headers=%u frames out=%zu (sent %d)\n", r.crc_bad, r.bad_headers, r.kind.size(), FRAMES);
-  check(r.crc_bad > 0, "corruption detected");
-  // Every received frame must equal some original frame, in order.
-  size_t next = 0;
-  bool all_original = true;
-  for (size_t k = 0, off = 0; k < r.kind.size(); off += FRAME, k++) {
-    if (!r.kind[k]) continue;
-    bool found = false;
-    for (size_t f = next; f < (size_t)FRAMES; f++) {
-      // a received frame may have been faded in; compare its tail (after the fade)
-      if (!memcmp(&r.pcm[off + 2 * PcmConceal::FADE_SAMPLES], &src[f * FRAME + 2 * PcmConceal::FADE_SAMPLES],
-                  FRAME - 2 * PcmConceal::FADE_SAMPLES)) {
-        next = f + 1; found = true; break;
+    printf("== signal: %s ==\nClean 'Q' stream\n", kind ? "chord + noise" : "two tones");
+    {
+      Out o;
+      parse(clean, o);
+      check(o.pcm == src && o.rx.crc_bad == 0 && o.bad_headers == 0, "bit-exact, no CRC failures");
+    }
+
+    printf("'Q' stream with 40 garbage bursts (1-300 bytes each)\n");
+    std::vector<uint8_t> q = clean;
+    corrupt(q, 40, 7);
+    Out o;
+    parse(q, o);
+    printf("  crc_bad=%u bad_headers=%u lost_frames=%u outages=%u\n", o.rx.crc_bad, o.bad_headers, o.rx.lost_frames, o.rx.outages);
+    check(o.rx.crc_bad + o.bad_headers > 0 && o.rx.lost_frames > 0, "corruption detected");
+    check(o.pcm.size() == src.size(), "output as long as the input (lost frames filled, not skipped)");
+    bool same = o.pcm.size() == src.size();
+    size_t filled = 0;
+    double err_fill = 0, err_silence = 0;
+    for (size_t i = 0; same && i < src.size() / 2; i++) {
+      if (o.filled[i]) {
+        filled++;
+        double d = sample(o.pcm, i) - sample(src, i);
+        err_fill += d * d;
+        err_silence += (double)sample(src, i) * sample(src, i);
+      } else if (sample(o.pcm, i) != sample(src, i)) {
+        // allowed only inside the cross-fade right after a fill
+        bool in_xfade = false;
+        for (size_t k = 1; k <= PcmConceal::XFADE && k <= i; k++) if (o.filled[i - k]) in_xfade = true;
+        if (!in_xfade) { same = false; printf("  corrupt sample at %zu\n", i); }
       }
     }
-    if (!found) all_original = false;
+    check(same, "every received sample is original (no corrupt audio reaches the encoder)");
+    printf("  filled %zu samples (%.1f ms) of %zu (%.3f%%)\n", filled, filled / 44.1, src.size() / 2, 100.0 * filled / (src.size() / 2));
+    int q_step = max_step(o.pcm);
+    printf("  max step: signal %d, output %d\n", src_step, q_step);
+    check(q_step <= src_step + 1100, "no step bigger than the signal's own (+1100 cross-fade slack)");
+    printf("  fill error energy vs silence: %.2f\n", err_silence > 0 ? err_fill / err_silence : 0.0);
+    check(err_fill < err_silence, "the fill is closer to the lost audio than silence");
   }
-  check(all_original, "every received frame is an original frame (no corrupt audio)");
-  int q_step = max_step(r.pcm);
-  printf("  max step: signal %d, output %d\n", src_step, q_step);
-  check(q_step <= src_step + 400, "no step bigger than the signal's own (+400)");
-  int lost = 0;
-  for (int k : r.kind) lost += k == 0;
-  check(lost <= 40 && lost > 0, "at most one replacement per burst");
 
+  std::vector<uint8_t> src = make_pcm(CHUNKS, 0);
+  int src_step = max_step(src);
   printf("Same corruption through the old unchecked 'P' path\n");
-  std::vector<uint8_t> p;
-  for (int f = 0; f < FRAMES; f++) frame_into(p, LINK_FRAME_PCM, &src[f * FRAME], FRAME);
-  corrupt(p, 40, 7);
-  Parsed old = parse(p);
-  int p_step = max_step(old.pcm);
-  printf("  max step: %d\n", p_step);
-  check(p_step > 4 * src_step, "spikes get through without the CRC (the test can see them)");
+  {
+    std::vector<uint8_t> p;
+    for (int c = 0; c < CHUNKS; c++) send_p(p, &src[c * CHUNK], CHUNK);
+    corrupt(p, 40, 7);
+    Out old;
+    parse(p, old);
+    int p_step = max_step(old.pcm);
+    printf("  max step: %d\n", p_step);
+    check(p_step > 4 * src_step, "spikes get through without the CRC (the test can see them)");
+  }
 
   printf(fails ? "FAILED (%d)\n" : "ALL OK\n", fails);
   return fails ? 1 : 0;

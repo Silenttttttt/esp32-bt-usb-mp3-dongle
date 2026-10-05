@@ -34,10 +34,14 @@ A direct ground wire between the boards is required.
    of three 4 KB slots; `loop()` drains them (`DIAG_LOOP_DRAIN`: a separate task broke Bluetooth
    connectability). Chunks larger than a slot are split across slots.
 2. **Classic → S3.** The classic downmixes to mono 44.1 kHz and sends it as `Q` frames
-   (`common/link_protocol.h`) at 2 Mbaud, ~89 KB/s, 45% of the link. Each frame carries a CRC-16.
-   A frame corrupted on the wire is dropped and replaced by a ~23 ms fade to silence, and the next
-   good frame fades back in (`common/pcm_conceal.h`). Without this, flipped bits went straight to
-   the encoder as full-scale cracks. When the phone is silent or disconnected, the classic sends
+   (`common/link_protocol.h`) at 2 Mbaud, ~89 KB/s, 46% of the link. Each frame holds 5.8 ms of
+   audio (512 B), a sequence number and a CRC-16. The S3 drops a frame that fails the CRC; the next
+   good frame's sequence number says how many are missing, and exactly that much audio is filled
+   (`common/pcm_link_rx.h`). The fill repeats the last pitch period, joined without a jump, fading
+   out over 23 ms, and the next good frame cross-fades in (`common/pcm_conceal.h`). Audio with no
+   clear period fades to silence in ~3 ms instead. Without this, flipped bits went straight to the
+   encoder as full-scale cracks. Totals survive reboots: `[s3] link lifetime: boots= crc_bad=
+   lost_frames= outages=` at boot and every minute. When the phone is silent or disconnected, the classic sends
    silence, so the stream never stops.
 3. **Encoding on the S3.** The S3 runs Shine (`common/mp3_pipeline.h`) at 128 kbps mono, 18-25%
    of one core. It appends the MP3 frames to the ring. The encoder used to run on the classic,

@@ -59,9 +59,10 @@
 #include "../common/link_protocol.h"  // LINK_BAUD + frame types, shared with the classic
 #ifdef ENCODE_ON_S3
 #include "../common/mp3_pipeline.h"   // the shared encoder (same source the classic uses by default)
-#include "../common/pcm_conceal.h"    // fades over PCM frames lost on the wire ('Q' CRC failures)
+#include "../common/pcm_link_rx.h"    // 'Q' frames: fills PCM lost on the wire (pcm_conceal.h)
 #endif
 #include <Adafruit_NeoPixel.h>
+#include <Preferences.h>  // lifetime link-error totals (ENCODE_ON_S3)
 
 // UART pins to the classic ESP32's TX (its Serial/UART0 TX pin, wired
 // directly -- see CLAUDE.md's real end-state architecture diagram).
@@ -303,11 +304,25 @@ static volatile uint32_t g_enc_us_sum = 0, g_enc_us_max = 0, g_enc_n = 0, g_pcm_
 // Status LED inputs for this mode: encoder started OK, and when PCM last arrived.
 static volatile bool g_s3_encoder_ok = false;
 static volatile uint32_t g_pcm_last_ms = 0;
-// 'Q' frames that failed their CRC, and replacement frames encoded in place of
-// lost audio (CRC failures plus bad headers while PCM was flowing).
-static volatile uint32_t g_pcm_crc_bad = 0, g_pcm_concealed = 0;
-static PcmConceal g_conceal;
-static bool g_pcm_in_loss = false;  // one replacement per loss burst
+// 'Q' frames: CRC failures, lost frames filled, and long gaps (link_rx), plus
+// lifetime totals kept in NVS so a drive with no laptop can be checked later.
+static PcmLinkRx g_link_rx;
+static Preferences g_link_prefs;
+static uint32_t g_saved_crc_bad = 0, g_saved_lost = 0, g_saved_outages = 0, g_boots = 0;
+
+// Lifetime totals = what NVS had at boot + this session. Saved at most once a
+// minute and only when they changed (a flash write briefly stalls
+// flash-resident code; the radio's ~3.7 s read-ahead absorbs that).
+static void link_totals_save(bool force) {
+  static uint32_t last_ms = 0, last_sum = 0;
+  uint32_t sum = g_link_rx.crc_bad + g_link_rx.lost_frames + g_link_rx.outages;
+  if (!force && (sum == last_sum || millis() - last_ms < 60000)) return;
+  last_ms = millis();
+  last_sum = sum;
+  g_link_prefs.putUInt("crc_bad", g_saved_crc_bad + g_link_rx.crc_bad);
+  g_link_prefs.putUInt("lost", g_saved_lost + g_link_rx.lost_frames);
+  g_link_prefs.putUInt("outages", g_saved_outages + g_link_rx.outages);
+}
 
 static void encode_pcm(const uint8_t *pcm, uint32_t len) {
   uint32_t t0 = micros();
@@ -315,18 +330,6 @@ static void encode_pcm(const uint8_t *pcm, uint32_t len) {
   uint32_t dt = micros() - t0;
   g_enc_us_sum += dt; g_enc_n++; g_pcm_bytes += len;
   if (dt > g_enc_us_max) g_enc_us_max = dt;
-}
-
-// PCM was lost on the wire: encode one fade-to-silence frame in its place.
-static void conceal_pcm_loss() {
-  if (g_pcm_in_loss) return;
-  g_pcm_in_loss = true;
-  static uint8_t fill[MAX_FRAME_LEN];
-  uint32_t n = g_conceal.last_len();
-  if (n > MAX_FRAME_LEN) n = MAX_FRAME_LEN;
-  g_conceal.lost(fill, n);
-  encode_pcm(fill, n);
-  g_pcm_concealed++;
 }
 #endif
 
@@ -342,14 +345,11 @@ static void link_task(void *) {
 
     bool known = frame_type == LINK_FRAME_MP3 || frame_type == LINK_FRAME_CONTROL;
 #ifdef ENCODE_ON_S3
-    known = known || frame_type == LINK_FRAME_PCM || frame_type == LINK_FRAME_PCM_CRC;
+    known = known || frame_type == LINK_FRAME_PCM ||
+            (frame_type == LINK_FRAME_PCM_CRC && link_q_len_ok(length));
 #endif
     if (!known || length > MAX_FRAME_LEN) {
       g_link_frames_bad++;
-#ifdef ENCODE_ON_S3
-      // Mid-stream (PCM in the last 100 ms), a bad header means audio was lost.
-      if (g_pcm_last_ms && millis() - g_pcm_last_ms < 100) conceal_pcm_loss();
-#endif
       static uint32_t last_bad_log_ms = 0;  // one line per burst, for matching against clicks
       if (millis() - last_bad_log_ms > 2000) {
         last_bad_log_ms = millis();
@@ -364,13 +364,10 @@ static void link_task(void *) {
     if (frame_type == LINK_FRAME_PCM_CRC) {
       uint8_t trailer[2];
       read_exact(trailer, 2);
-      uint16_t crc = link_crc16(header, 5);
-      crc = link_crc16(payload, length, crc);
-      if (crc != (uint16_t)((trailer[0] << 8) | trailer[1])) {
-        g_pcm_crc_bad++;
+      if (!link_q_crc_ok(header, payload, length, trailer)) {
+        g_link_rx.on_crc_bad();
         g_link_frames_bad++;
-        conceal_pcm_loss();
-        continue;  // a corrupted length may have eaten the next frame's start: rescan
+        continue;  // the sequence number of the next good frame says how much to fill
       }
     }
 #endif
@@ -379,10 +376,11 @@ static void link_task(void *) {
     if (frame_type == LINK_FRAME_MP3) {
       append_mp3(payload, length);
 #ifdef ENCODE_ON_S3
-    } else if (frame_type == LINK_FRAME_PCM || frame_type == LINK_FRAME_PCM_CRC) {
+    } else if (frame_type == LINK_FRAME_PCM_CRC) {
       g_pcm_last_ms = millis();
-      g_pcm_in_loss = false;
-      g_conceal.good(payload, length);
+      g_link_rx.on_good(payload[0], payload + 1, length - 1, g_pcm_last_ms, encode_pcm);
+    } else if (frame_type == LINK_FRAME_PCM) {  // older classic: no CRC
+      g_pcm_last_ms = millis();
       encode_pcm(payload, length);
 #endif
     } else {
@@ -515,6 +513,15 @@ void setup() {
   g_s3_encoder_ok = enc_ok;
   Serial.printf("[s3] encoder (ENCODE_ON_S3): %s, int_free=%u\n", enc_ok ? "on" : "FAILED",
                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+  g_link_prefs.begin("link", false);
+  g_saved_crc_bad = g_link_prefs.getUInt("crc_bad", 0);
+  g_saved_lost = g_link_prefs.getUInt("lost", 0);
+  g_saved_outages = g_link_prefs.getUInt("outages", 0);
+  g_boots = g_link_prefs.getUInt("boots", 0) + 1;
+  g_link_prefs.putUInt("boots", g_boots);
+  Serial.printf("[s3] link lifetime: boots=%lu crc_bad=%lu lost_frames=%lu outages=%lu\n",
+                (unsigned long)g_boots, (unsigned long)g_saved_crc_bad,
+                (unsigned long)g_saved_lost, (unsigned long)g_saved_outages);
 #endif
   // Prime the ring with pre-encoded silence up front -- same fix as
   // fat12_disk.py's __init__, same rationale (see CLAUDE.md/STATUS.md):
@@ -940,7 +947,15 @@ void loop() {
   if (now_ms - last_heartbeat_ms >= 1000) {
     last_heartbeat_ms = now_ms;
     static uint32_t heartbeat_n = 0;
-    if (++heartbeat_n % 60 == 0) print_build_line();
+    if (++heartbeat_n % 60 == 0) {
+      print_build_line();
+#ifdef ENCODE_ON_S3
+      Serial.printf("[s3] link lifetime: boots=%lu crc_bad=%lu lost_frames=%lu outages=%lu\n",
+                    (unsigned long)g_boots, (unsigned long)(g_saved_crc_bad + g_link_rx.crc_bad),
+                    (unsigned long)(g_saved_lost + g_link_rx.lost_frames),
+                    (unsigned long)(g_saved_outages + g_link_rx.outages));
+#endif
+    }
     Serial.printf("[s3] link heartbeat: bytes_read=%lu frames_ok=%lu frames_bad=%lu "
                   "write_pos=%lu total_written=%lu last_read_offset=%lu "
                   "diag_write_byte=%02x(n=%lu) diag_read_byte=%02x(n=%lu)\n",
@@ -964,10 +979,11 @@ void loop() {
     {
       uint32_t n = g_enc_n, sum = g_enc_us_sum, mx = g_enc_us_max, pcm = g_pcm_bytes;
       g_enc_n = 0; g_enc_us_sum = 0; g_enc_us_max = 0; g_pcm_bytes = 0;
-      Serial.printf("[s3] enc: frames=%lu pcm_bytes=%lu avg_us=%lu max_us=%lu crc_bad=%lu concealed=%lu\n",
+      Serial.printf("[s3] enc: frames=%lu pcm_bytes=%lu avg_us=%lu max_us=%lu crc_bad=%lu lost_frames=%lu\n",
                     (unsigned long)n, (unsigned long)pcm,
                     (unsigned long)(n ? sum / n : 0), (unsigned long)mx,
-                    (unsigned long)g_pcm_crc_bad, (unsigned long)g_pcm_concealed);
+                    (unsigned long)g_link_rx.crc_bad, (unsigned long)g_link_rx.lost_frames);
+      link_totals_save(false);
     }
 #endif
 #ifdef FATDISK_ALWAYS_SERVE_LIVE
