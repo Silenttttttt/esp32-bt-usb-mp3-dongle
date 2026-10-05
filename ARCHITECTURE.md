@@ -121,9 +121,10 @@ the limit is a fixed voltage drop, not current. Fixes exist but weren't pursued:
 source split to both boards, or bridging D7 (losing its port isolation).
 
 **Mounting in the car (2026-10-05).** On rough roads the audio crackled. Jiggling the classic's
-micro-USB power plug reproduces it. A momentary contact loss sags the classic's supply and ground,
-which corrupts bits on the 2 Mbaud audio wire. The firmware now hides those errors (CRC above), but
-the plug is still the cause. In order of effect per effort:
+micro-USB power plug reproduces it. The likely mechanism (not yet measured): a momentary contact
+loss sags the classic's supply and ground, which corrupts bits on the 2 Mbaud audio wire. The
+`crc_bad` counter in the S3's `[s3] enc:` heartbeat will confirm or rule this out on the bench. The
+firmware now hides such errors (CRC above), but the plug is still the cause. In order of effect per effort:
 
 | Fix | Effort | Why |
 |---|---|---|
