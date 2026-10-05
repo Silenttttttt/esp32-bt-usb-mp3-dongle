@@ -82,7 +82,7 @@ legacy single-file build; don't use them unless Muni asks.
 | S3 | `FATDISK_ALWAYS_SERVE_LIVE` | Reads are served from a cursor at the live write edge, not the requested offset. Without it the ring's ~4 min catch-up lag comes back |
 | S3 | `FATDISK_MULTI_FILE` | 3 full-length files on the same live stream; Next/Back detection and relay (`RADIO_CMD:next/prev`) |
 | S3 | `LED_RAINBOW_PLAYING` | Rainbow LED while playing (Muni's preference) instead of solid green |
-| S3 + classic | `ENCODE_ON_S3` | Classic sends mono PCM `P` frames at **2 Mbaud**; the S3 runs the MP3 encoder (`common/mp3_pipeline.h`). **Both boards or neither**: a mismatch means different bauds and the S3 shows blinking WHITE ("link never seen") |
+| S3 + classic | `ENCODE_ON_S3` | Classic sends mono PCM `Q` frames (PCM + CRC-16; the S3 drops a corrupted frame and fades over it) at **2 Mbaud**; the S3 runs the MP3 encoder (`common/mp3_pipeline.h`). **Both boards or neither**: a mismatch means different bauds and the S3 shows blinking WHITE ("link never seen") |
 | classic | `V2_ALL` | AVRCP features: radio-button relay, auto resume, near-end auto skip. **Never add `A2DP_DISABLE_AVRC`**: AVRCP is the point; the old crash was heap fragmentation |
 | classic | `DIAG_LOOP_DRAIN` | Load-bearing: encode/PCM work stays in `loop()`. A separate task breaks BT connectability (A/B test 2026-09-22) |
 | classic | `DIAG_FRAG_TRACE` | `FRAG:` heap line every second |

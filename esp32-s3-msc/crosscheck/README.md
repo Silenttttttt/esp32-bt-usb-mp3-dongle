@@ -1,6 +1,6 @@
 # S3 firmware cross-checks (host-only, no ESP32 hardware needed)
 
-**For the v2 car build, the tests that matter are `live_serve_test.cpp` (run it after any change
+**For the v2 car build, the tests that matter are `pcm_crc_test.cpp` (the link's CRC and loss concealment; run it after touching `common/link_protocol.h` or `common/pcm_conceal.h`), `live_serve_test.cpp` (run it after any change
 to `fat_disk_shared.h`) and `lfn_image_test.cpp` without a title (the real disk layout: 3 ×
 `Stream.mp3`, checked with `fsck.fat`).** Both are at the end of this file. The sections before
 them date from 2026-09-17, before the S3 board existed. They check the v1 offset-served ring
@@ -203,3 +203,15 @@ firmware. With a title, fsck.fat must list `/Arctic Monkeys - 505.mp3 (ARCTIC~1.
 2026-09-25 with an empty title, ASCII, non-ASCII with forbidden characters, and a 300-char title
 (truncated to 255). The single-file build's metadata is byte-identical to before, apart from the
 per-boot volume serial.
+
+## PCM link CRC + loss concealment (`Q` frames, `common/pcm_conceal.h`)
+
+```
+g++ -O2 -std=c++17 -Wall -o pcm_crc_test pcm_crc_test.cpp && ./pcm_crc_test
+```
+Encodes ~46 s of two-tone PCM as `Q` frames, sprays 40 bursts of 1-300 garbage bytes over the
+wire (a wobbling plug), and parses it with a copy of `link_task`'s logic. Must print `ALL OK`:
+CRC check value 0x29B1, a clean stream bit-exact, every received frame an original frame, no
+sample step bigger than the signal's own, at most one replacement per burst, and the same
+corruption through the old `P` path producing full-scale steps. 2026-10-05: 40/40 bursts caught,
+max step 2501 = the signal's (old path: 65118).

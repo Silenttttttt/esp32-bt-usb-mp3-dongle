@@ -33,9 +33,12 @@ A direct ground wire between the boards is required.
 1. **Phone → classic.** The classic is an A2DP sink. Its PCM callback copies each chunk into one
    of three 4 KB slots; `loop()` drains them (`DIAG_LOOP_DRAIN`: a separate task broke Bluetooth
    connectability). Chunks larger than a slot are split across slots.
-2. **Classic → S3.** The classic downmixes to mono 44.1 kHz and sends it as `P` frames
-   (`common/link_protocol.h`) at 2 Mbaud, ~89 KB/s, 45% of the link. When the phone is silent
-   or disconnected, it sends silence, so the stream never stops.
+2. **Classic → S3.** The classic downmixes to mono 44.1 kHz and sends it as `Q` frames
+   (`common/link_protocol.h`) at 2 Mbaud, ~89 KB/s, 45% of the link. Each frame carries a CRC-16.
+   A frame corrupted on the wire is dropped and replaced by a ~23 ms fade to silence, and the next
+   good frame fades back in (`common/pcm_conceal.h`). Without this, flipped bits went straight to
+   the encoder as full-scale cracks. When the phone is silent or disconnected, the classic sends
+   silence, so the stream never stops.
 3. **Encoding on the S3.** The S3 runs Shine (`common/mp3_pipeline.h`) at 128 kbps mono, 18-25%
    of one core. It appends the MP3 frames to the ring. The encoder used to run on the classic,
    where its ~80 KB starved Bluetooth and AVRCP (`ENCODE_ON_S3` moved it).
@@ -116,6 +119,18 @@ USB ports. Power going *out* through that pin has already dropped below 5 V. Cla
 (it doesn't cross the diode). S3 → classic gave a brownout boot every time, whatever the charger:
 the limit is a fixed voltage drop, not current. Fixes exist but weren't pursued: a third 5 V
 source split to both boards, or bridging D7 (losing its port isolation).
+
+**Mounting in the car (2026-10-05).** On rough roads the audio crackled. Jiggling the classic's
+micro-USB power plug reproduces it. A momentary contact loss sags the classic's supply and ground,
+which corrupts bits on the 2 Mbaud audio wire. The firmware now hides those errors (CRC above), but
+the plug is still the cause. In order of effect per effort:
+
+| Fix | Effort | Why |
+|---|---|---|
+| Strain-relieve the micro-USB plug: hot glue or a zip tie so the cable can't lever it | 5 min | The plug only loses contact when the cable moves it |
+| 470-1000 µF electrolytic across the classic's 5V and GND pins | 10 min, solder | Rides through contact dropouts of several ms (1000 µF at ~150 mA: ~9 ms before 3.3 V regulation is lost) |
+| Feed 5 V to the classic's 5V/GND header pins (soldered) instead of the micro USB | 15 min, solder | Removes the connector. Check first that the USB-serial chip doesn't load TX0 when it's unpowered |
+| Mount both boards firmly; keep the audio wire and its ground short and twisted together | 10 min | Less movement and less pickup on the 2 Mbaud wire |
 
 Open: with the car off, USB goes to suspend but the port may stay powered. Draw in that state
 isn't measured.

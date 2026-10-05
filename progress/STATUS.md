@@ -5923,3 +5923,25 @@ Muni tested the v2 build with 32 KB clusters (3 files of 44.6 MB, 133.7 MB FAT12
 Kenwood: "32 was a success". Docs updated (README, CLAUDE.md, BUILD_FLAGS.md). Still open for a
 car test: the green USB-suspended LED, a real second phone pairing, Next-while-paused resumes.
 Project paused here until new bugs show up.
+
+### 2026-10-05 -- Crackle on rough roads: CRC on the PCM link + loss concealment
+
+After a few days of use Muni reported crackle on rough roads, and that jiggling the micro USB (the
+classic's power plug) reproduces it. Mechanism: a momentary contact loss sags the classic's
+supply/ground, which corrupts bytes on the 2 Mbaud PCM wire. `P` frames had no check, so flipped
+bits went straight into the S3's encoder as full-scale spikes; a hit header caused a resync gap.
+
+Firmware (both boards, flash together): new `Q` frame = `P` + CRC-16/CCITT-FALSE over type, length
+and payload (`common/link_protocol.h`). The S3 drops a frame that fails, encodes a ~23 ms
+fade-to-silence in its place (one per loss burst, also on a bad header mid-stream), and fades the
+next good frame in (`common/pcm_conceal.h`). Heartbeat `[s3] enc:` gains `crc_bad= concealed=`.
+The S3 still accepts `P`; an old S3 rejects `Q` (blinking white). `logs/serial_logger.py` reads `Q`.
+
+Verified: `crosscheck/pcm_crc_test.cpp`: 40 garbage bursts, all caught, output max sample step
+2501 = the signal's own (old path: 65118). Both firmwares compile with their flash-script flags
+(S3 static RAM +4 KB). NOT yet on hardware: the boards are in the car. Bench check when they're
+back: flash both, play, jiggle the micro USB with the S3 logger attached; expect `crc_bad` to climb
+and soft dropouts instead of cracks.
+
+Hardware recommendations (the real fix) are in ARCHITECTURE.md's Power section: strain-relieve
+the plug, a 470-1000 µF cap on the classic's 5V/GND, or solder power to the header pins.
