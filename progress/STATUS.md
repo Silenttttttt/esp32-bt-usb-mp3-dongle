@@ -5967,3 +5967,10 @@ Software-only follow-up to the CRC change (Muni: "lets focus on non physical thi
 
 Verified: pcm_crc_test ALL OK (numbers in crosscheck/README.md); live_serve_test ALL OK; both
 firmwares compile (S3 38% flash, 25% RAM). Not on hardware yet; flash both boards together.
+
+Fix before it ever ran (found reviewing the counters): the S3's UART interrupt is not in IRAM
+(`CONFIG_UART_ISR_IN_IRAM` unset in the 3.3.11 core), so an NVS write mid-music would overflow the
+128-byte RX FIFO (0.64 ms at 2 Mbaud) and drop a frame -- whose new error would trigger the next
+save a minute later. Totals are now saved only after 10 s of silence or on USB suspend (car off);
+errors within 500 ms of a save count as `self_inflicted`. The boot-time `boots` write happens
+before `LinkSerial.begin()`.

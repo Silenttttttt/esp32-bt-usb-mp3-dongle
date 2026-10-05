@@ -308,22 +308,35 @@ static volatile uint32_t g_pcm_last_ms = 0;
 // lifetime totals kept in NVS so a drive with no laptop can be checked later.
 static PcmLinkRx g_link_rx;
 static Preferences g_link_prefs;
-static uint32_t g_saved_crc_bad = 0, g_saved_lost = 0, g_saved_outages = 0, g_boots = 0;
+static uint32_t g_saved_crc_bad = 0, g_saved_lost = 0, g_saved_outages = 0, g_saved_self = 0, g_boots = 0;
 
-// Lifetime totals = what NVS had at boot + this session. Saved at most once a
-// minute and only when they changed (a flash write briefly stalls
-// flash-resident code; the radio's ~3.7 s read-ahead absorbs that).
-static void link_totals_save(bool force) {
-  static uint32_t last_ms = 0, last_sum = 0;
+// Lifetime totals = what NVS had at boot + this session, saved when they
+// changed, at most once a minute, and ONLY while nothing audible can be lost:
+// after 10 s of silence (AUDIO_SILENCE from the classic) or with the USB bus
+// suspended (car off). A flash write stalls flash-resident interrupt handlers,
+// and the UART's isn't in IRAM (CONFIG_UART_ISR_IN_IRAM is off in this core):
+// at 2 Mbaud the 128-byte RX FIFO overflows in 0.64 ms, so a save mid-music
+// would itself drop a frame -- and that new error would trigger the next
+// save. Errors in the 500 ms after a save are counted as self_inflicted, not
+// as link errors.
+static uint32_t g_self_inflicted = 0;
+static void link_totals_save(bool quiet_now) {
+  static uint32_t last_ms = 0, last_sum = 0, check_ms = 0, snap_sum = 0;
   uint32_t sum = g_link_rx.crc_bad + g_link_rx.lost_frames + g_link_rx.outages;
-  if (!force && (sum == last_sum || millis() - last_ms < 60000)) return;
+  if (check_ms && millis() - check_ms > 500) {  // settle the window after a save
+    if (sum > snap_sum) g_self_inflicted += sum - snap_sum;
+    check_ms = 0;
+  }
+  if (!quiet_now || check_ms || sum - g_self_inflicted == last_sum || millis() - last_ms < 60000) return;
   last_ms = millis();
-  last_sum = sum;
+  last_sum = sum - g_self_inflicted;
   g_link_prefs.putUInt("crc_bad", g_saved_crc_bad + g_link_rx.crc_bad);
   g_link_prefs.putUInt("lost", g_saved_lost + g_link_rx.lost_frames);
   g_link_prefs.putUInt("outages", g_saved_outages + g_link_rx.outages);
+  g_link_prefs.putUInt("self", g_saved_self + g_self_inflicted);
+  check_ms = millis();
+  snap_sum = g_link_rx.crc_bad + g_link_rx.lost_frames + g_link_rx.outages;
 }
-
 static void encode_pcm(const uint8_t *pcm, uint32_t len) {
   uint32_t t0 = micros();
   g_s3_encoder.write_mono(pcm, len);
@@ -517,11 +530,12 @@ void setup() {
   g_saved_crc_bad = g_link_prefs.getUInt("crc_bad", 0);
   g_saved_lost = g_link_prefs.getUInt("lost", 0);
   g_saved_outages = g_link_prefs.getUInt("outages", 0);
+  g_saved_self = g_link_prefs.getUInt("self", 0);
   g_boots = g_link_prefs.getUInt("boots", 0) + 1;
   g_link_prefs.putUInt("boots", g_boots);
-  Serial.printf("[s3] link lifetime: boots=%lu crc_bad=%lu lost_frames=%lu outages=%lu\n",
+  Serial.printf("[s3] link lifetime: boots=%lu crc_bad=%lu lost_frames=%lu outages=%lu (self_inflicted=%lu)\n",
                 (unsigned long)g_boots, (unsigned long)g_saved_crc_bad,
-                (unsigned long)g_saved_lost, (unsigned long)g_saved_outages);
+                (unsigned long)g_saved_lost, (unsigned long)g_saved_outages, (unsigned long)g_saved_self);
 #endif
   // Prime the ring with pre-encoded silence up front -- same fix as
   // fat12_disk.py's __init__, same rationale (see CLAUDE.md/STATUS.md):
@@ -950,10 +964,11 @@ void loop() {
     if (++heartbeat_n % 60 == 0) {
       print_build_line();
 #ifdef ENCODE_ON_S3
-      Serial.printf("[s3] link lifetime: boots=%lu crc_bad=%lu lost_frames=%lu outages=%lu\n",
+      Serial.printf("[s3] link lifetime: boots=%lu crc_bad=%lu lost_frames=%lu outages=%lu (self_inflicted=%lu)\n",
                     (unsigned long)g_boots, (unsigned long)(g_saved_crc_bad + g_link_rx.crc_bad),
                     (unsigned long)(g_saved_lost + g_link_rx.lost_frames),
-                    (unsigned long)(g_saved_outages + g_link_rx.outages));
+                    (unsigned long)(g_saved_outages + g_link_rx.outages),
+                    (unsigned long)(g_saved_self + g_self_inflicted));
 #endif
     }
     Serial.printf("[s3] link heartbeat: bytes_read=%lu frames_ok=%lu frames_bad=%lu "
@@ -983,7 +998,13 @@ void loop() {
                     (unsigned long)n, (unsigned long)pcm,
                     (unsigned long)(n ? sum / n : 0), (unsigned long)mx,
                     (unsigned long)g_link_rx.crc_bad, (unsigned long)g_link_rx.lost_frames);
-      link_totals_save(false);
+      {
+        static uint32_t silent_since_ms = 0;
+        if (g_s3_audio_live) silent_since_ms = 0;
+        else if (!silent_since_ms) silent_since_ms = millis();
+        bool quiet = g_usb_suspended || (silent_since_ms && millis() - silent_since_ms > 10000);
+        link_totals_save(quiet);
+      }
     }
 #endif
 #ifdef FATDISK_ALWAYS_SERVE_LIVE
