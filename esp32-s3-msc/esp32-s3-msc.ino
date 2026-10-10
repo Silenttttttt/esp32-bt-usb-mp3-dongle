@@ -1093,9 +1093,9 @@ void loop() {
                     (unsigned long)n, (unsigned long)pcm,
                     (unsigned long)(n ? sum / n : 0), (unsigned long)mx);
 #ifdef LINK_Q
-      Serial.printf("[s3] linkq: crc_bad=%lu lost_frames=%lu outages=%lu\n",
+      Serial.printf("[s3] linkq: crc_bad=%lu lost_frames=%lu silence_frames=%lu outages=%lu\n",
                     (unsigned long)g_link_rx.crc_bad, (unsigned long)g_link_rx.lost_frames,
-                    (unsigned long)g_link_rx.outages);
+                    (unsigned long)g_link_rx.silence_frames, (unsigned long)g_link_rx.outages);
 #endif
 #ifdef LINK_DIAG
       {

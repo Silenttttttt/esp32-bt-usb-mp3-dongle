@@ -12,12 +12,17 @@
 
 class PcmLinkRx {
  public:
-  static const uint32_t MAX_GAP_FRAMES = 16;  // ~93 ms; more is an outage, not a glitch
-  static const uint32_t OUTAGE_MS = 100;      // no PCM this long: fade in from silence
+  static const uint32_t MAX_GAP_FRAMES = 16;  // ~93 ms: filled with concealment
+  // Longer gaps (up to the 8-bit sequence's 255 frames, ~1.48 s) are filled
+  // with silence of exactly the missing length, if the time that passed agrees
+  // with the gap (so it was lost data, not the classic restarting with a new
+  // sequence). Keeps the S3's live cushion from shrinking. Otherwise: outage.
+  static const uint32_t FRAME_US = LINK_Q_MAX_PCM / 2 * 1000000ULL / 44100;  // 5805 us
 
   uint32_t crc_bad = 0;      // 'Q' frames that failed their CRC
   uint32_t lost_frames = 0;  // frames filled with concealment (from sequence gaps)
-  uint32_t outages = 0;      // gaps too long to fill (faded in from silence)
+  uint32_t outages = 0;      // gaps not filled (stream restarted; faded in from silence)
+  uint32_t silence_frames = 0;  // frames filled with silence (gaps of 17..255 frames)
   // Loss runs by length in frames: 1, 2, 3-4, 5-8, 9-16 (longer = outages).
   uint32_t runs[5] = {0, 0, 0, 0, 0};
   uint32_t last_gap = 0;     // frames missing before the latest good frame
@@ -30,8 +35,19 @@ class PcmLinkRx {
   void on_good(uint8_t seq, uint8_t *pcm, uint32_t len, uint32_t now_ms, Emit emit) {
     if (have_seq_) {
       uint8_t gap = (uint8_t)(seq - (uint8_t)(last_seq_ + 1));
-      if (now_ms - last_ms_ > OUTAGE_MS || gap > MAX_GAP_FRAMES) {
-        if (gap) { outages++; conceal_.outage(); }
+      uint32_t elapsed_ms = now_ms - last_ms_;
+      uint32_t expect_ms = (uint32_t)((gap + 1) * FRAME_US / 1000);
+      bool time_agrees = elapsed_ms <= expect_ms + 60 && elapsed_ms + 60 >= expect_ms / 2;
+      if (gap > MAX_GAP_FRAMES && time_agrees) {
+        // concealment fades out within the first frames; the rest is silence
+        for (uint32_t f = 0; f < gap; f++) {
+          conceal_.lost(fill_, LINK_Q_MAX_PCM / 2);
+          emit(fill_, LINK_Q_MAX_PCM);
+        }
+        silence_frames += gap;
+      } else if (gap && !time_agrees) {
+        outages++;
+        conceal_.outage();
       } else if (gap) {
         for (uint32_t f = 0; f < gap; f++) {
           conceal_.lost(fill_, LINK_Q_MAX_PCM / 2);

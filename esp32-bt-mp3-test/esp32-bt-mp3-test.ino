@@ -380,29 +380,45 @@ Mp3Pipeline mp3_out(serial_sink);  // the shared encoder, output as 'A' frames
 // LINK_Q (opt-in, both boards): 'Q' frames (link_protocol.h): PCM split into LINK_Q_MAX_PCM-byte pieces, each
 // with a sequence number and a CRC-16, so the S3 can drop a piece corrupted
 // on the wire and fill exactly the audio that went missing.
-static void send_pcm_crc(const uint8_t *pcm, uint32_t len) {
+static void send_q_frame(const uint8_t *pcm, uint32_t n) {
   static uint8_t seq = 0;
+  uint32_t plen = n + 1;
+  uint8_t header[7];
+  header[0] = FRAME_MAGIC;
+  header[1] = (uint8_t)LINK_FRAME_PCM_CRC;
+  header[2] = (plen >> 24) & 0xFF;
+  header[3] = (plen >> 16) & 0xFF;
+  header[4] = (plen >> 8) & 0xFF;
+  header[5] = plen & 0xFF;
+  header[6] = seq++;
+  uint16_t crc = link_crc16(header + 1, 6);
+  crc = link_crc16(pcm, n, crc);
+  uint8_t trailer[2] = {(uint8_t)(crc >> 8), (uint8_t)(crc & 0xFF)};
+  xSemaphoreTakeRecursive(serial_mutex, portMAX_DELAY);
+  Serial.write(header, 7);
+  Serial.write(pcm, n);
+  Serial.write(trailer, 2);
+  xSemaphoreGiveRecursive(serial_mutex);
+}
+
+// Every 'Q' frame carries exactly LINK_Q_MAX_PCM bytes (5.8 ms): the remainder
+// of a chunk waits for the next one (adds < 5.8 ms). With every frame the same
+// length, the S3 fills exactly the audio that went missing: no drift.
+static void send_pcm_crc(const uint8_t *pcm, uint32_t len) {
+  static uint8_t pend[LINK_Q_MAX_PCM];
+  static uint32_t pend_n = 0;
   while (len) {
-    uint32_t n = len < LINK_Q_MAX_PCM ? len : LINK_Q_MAX_PCM;
-    uint32_t plen = n + 1;
-    uint8_t header[7];
-    header[0] = FRAME_MAGIC;
-    header[1] = (uint8_t)LINK_FRAME_PCM_CRC;
-    header[2] = (plen >> 24) & 0xFF;
-    header[3] = (plen >> 16) & 0xFF;
-    header[4] = (plen >> 8) & 0xFF;
-    header[5] = plen & 0xFF;
-    header[6] = seq++;
-    uint16_t crc = link_crc16(header + 1, 6);
-    crc = link_crc16(pcm, n, crc);
-    uint8_t trailer[2] = {(uint8_t)(crc >> 8), (uint8_t)(crc & 0xFF)};
-    xSemaphoreTakeRecursive(serial_mutex, portMAX_DELAY);
-    Serial.write(header, 7);
-    Serial.write(pcm, n);
-    Serial.write(trailer, 2);
-    xSemaphoreGiveRecursive(serial_mutex);
-    pcm += n;
-    len -= n;
+    uint32_t take = LINK_Q_MAX_PCM - pend_n;
+    if (take > len) take = len;
+    if (pend_n == 0 && take == LINK_Q_MAX_PCM) {
+      send_q_frame(pcm, LINK_Q_MAX_PCM);  // whole frame straight from the caller
+    } else {
+      memcpy(pend + pend_n, pcm, take);
+      pend_n += take;
+      if (pend_n == LINK_Q_MAX_PCM) { send_q_frame(pend, LINK_Q_MAX_PCM); pend_n = 0; }
+    }
+    pcm += take;
+    len -= take;
   }
 }
 #endif

@@ -52,21 +52,32 @@ static std::vector<uint8_t> make_pcm(int chunks, int kind) {
   return pcm;
 }
 
-// The classic's send_pcm_crc().
-static void send_q(std::vector<uint8_t> &wire, uint8_t &seq, const uint8_t *pcm, uint32_t len) {
-  while (len) {
-    uint32_t n = len < LINK_Q_MAX_PCM ? len : LINK_Q_MAX_PCM, plen = n + 1;
+// The classic's send_pcm_crc(): exactly LINK_Q_MAX_PCM bytes per frame, the
+// remainder of a chunk carried into the next.
+struct QSender {
+  uint8_t seq = 0, pend[LINK_Q_MAX_PCM];
+  uint32_t pend_n = 0;
+  void frame(std::vector<uint8_t> &wire, const uint8_t *pcm) {
+    uint32_t plen = LINK_Q_MAX_PCM + 1;
     uint8_t h[7] = {MAGIC, (uint8_t)LINK_FRAME_PCM_CRC, (uint8_t)(plen >> 24), (uint8_t)(plen >> 16),
                     (uint8_t)(plen >> 8), (uint8_t)plen, seq++};
-    uint16_t crc = link_crc16(pcm, n, link_crc16(h + 1, 6));
+    uint16_t crc = link_crc16(pcm, LINK_Q_MAX_PCM, link_crc16(h + 1, 6));
     wire.insert(wire.end(), h, h + 7);
-    wire.insert(wire.end(), pcm, pcm + n);
+    wire.insert(wire.end(), pcm, pcm + LINK_Q_MAX_PCM);
     wire.push_back(crc >> 8);
     wire.push_back(crc & 0xFF);
-    pcm += n;
-    len -= n;
   }
-}
+  void send(std::vector<uint8_t> &wire, const uint8_t *pcm, uint32_t len) {
+    while (len) {
+      uint32_t take = std::min(LINK_Q_MAX_PCM - pend_n, len);
+      memcpy(pend + pend_n, pcm, take);
+      pend_n += take;
+      if (pend_n == LINK_Q_MAX_PCM) { frame(wire, pend); pend_n = 0; }
+      pcm += take;
+      len -= take;
+    }
+  }
+};
 
 static void send_p(std::vector<uint8_t> &wire, const uint8_t *pcm, uint32_t len) {
   uint8_t h[6] = {MAGIC, (uint8_t)LINK_FRAME_PCM, (uint8_t)(len >> 24), (uint8_t)(len >> 16), (uint8_t)(len >> 8), (uint8_t)len};
@@ -153,8 +164,13 @@ int main() {
     int src_step = max_step(src);
 
     std::vector<uint8_t> clean;
-    uint8_t seq = 0;
-    for (int c = 0; c < CHUNKS; c++) send_q(clean, seq, &src[c * CHUNK], CHUNK);
+    QSender qs;
+    // uneven chunks, like phone packets split across slots (1552 + 496 B pattern)
+    for (size_t off = 0, k = 0; off < src.size(); k++) {
+      uint32_t n = std::min<size_t>(k % 2 ? 496 : 1552, src.size() - off);
+      qs.send(clean, &src[off], n);
+      off += n;
+    }
 
     printf("== signal: %s ==\nClean 'Q' stream\n", kind ? "chord + noise" : "two tones");
     {
@@ -208,6 +224,38 @@ int main() {
     int p_step = max_step(old.pcm);
     printf("  max step: %d\n", p_step);
     check(p_step > 4 * src_step, "spikes get through without the CRC (the test can see them)");
+  }
+
+  printf("Long gaps: 40 frames lost in a row (232 ms), time consistent\n");
+  {
+    std::vector<uint8_t> src = make_pcm(200, 0), wire;
+    QSender qs;
+    qs.send(wire, src.data(), src.size());
+    // cut frames 100..139 out of the wire (each 'Q' frame is 7+512+2 bytes)
+    const size_t F = 7 + LINK_Q_MAX_PCM + 2;
+    wire.erase(wire.begin() + 100 * F, wire.begin() + 140 * F);
+    // parse() derives time from byte position; insert idle time by padding
+    // the gap with non-magic filler bytes worth 232 ms at 2 Mbaud
+    wire.insert(wire.begin() + 100 * F, 232 * 200, (uint8_t)0x00);
+    Out o;
+    parse(wire, o);
+    printf("  silence_frames=%u lost_frames=%u outages=%u out=%zu in=%zu\n", o.rx.silence_frames, o.rx.lost_frames,
+           o.rx.outages, o.pcm.size(), src.size());
+    check(o.rx.silence_frames == 40 && o.rx.outages == 0 && o.pcm.size() == src.size(),
+          "a 232 ms gap is filled with exactly 232 ms (cushion keeps its size)");
+  }
+  printf("Restart: sequence jumps with a time gap that doesn't match\n");
+  {
+    std::vector<uint8_t> src = make_pcm(100, 0), wire;
+    QSender a1, a2;
+    a1.send(wire, src.data(), src.size() / 2);
+    wire.insert(wire.end(), 3 * 200000, (uint8_t)0x00);  // 3 s of nothing
+    a2.seq = 7;  // a fresh classic boot starts its sequence anew
+    a2.send(wire, src.data() + src.size() / 2, src.size() / 2);
+    Out o;
+    parse(wire, o);
+    check(o.rx.outages == 1 && o.rx.silence_frames == 0 && o.rx.lost_frames == 0,
+          "a 3 s stop is an outage, not filled (the S3's underrun handles it)");
   }
 
   printf("LINK_DIAG helpers\n");
