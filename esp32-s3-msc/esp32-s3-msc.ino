@@ -73,7 +73,8 @@
 #error "LINK_TOTALS needs LINK_Q"
 #endif
 #ifdef LINK_Q
-#include "../common/pcm_link_rx.h"    // 'Q' frames: fills PCM lost on the wire (pcm_conceal.h)
+#include "../common/pcm_link_rx.h"    // 'R' frames: fills PCM lost on the wire (pcm_conceal.h)
+#include "../common/link_rx_parser.h" // CRC-32 check, one-bit correction, rescan
 #endif
 #ifdef LINK_DIAG
 #include "../common/link_diag.h"      // spike meter + single-bit check (opt-in debug)
@@ -334,7 +335,7 @@ static PcmLinkRx g_link_rx;
 // loss-run lengths. Printed once a second when anything happened (else every
 // 10 s), plus one line per loss event (rate-limited).
 static PcmSpikeMeter g_diag_spikes;
-static volatile uint32_t g_diag_hdr_bad = 0, g_diag_crc_single = 0;
+static volatile uint32_t g_diag_hdr_bad = 0;
 static uint32_t g_diag_events_this_s = 0, g_diag_events_s = 0;
 static void diag_event(const char *what, uint32_t a, uint32_t b) {
   uint32_t s = millis() / 1000;
@@ -386,9 +387,42 @@ static void encode_pcm(const uint8_t *pcm, uint32_t len) {
 }
 #endif
 
+#ifdef LINK_Q
+// The shared parser (common/link_rx_parser.h): CRC-32, one-bit correction,
+// rescan after a failed frame. Static: it holds a 4 KB pushback buffer.
+struct LinkUartSrc {
+  void read(uint8_t *buf, uint32_t n) { read_exact(buf, n); }
+};
+static LinkUartSrc g_link_src;
+static LinkParser<LinkUartSrc> g_link_parser(g_link_src, false);  // only C and R
+#endif
+
 static void link_task(void *) {
   static uint8_t payload[MAX_FRAME_LEN];
   while (true) {
+#ifdef LINK_Q
+    LinkFrame lf = g_link_parser.next(payload, MAX_FRAME_LEN);
+    if (lf.bad_header) {
+      g_link_frames_bad++;
+#ifdef LINK_DIAG
+      g_diag_hdr_bad++;
+#endif
+      continue;
+    }
+    if (lf.crc_bad) {
+      g_link_rx.on_crc_bad();
+      g_link_frames_bad++;
+#ifdef LINK_DIAG
+      diag_event("crc_fail uncorrectable", 0, 0);
+#endif
+      continue;  // the next good frame's sequence number says how much to fill
+    }
+#ifdef LINK_DIAG
+    if (lf.corrected) diag_event("crc_fail corrected", payload[0], 0);
+#endif
+    char frame_type = lf.type;
+    uint32_t length = lf.len;
+#else
     find_sync();
     uint8_t header[5];
     read_exact(header, 5);
@@ -399,9 +433,6 @@ static void link_task(void *) {
     bool known = frame_type == LINK_FRAME_MP3 || frame_type == LINK_FRAME_CONTROL;
 #ifdef ENCODE_ON_S3
     known = known || frame_type == LINK_FRAME_PCM;
-#endif
-#ifdef LINK_Q
-    known = known || (frame_type == LINK_FRAME_PCM_CRC && link_q_len_ok(length));
 #endif
     if (!known || length > MAX_FRAME_LEN) {
       g_link_frames_bad++;
@@ -419,26 +450,7 @@ static void link_task(void *) {
       continue;  // bad header -- rescan from find_sync(), same as the Python side
     }
     if (length) read_exact(payload, length);
-#ifdef LINK_Q
-    if (frame_type == LINK_FRAME_PCM_CRC) {
-      uint8_t trailer[2];
-      read_exact(trailer, 2);
-      if (!link_q_crc_ok(header, payload, length, trailer)) {
-#ifdef LINK_DIAG
-        {
-          uint16_t calc = link_crc16(payload, length, link_crc16(header, 5));
-          uint16_t syn = calc ^ (uint16_t)((trailer[0] << 8) | trailer[1]);
-          bool single = link_crc16_single_bit(syn, (5 + length) * 8);
-          if (single) g_diag_crc_single++;
-          diag_event(single ? "crc_fail single_bit" : "crc_fail multi_bit", payload[0], length);
-        }
-#endif
-        g_link_rx.on_crc_bad();
-        g_link_frames_bad++;
-        continue;  // the sequence number of the next good frame says how much to fill
-      }
-    }
-#endif
+#endif  // LINK_Q
     g_link_last_frame_ms = millis();
 
     if (frame_type == LINK_FRAME_MP3) {
@@ -1101,17 +1113,18 @@ void loop() {
       {
         static uint32_t prev_hdr = 0, prev_err[6] = {0}, quiet_s = 0;
 #ifdef LINK_Q
-        static uint32_t prev_crc = 0, prev_single = 0, prev_runs[5] = {0}, prev_out = 0;
+        static uint32_t prev_crc = 0, prev_fix = 0, prev_fixt = 0, prev_01 = 0, prev_10 = 0, prev_runs[5] = {0}, prev_out = 0;
 #endif
         uint32_t d_hdr = g_diag_hdr_bad - prev_hdr, d_frame = g_uart_errs[4] - prev_err[4],
                  d_par = g_uart_errs[5] - prev_err[5], d_brk = g_uart_errs[1] - prev_err[1],
                  d_ovf = g_uart_errs[3] - prev_err[3], d_full = g_uart_errs[2] - prev_err[2];
         bool any = d_hdr || d_frame || d_par || d_brk || d_ovf || d_full || g_diag_spikes.spikes;
 #ifdef LINK_Q
-        uint32_t d_crc = g_link_rx.crc_bad - prev_crc, d_single = g_diag_crc_single - prev_single,
-                 d_out = g_link_rx.outages - prev_out, d_runs[5];
+        uint32_t d_crc = g_link_rx.crc_bad - prev_crc, d_fix = g_link_parser.corrected_data - prev_fix,
+                 d_fixt = g_link_parser.corrected_trailer - prev_fixt, d_01 = g_link_parser.flips_0to1 - prev_01,
+                 d_10 = g_link_parser.flips_1to0 - prev_10, d_out = g_link_rx.outages - prev_out, d_runs[5];
         for (int i = 0; i < 5; i++) { d_runs[i] = g_link_rx.runs[i] - prev_runs[i]; any = any || d_runs[i]; }
-        any = any || d_crc || d_out;
+        any = any || d_crc || d_out || d_fix || d_fixt;
 #endif
         if (any || ++quiet_s >= 10) {
           quiet_s = 0;
@@ -1120,8 +1133,9 @@ void loop() {
                         (unsigned long)d_frame, (unsigned long)d_par, (unsigned long)d_brk, (unsigned long)d_ovf,
                         (unsigned long)d_full);
 #ifdef LINK_Q
-          Serial.printf(" crc_bad=%lu single_bit=%lu runs[1,2,3-4,5-8,9-16]=%lu,%lu,%lu,%lu,%lu outages=%lu",
-                        (unsigned long)d_crc, (unsigned long)d_single, (unsigned long)d_runs[0],
+          Serial.printf(" lost_crc=%lu fixed=%lu(+%lu crc-field) flips0to1=%lu 1to0=%lu runs[1,2,3-4,5-8,9-16]=%lu,%lu,%lu,%lu,%lu outages=%lu",
+                        (unsigned long)d_crc, (unsigned long)d_fix, (unsigned long)d_fixt, (unsigned long)d_01,
+                        (unsigned long)d_10, (unsigned long)d_runs[0],
                         (unsigned long)d_runs[1], (unsigned long)d_runs[2], (unsigned long)d_runs[3],
                         (unsigned long)d_runs[4], (unsigned long)d_out);
 #endif
@@ -1130,7 +1144,9 @@ void loop() {
         prev_hdr = g_diag_hdr_bad;
         for (int i = 0; i < 6; i++) prev_err[i] = g_uart_errs[i];
 #ifdef LINK_Q
-        prev_crc = g_link_rx.crc_bad; prev_single = g_diag_crc_single; prev_out = g_link_rx.outages;
+        prev_crc = g_link_rx.crc_bad; prev_out = g_link_rx.outages;
+        prev_fix = g_link_parser.corrected_data; prev_fixt = g_link_parser.corrected_trailer;
+        prev_01 = g_link_parser.flips_0to1; prev_10 = g_link_parser.flips_1to0;
         for (int i = 0; i < 5; i++) prev_runs[i] = g_link_rx.runs[i];
 #endif
         g_diag_spikes.reset();

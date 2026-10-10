@@ -32,6 +32,7 @@ class PcmConceal {
   void lost(uint8_t *out, uint32_t samples) {
     if (!concealing_) find_period();
     for (uint32_t i = 0; i < samples; i++) put(out, i, next_cont());
+    remember(out, samples);  // the history is what the encoder got, fills included
     concealing_ = true;
   }
 
@@ -55,17 +56,24 @@ class PcmConceal {
       }
       concealing_ = false;
     }
-    // Shift the new samples into the history.
+    remember(pcm, n);
+    gain_ = FADE_STEPS;
+  }
+
+ private:
+  // Shift samples into the history. 2026-10-10 bug: only good frames went in,
+  // so after a fill the history jumped where the fill should have been, and a
+  // later fill repeating across that point reproduced the jump (found by the
+  // host test's vanished-byte case).
+  void remember(const uint8_t *pcm, uint32_t n) {
     if (n >= HIST) {
       for (uint32_t i = 0; i < HIST; i++) hist_[i] = get(pcm, n - HIST + i);
     } else {
       memmove(hist_, hist_ + n, (HIST - n) * sizeof(int16_t));
       for (uint32_t i = 0; i < n; i++) hist_[HIST - n + i] = get(pcm, i);
     }
-    gain_ = FADE_STEPS;
   }
 
- private:
   static const uint32_t WIN = 256;     // samples matched when looking for the period (5.8 ms)
   static const uint32_t MIN_LAG = 32;  // ~1.4 kHz
   static const uint32_t MAX_LAG = HIST - WIN;
@@ -94,24 +102,21 @@ class PcmConceal {
       }
     }
     period_ = best;
-    pos_ = HIST - period_;
+    memcpy(rep_, hist_ + HIST - period_, period_ * sizeof(int16_t));  // frozen: the history moves on
+    pos_ = 0;
     decay_ = best_corr >= 0.36 ? 1 : FADE_STEPS / FAST_FADE;  // corr >= 0.6
-    start_join();
-  }
-
-  // The repeat restarts at hist_[HIST - period_]; offset it toward the sample
-  // it should follow (the newest one), decaying over JOIN samples.
-  void start_join() {
+    // Each restart of the period follows its own last sample (the newest
+    // good one at first); offset it toward that, decaying over JOIN samples.
     join_off_ = (int32_t)hist_[HIST - 1] - (int32_t)hist_[HIST - period_ - 1];
     join_n_ = 0;
   }
 
   int16_t next_cont() {
-    int32_t v = hist_[pos_];
+    int32_t v = rep_[pos_];
     if (join_n_ < JOIN) { v += join_off_ * (int32_t)(JOIN - join_n_) / (int32_t)JOIN; join_n_++; }
     v = v * gain_ / FADE_STEPS;
     gain_ = gain_ > decay_ ? gain_ - decay_ : 0;
-    if (++pos_ >= HIST) { pos_ = HIST - period_; start_join(); }
+    if (++pos_ >= period_) { pos_ = 0; join_n_ = 0; }
     if (v > 32767) v = 32767;
     if (v < -32768) v = -32768;
     return (int16_t)v;
@@ -122,6 +127,7 @@ class PcmConceal {
     p[2 * i + 1] = (uint8_t)((uint16_t)v >> 8);
   }
   int16_t hist_[HIST] = {0};
+  int16_t rep_[HIST] = {0};  // the period being repeated
   uint32_t pos_ = 0, period_ = MAX_LAG, join_n_ = JOIN;
   int32_t join_off_ = 0, decay_ = 1;
   int32_t gain_ = 0;  // nothing heard yet: a first loss replays silence

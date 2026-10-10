@@ -377,9 +377,10 @@ Mp3Pipeline mp3_out(serial_sink);  // the shared encoder, output as 'A' frames
 // Every path that hands mono PCM downstream goes through here: encoded on
 // this board (default) or shipped raw to the S3 as 'P' frames (ENCODE_ON_S3).
 #if defined(ENCODE_ON_S3) && defined(LINK_Q)
-// LINK_Q (opt-in, both boards): 'Q' frames (link_protocol.h): PCM split into LINK_Q_MAX_PCM-byte pieces, each
+// LINK_Q (opt-in, both boards): 'R' frames (link_protocol.h): PCM split into LINK_Q_MAX_PCM-byte pieces, each
 // with a sequence number and a CRC-16, so the S3 can drop a piece corrupted
 // on the wire and fill exactly the audio that went missing.
+// One 'R' frame (link_protocol.h): magic, 'R', length 513, seq, 512 B PCM, CRC-32.
 static void send_q_frame(const uint8_t *pcm, uint32_t n) {
   static uint8_t seq = 0;
   uint32_t plen = n + 1;
@@ -391,13 +392,12 @@ static void send_q_frame(const uint8_t *pcm, uint32_t n) {
   header[4] = (plen >> 8) & 0xFF;
   header[5] = plen & 0xFF;
   header[6] = seq++;
-  uint16_t crc = link_crc16(header + 1, 6);
-  crc = link_crc16(pcm, n, crc);
-  uint8_t trailer[2] = {(uint8_t)(crc >> 8), (uint8_t)(crc & 0xFF)};
+  uint32_t crc = link_crc32(pcm, n, link_crc32_update(header + 1, 6));
+  uint8_t trailer[4] = {(uint8_t)(crc >> 24), (uint8_t)(crc >> 16), (uint8_t)(crc >> 8), (uint8_t)crc};
   xSemaphoreTakeRecursive(serial_mutex, portMAX_DELAY);
   Serial.write(header, 7);
   Serial.write(pcm, n);
-  Serial.write(trailer, 2);
+  Serial.write(trailer, 4);
   xSemaphoreGiveRecursive(serial_mutex);
 }
 

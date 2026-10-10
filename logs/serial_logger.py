@@ -135,12 +135,12 @@ def run_framed_mode(by_id_path, baud, out_path):
                     del buf[0]
                     n_resyncs += 1
                     continue
-                trailer = 2 if ftype == "Q" else 0  # 'Q' = PCM + CRC-16
+                trailer = {"Q": 2, "R": 4}.get(ftype, 0)  # PCM + CRC-16 ('Q', old) / CRC-32 ('R')
                 if len(buf) < 6 + length + trailer:
                     break
                 payload = bytes(buf[6:6 + length])
                 del buf[:6 + length + trailer]
-                if ftype in ("A", "P", "Q"):  # MP3, or raw PCM with ENCODE_ON_S3
+                if ftype in ("A", "P", "Q", "R"):  # MP3, or raw PCM with ENCODE_ON_S3
                     n_audio_frames += 1
                     n_audio_bytes += length
                 elif ftype == "C":
