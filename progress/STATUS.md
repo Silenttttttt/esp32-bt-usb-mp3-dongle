@@ -6015,3 +6015,15 @@ the frame: every sample becomes noise (the spike storms = the crackle), then PCM
 Implications: `LINK_Q` (CRC + 5.8 ms frames + seq fill) targets exactly this; Hamming/bit correction
 can't (deletions). Physical without solder: parallel jumpers for TX and GND. Next: flash both with
 `--fix-link --diag` and shake again (spikes should go to 0; run histogram decides FEC).
+
+### 2026-10-10 -- `--fix-link` on both boards; replay report; drift fixed
+
+- Both boards flashed `--fix-link --diag` (Muni: go). Link clean at rest (crc_bad 0).
+- Muni heard the audio "going back a second or two". Not us: the phone's own AVRCP position went
+  60.7 -> 59.5 -> 56.3 s at 00:34:42-44 and continued from 56.3 s; no RADIO_CMD relay, no AVRCP
+  command from the classic, no S3 file open, no link errors, cushion steady. The phone app rewound.
+- Drift (found before, now fixed, `LINK_Q`): the classic sends only exact 512-byte frames
+  (remainder carried, < 5.8 ms), so a fill is exactly the lost length; gaps of 17..255 frames get
+  exact-length silence when elapsed time agrees (else outage). Host test: output length == input
+  with uneven chunks, a 232 ms gap, a 3 s restart. `tools/s3_lag.py` prints the live cushion.
+- Reflashed both at the drift fix. Next: shake test, read `[s3] diag`/`linkq` + `tools/s3_lag.py`.
