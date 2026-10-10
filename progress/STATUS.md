@@ -6070,3 +6070,16 @@ Final bench build: both boards `c209365` `--fix-link --diag` (`KNOWN_BUILDS.md`:
 "nearly glitchless now").
 
 Clean build flashed 2026-10-10 01:19: both boards `f978a5d` `--fix-link` (no `--diag`) = `car-candidate-2026-10-10`. Verified: build lines name `LINK_Q` (+ `LINK_TOTALS` on the S3), no debug lines, link clean, PCM 176 frames/s.
+
+### 2026-10-10 -- Event log (`LINK_EVENTS`) replaces the totals
+
+Muni asked whether the saved data survives power-off. It didn't: `LINK_TOTALS` saved only in quiet
+moments, and on the bench music played until each reflash, so every count was lost (boot 2 reached
+crc_bad=173, boot 3 started at 0). Muni: "just save events, not full trash", like a queue. Now
+`LINK_EVENTS` (`esp32-s3-msc/event_log.h`): the last 64 unusual events, 16 B each, in NVS -- link
+damage bursts, link down, abnormal classic restarts, silence served, catch-up jumps, USB
+re-attaches, encoder failure, abnormal S3 reset. Each written once when it ends, while no damage
+episode is open, at most every 10 s, at once on USB suspend. Read with `tools/s3_events.py`
+(opening the port resets the S3 unless the logger holds it; harmless after a drive). Host test
+`event_log_test.cpp`. Hardware check: reflashing the classic logged "link down 14269 ms"; it
+survived an S3 reboot and read back. Both boards: `99f2b49` `--fix-link` (`car-candidate-2026-10-10`).

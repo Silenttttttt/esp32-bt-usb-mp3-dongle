@@ -16,5 +16,5 @@ Started 2026-10-05. Context: progress/STATUS.md (2026-10-05 entries), ARCHITECTU
 | T10 | FEC across frames (24+8, ~190 ms fixed delay) to make remaining losses bit-exact | P2 | Muni's go | parked ("nearly glitchless") | 2026-10-10 | runs mostly 1 frame, max 5-8 |
 | T11 | Phone rewinds ~4 s at ~1:00 into tracks (not us) -- identify the app behavior | P2 | - | todo | 2026-10-10 | evidence in STATUS 2026-10-10 |
 | T12 | False Back relayed at S3 boot (Linux probing) | P1 | - | done (c209365, hardware-verified) | 2026-10-10 | |
-| T13 | Car test of car-candidate-2026-10-10 (flashed on both boards 01:19) | P0 | Muni | todo | 2026-10-10 | boards already have it; reflash: `tools/flash_build.sh car-candidate-2026-10-10 both --fix-link` |
-| T14 | Persistent event log on the S3 (replaces LINK_TOTALS): only unusual events, 64-entry ring in NVS, read with tools/s3_events.py | P0 | - | in progress | 2026-10-10 | Muni: "just save events, not full trash... like a stack or queue" |
+| T13 | Car test of car-candidate-2026-10-10 (99f2b49, on both boards) | P0 | Muni | todo | 2026-10-10 | boards already have it; reflash: `tools/flash_build.sh car-candidate-2026-10-10 both --fix-link` |
+| T14 | Persistent event log on the S3 (replaces LINK_TOTALS): only unusual events, 64-entry ring in NVS, read with tools/s3_events.py | P0 | - | done (99f2b49, hardware-verified) | 2026-10-10 | Muni: "just save events, not full trash... like a stack or queue" |

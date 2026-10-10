@@ -15,7 +15,7 @@ ROOT=$PWD
 
 declare -A BUILDS=(
   [car-2026-09-25]=4cef646   # in the car since 2026-09-25 (32 KB clusters car-verified 09-26); plain flash.sh, v2 flags
-  [car-candidate-2026-10-10]=c209365  # the link fix without debug lines; flash with: both --fix-link
+  [car-candidate-2026-10-10]=99f2b49  # link fix + event log, no debug lines; flash with: both --fix-link
   [bench-2026-10-10-fixlink]=c209365  # bench-verified link fix; flash with: both --fix-link --diag
 )
 
