@@ -12,4 +12,6 @@ Started 2026-10-05. Context: progress/STATUS.md (2026-10-05 entries), ARCHITECTU
 | T6 | Drift fixes: exact 512 B frames, exact-length gap fill | P1 | - | done (flashed, awaiting shake test) | 2026-10-05 | |
 | T7 | Push the local commits (ask first) | P2 | - | todo | 2026-09-26 | 7+ local commits |
 | T8 | One-bit correction (CRC-32 'R' frames) + rescan after a failed frame | P0 | T4 | done (flashed, awaiting shake test) | 2026-10-10 | from shake data: 45% single-bit, runs of 2 |
-| T9 | Shake test with T8; decide on FEC from what's still lost | P0 | T8 | todo | 2026-10-10 | compare: 239 frames / 13 s before |
+| T9 | Shake test with T8; decide on FEC from what's still lost | P0 | T8 | done: 138 vs 239 frames, still audible -> FEC decision (Muni) | 2026-10-10 | compare: 239 frames / 13 s before |
+| T10 | FEC across frames (24+8, ~190 ms fixed delay) to make remaining losses bit-exact | P1 | T9, Muni's go | todo | 2026-10-10 | runs mostly 1 frame, max 5-8 |
+| T11 | Phone rewinds ~4 s at ~1:00 into tracks (not us) -- identify the app behavior | P2 | - | todo | 2026-10-10 | evidence in STATUS 2026-10-10 |

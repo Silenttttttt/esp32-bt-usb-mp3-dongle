@@ -6041,3 +6041,16 @@ the length field isn't trusted; after an uncorrectable frame the bytes after its
 (`common/link_rx_parser.h`). The new test found a real fill bug: the history skipped earlier fills,
 so a later fill could repeat across a jump (15-17k steps); fixed (history = what the encoder got).
 Flashed both (`--fix-link --diag`). Next: shake again and compare with 239 frames / 13 s.
+
+### 2026-10-10 -- Shake with 'R' frames; the phone's own rewinds
+
+Shake (00:59:03-13, 01:00:10-15): spikes 0; 138 frames filled (was 239 for a similar shake), 24
+repaired by one-bit correction, all 24 flips 0 -> 1 (open contact + RX pull-up, as predicted);
+runs mostly 1 frame (61 of 84). Muni heard no difference: the remaining fills (~5% of the audio
+while shaking) are what's audible now. Cushion 0.53-0.90 s over the session, bounded.
+
+"Does it rewind?": our side never serves old audio (live serving only moves forward or holds;
+fills repeat a few ms). The classic logs every command it sends the phone (`CMD_SENT`): today only
+`auto_skip_near_end` (7 s before track ends, intended v2 feature) and one `radio_prev`. The phone,
+with no command from us, repeatedly jumped back at ~1:00 into tracks: 60.3 s -> 56.2 s (7 times)
+and 56.1 s -> 49.2 s (3 times). Phone/app behavior, not the boards.
