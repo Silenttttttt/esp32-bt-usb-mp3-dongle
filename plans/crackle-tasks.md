@@ -10,7 +10,7 @@ Started 2026-10-05. Context: progress/STATUS.md (2026-10-05 entries), ARCHITECTU
 | T4 | Bench session: flash, jiggle the micro USB, read diagnostics | P0 | T3, S3 debug port connected | round 1 done, round 2 blocked on S3 debug port | 2026-10-10 | S3 UART port (5CE5146685) not plugged in |
 | T5 | Pick the fix from T4's data (FEC 24+8, CRC-32 single-bit fix, or physical only) | P1 | T4 | todo | 2026-10-05 | Muni wants one-way, fixed small delay, no growing delay |
 | T6 | Drift fixes: exact 512 B frames, exact-length gap fill | P1 | - | done (flashed, awaiting shake test) | 2026-10-05 | |
-| T7 | Push the local commits (ask first) | P2 | - | todo | 2026-09-26 | 7+ local commits |
+| T7 | Push the local commits (ask first) | P2 | - | done (485a0e8, 2026-10-10) | 2026-09-26 | 7+ local commits |
 | T8 | One-bit correction (CRC-32 'R' frames) + rescan after a failed frame | P0 | T4 | done (flashed, awaiting shake test) | 2026-10-10 | from shake data: 45% single-bit, runs of 2 |
 | T9 | Shake test with T8; decide on FEC from what's still lost | P0 | T8 | done: 138 vs 239 frames, still audible -> FEC decision (Muni) | 2026-10-10 | compare: 239 frames / 13 s before |
 | T10 | FEC across frames (24+8, ~190 ms fixed delay) to make remaining losses bit-exact | P2 | Muni's go | parked ("nearly glitchless") | 2026-10-10 | runs mostly 1 frame, max 5-8 |
