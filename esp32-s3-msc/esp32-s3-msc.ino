@@ -60,17 +60,18 @@
 #ifdef ENCODE_ON_S3
 #include "../common/mp3_pipeline.h"   // the shared encoder (same source the classic uses by default)
 #endif
-// LINK_Q (opt-in, both boards, needs ENCODE_ON_S3): 'Q' frames with a sequence
-// number and CRC-16; the S3 drops a corrupted frame and fills the gap.
-// LINK_TOTALS (S3, needs LINK_Q): lifetime link-error totals in NVS.
+// LINK_Q (opt-in, both boards, needs ENCODE_ON_S3): 'R' frames with a sequence
+// number and CRC-32; the S3 repairs one flipped bit or fills the gap.
+// LINK_EVENTS (S3, needs LINK_Q): the last 64 unusual events kept in flash
+// (event_log.h), printed at boot and on the 'E' serial command.
 #if defined(LINK_Q) && !defined(ENCODE_ON_S3)
 #error "LINK_Q needs ENCODE_ON_S3"
 #endif
 #if defined(LINK_DIAG) && !defined(ENCODE_ON_S3)
 #error "LINK_DIAG needs ENCODE_ON_S3"
 #endif
-#if defined(LINK_TOTALS) && !defined(LINK_Q)
-#error "LINK_TOTALS needs LINK_Q"
+#if defined(LINK_EVENTS) && !defined(LINK_Q)
+#error "LINK_EVENTS needs LINK_Q"
 #endif
 #ifdef LINK_Q
 #include "../common/pcm_link_rx.h"    // 'R' frames: fills PCM lost on the wire (pcm_conceal.h)
@@ -80,8 +81,9 @@
 #include "../common/link_diag.h"      // spike meter + single-bit check (opt-in debug)
 #endif
 #include <Adafruit_NeoPixel.h>
-#ifdef LINK_TOTALS
+#ifdef LINK_EVENTS
 #include <Preferences.h>
+#include "event_log.h"
 #endif
 
 // UART pins to the classic ESP32's TX (its Serial/UART0 TX pin, wired
@@ -345,48 +347,6 @@ static void diag_event(const char *what, uint32_t a, uint32_t b) {
                 (unsigned long)a, (unsigned long)b, (unsigned long)g_uart_errs[4], (unsigned long)g_uart_errs[3]);
 }
 #endif
-#ifdef LINK_TOTALS
-// Lifetime totals kept in NVS, so a drive with no laptop can be checked later.
-static Preferences g_link_prefs;
-static uint32_t g_saved_crc_bad = 0, g_saved_lost = 0, g_saved_outages = 0, g_saved_self = 0, g_boots = 0;
-
-// Lifetime totals = what NVS had at boot + this session, saved when they
-// changed, at most once a minute, and ONLY while nothing audible can be lost:
-// after 10 s of silence (AUDIO_SILENCE from the classic) or with the USB bus
-// suspended (car off). A flash write stalls flash-resident interrupt handlers,
-// and the UART's isn't in IRAM (CONFIG_UART_ISR_IN_IRAM is off in this core):
-// at 2 Mbaud the 128-byte RX FIFO overflows in 0.64 ms, so a save mid-music
-// would itself drop a frame -- and that new error would trigger the next
-// save. Errors in the 500 ms after a save are counted as self_inflicted, not
-// as link errors.
-static uint32_t g_self_inflicted = 0;
-static void link_totals_save(bool quiet_now) {
-  static uint32_t last_ms = 0, last_sum = 0, check_ms = 0, snap_sum = 0;
-  uint32_t sum = g_link_rx.crc_bad + g_link_rx.lost_frames + g_link_rx.outages;
-  if (check_ms && millis() - check_ms > 500) {  // settle the window after a save
-    if (sum > snap_sum) g_self_inflicted += sum - snap_sum;
-    check_ms = 0;
-  }
-  if (!quiet_now || check_ms || sum - g_self_inflicted == last_sum || millis() - last_ms < 60000) return;
-  last_ms = millis();
-  last_sum = sum - g_self_inflicted;
-  g_link_prefs.putUInt("crc_bad", g_saved_crc_bad + g_link_rx.crc_bad);
-  g_link_prefs.putUInt("lost", g_saved_lost + g_link_rx.lost_frames);
-  g_link_prefs.putUInt("outages", g_saved_outages + g_link_rx.outages);
-  g_link_prefs.putUInt("self", g_saved_self + g_self_inflicted);
-  check_ms = millis();
-  snap_sum = g_link_rx.crc_bad + g_link_rx.lost_frames + g_link_rx.outages;
-}
-#endif  // LINK_TOTALS
-static void encode_pcm(const uint8_t *pcm, uint32_t len) {
-  uint32_t t0 = micros();
-  g_s3_encoder.write_mono(pcm, len);
-  uint32_t dt = micros() - t0;
-  g_enc_us_sum += dt; g_enc_n++; g_pcm_bytes += len;
-  if (dt > g_enc_us_max) g_enc_us_max = dt;
-}
-#endif
-
 #ifdef LINK_Q
 // The shared parser (common/link_rx_parser.h): CRC-32, one-bit correction,
 // rescan after a failed frame. Static: it holds a 4 KB pushback buffer.
@@ -396,6 +356,126 @@ struct LinkUartSrc {
 static LinkUartSrc g_link_src;
 static LinkParser<LinkUartSrc> g_link_parser(g_link_src, false);  // only C and R
 #endif
+#ifdef LINK_EVENTS
+// Event log (event_log.h) in NVS namespace "events": e00..e63 + "count", and
+// the boot counter "boot". Events are queued in RAM and written when nothing
+// is going wrong (no open link-damage episode), at most every 10 s, and at
+// once on USB suspend (car off). A flash write stalls flash-resident
+// interrupts and the UART's isn't in IRAM: at 2 Mbaud a write drops a few
+// bytes, i.e. one filled frame with LINK_Q. Losses in the second after a
+// write are ignored by the detector so a write can't log itself.
+static Preferences g_ev_prefs;
+struct NvsEventStore {
+  bool get(uint32_t slot, LinkEvent &e) {
+    char k[4] = {'e', (char)('0' + slot / 10), (char)('0' + slot % 10), 0};
+    return g_ev_prefs.getBytes(k, &e, sizeof e) == sizeof e;
+  }
+  void put(uint32_t slot, const LinkEvent &e) {
+    char k[4] = {'e', (char)('0' + slot / 10), (char)('0' + slot % 10), 0};
+    g_ev_prefs.putBytes(k, &e, sizeof e);
+  }
+  uint32_t get_count() { return g_ev_prefs.getUInt("count", 0); }
+  void put_count(uint32_t n) { g_ev_prefs.putUInt("count", n); }
+};
+static NvsEventStore g_ev_store;
+static EventLog<NvsEventStore> g_ev_log(g_ev_store);
+static uint16_t g_boot_no = 0;
+static LinkEvent g_ev_pending[8];
+static volatile uint32_t g_ev_pending_n = 0, g_ev_dropped = 0;
+static uint32_t g_ev_last_write_ms = 0, g_ev_guard_until_ms = 0;
+static portMUX_TYPE g_ev_mux = portMUX_INITIALIZER_UNLOCKED;
+
+static void event_push(uint8_t type, uint32_t t_ms, uint32_t a, uint32_t b, uint8_t flags = 0) {
+  LinkEvent e = {g_boot_no, type, flags, t_ms, a, b};
+  char line[120];
+  event_describe(e, line, sizeof line);
+  Serial.printf("[s3] event: %s\n", line);
+  portENTER_CRITICAL(&g_ev_mux);
+  if (g_ev_pending_n < 8) g_ev_pending[g_ev_pending_n++] = e; else g_ev_dropped++;
+  portEXIT_CRITICAL(&g_ev_mux);
+}
+
+static void events_dump() {
+  uint32_t n = g_ev_log.count();
+  Serial.printf("[s3] events: %lu recorded, last %lu kept, oldest first (boot now %u)\n", (unsigned long)n,
+                (unsigned long)(n < EVENT_LOG_CAP ? n : EVENT_LOG_CAP), (unsigned)g_boot_no);
+  g_ev_log.for_each([](uint32_t i, const LinkEvent &e) {
+    char line[120];
+    event_describe(e, line, sizeof line);
+    Serial.printf("[s3] event %lu: %s\n", (unsigned long)i, line);
+  });
+  Serial.println("[s3] events end");
+}
+
+// Called once a second from loop(): detect episodes, write queued events.
+static void events_tick(uint32_t now) {
+  // Link damage: frames filled or repaired, closed after 2 s of a clean link.
+  static Episode loss;
+  static uint32_t prev_lost = 0, prev_fixed = 0, prev_out = 0, out_in_ep = 0;
+  uint32_t lost = g_link_rx.lost_frames + g_link_rx.silence_frames;
+  uint32_t fixed = g_link_parser.corrected_data + g_link_parser.corrected_trailer;
+  uint32_t d_lost = lost - prev_lost, d_fixed = fixed - prev_fixed, d_out = g_link_rx.outages - prev_out;
+  prev_lost = lost; prev_fixed = fixed; prev_out = g_link_rx.outages;
+  if ((int32_t)(now - g_ev_guard_until_ms) < 0) { d_lost = d_fixed = d_out = 0; }  // our own flash write
+  if (d_out && !loss.open) out_in_ep = 0;
+  out_in_ep += d_out;
+  if (loss.update(now, d_lost + d_out, d_fixed, 2000)) {
+    uint32_t sum = loss.sum > 0xFFFF ? 0xFFFF : loss.sum, sum2 = loss.sum2 > 0xFFFF ? 0xFFFF : loss.sum2;
+    event_push(EV_LOSS, loss.start - 1000, loss.duration() + 1000, sum | (sum2 << 16), out_in_ep ? 1 : 0);
+  }
+  // Link down: no frames from the classic for over 2 s.
+  static bool down = false;
+  static uint32_t down_since = 0;
+  uint32_t last_frame = g_link_last_frame_ms;
+  if (!down && last_frame && now - last_frame > 2000) { down = true; down_since = last_frame; }
+  if (down && now - last_frame < 1000) {
+    down = false;
+    event_push(EV_LINK_DOWN, down_since, last_frame - down_since, 0);
+  }
+#ifdef FATDISK_ALWAYS_SERVE_LIVE
+  // Silence served to the radio, and catch-up jumps.
+  static Episode und, jmp;
+  static uint32_t prev_und = 0, prev_jmp = 0;
+  uint32_t d_und = g_live_underruns - prev_und, d_jmp = g_live_jumps - prev_jmp;
+  prev_und = g_live_underruns; prev_jmp = g_live_jumps;
+  if (und.update(now, d_und, 0, 2000)) event_push(EV_UNDERRUN, und.start - 1000, und.duration() + 1000, und.sum);
+  if (jmp.update(now, d_jmp, 0, 2000)) event_push(EV_JUMP, jmp.start - 1000, jmp.sum, 0);
+#endif
+  // Write what's queued when nothing is going wrong.
+  bool due = g_ev_pending_n && !loss.open && (g_usb_suspended || now - g_ev_last_write_ms >= 10000);
+  if (!due) return;
+  LinkEvent batch[8];
+  uint32_t n;
+  portENTER_CRITICAL(&g_ev_mux);
+  n = g_ev_pending_n;
+  memcpy(batch, g_ev_pending, n * sizeof(LinkEvent));
+  g_ev_pending_n = 0;
+  portEXIT_CRITICAL(&g_ev_mux);
+  for (uint32_t i = 0; i < n; i++) g_ev_log.add(batch[i]);
+  g_ev_last_write_ms = millis();
+  g_ev_guard_until_ms = g_ev_last_write_ms + 1500;
+}
+
+// 'E' on the debug serial: print the log. 'Z' twice in a row: clear it.
+static void events_serial_commands() {
+  static char prev = 0;
+  while (Serial.available() > 0) {
+    char c = (char)Serial.read();
+    if (c == 'E') events_dump();
+    if (c == 'Z' && prev == 'Z') { g_ev_log.clear(); Serial.println("[s3] events cleared"); c = 0; }
+    prev = c;
+  }
+}
+#endif  // LINK_EVENTS
+static void encode_pcm(const uint8_t *pcm, uint32_t len) {
+  uint32_t t0 = micros();
+  g_s3_encoder.write_mono(pcm, len);
+  uint32_t dt = micros() - t0;
+  g_enc_us_sum += dt; g_enc_n++; g_pcm_bytes += len;
+  if (dt > g_enc_us_max) g_enc_us_max = dt;
+}
+#endif
+
 
 static void link_task(void *) {
   static uint8_t payload[MAX_FRAME_LEN];
@@ -503,6 +583,22 @@ static void link_task(void *) {
       } else if (msg_len >= 5 && memcmp(msg, "DIAG:", 5) == 0) {
         Serial.printf("[s3] classic %.*s\n", (int)msg_len, (const char *)msg);
 #endif
+#ifdef LINK_EVENTS
+      } else if (msg_len > 13 && memcmp(msg, "RESET_REASON:", 13) == 0) {
+        // Abnormal restarts only: a normal power-on (POWERON) or a reset from
+        // flashing (OTHER) isn't worth an entry. SW = the classic's own
+        // watchdog restarted it. Stored as the reason's first 4 chars.
+        static const char *const abnormal[] = {"PANIC", "INT_WDT", "TASK_WDT", "WDT", "BROWNOUT", "CPU_LOCKUP", "SW"};
+        const char *rs = (const char *)msg + 13;
+        uint32_t rl = msg_len - 13;
+        for (const char *a : abnormal) {
+          if (strlen(a) == rl && memcmp(a, rs, rl) == 0) {
+            uint32_t r = 0;
+            memcpy(&r, rs, rl < 4 ? rl : 4);
+            event_push(EV_CLASSIC_RESET, millis(), r, 0);
+          }
+        }
+#endif
       } else if (msg_len >= 12 && memcmp(msg, "S3_RX:S3_HB:", 12) == 0) {
         // Our own return-channel heartbeat, echoed all the way back --
         // confirms the S3->classic wire is genuinely reaching its
@@ -580,17 +676,17 @@ static void usb_event_callback(void *arg, esp_event_base_t event_base, int32_t e
 #else
 #define BF_LINK_Q ""
 #endif
-#ifdef LINK_TOTALS
-#define BF_LINK_TOTALS " LINK_TOTALS"
+#ifdef LINK_EVENTS
+#define BF_LINK_EVENTS " LINK_EVENTS"
 #else
-#define BF_LINK_TOTALS ""
+#define BF_LINK_EVENTS ""
 #endif
 #ifdef LINK_DIAG
 #define BF_LINK_DIAG " LINK_DIAG"
 #else
 #define BF_LINK_DIAG ""
 #endif
-static const char BUILD_FLAGS_STR[] = BF_FATDISK_ALWAYS_SERVE_LIVE BF_FATDISK_MULTI_FILE BF_LED_RAINBOW_PLAYING BF_ENCODE_ON_S3 BF_MSC_TRACE BF_LINK_Q BF_LINK_TOTALS BF_LINK_DIAG;
+static const char BUILD_FLAGS_STR[] = BF_FATDISK_ALWAYS_SERVE_LIVE BF_FATDISK_MULTI_FILE BF_LED_RAINBOW_PLAYING BF_ENCODE_ON_S3 BF_MSC_TRACE BF_LINK_Q BF_LINK_EVENTS BF_LINK_DIAG;
 
 static void print_build_line() {
   Serial.printf("[s3] build: commit %07lx%s flags:%s file=%lu x %lu KB clusters (%lu B) ring=%lu B\n",
@@ -640,17 +736,19 @@ void setup() {
   Serial.printf("[s3] encoder (ENCODE_ON_S3): %s, int_free=%u\n", enc_ok ? "on" : "FAILED",
                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
 #endif
-#ifdef LINK_TOTALS
-  g_link_prefs.begin("link", false);
-  g_saved_crc_bad = g_link_prefs.getUInt("crc_bad", 0);
-  g_saved_lost = g_link_prefs.getUInt("lost", 0);
-  g_saved_outages = g_link_prefs.getUInt("outages", 0);
-  g_saved_self = g_link_prefs.getUInt("self", 0);
-  g_boots = g_link_prefs.getUInt("boots", 0) + 1;
-  g_link_prefs.putUInt("boots", g_boots);
-  Serial.printf("[s3] link lifetime: boots=%lu crc_bad=%lu lost_frames=%lu outages=%lu (self_inflicted=%lu)\n",
-                (unsigned long)g_boots, (unsigned long)g_saved_crc_bad,
-                (unsigned long)g_saved_lost, (unsigned long)g_saved_outages, (unsigned long)g_saved_self);
+#ifdef LINK_EVENTS
+  // Before LinkSerial.begin(): these flash writes can't drop link bytes yet.
+  g_ev_prefs.begin("events", false);
+  g_boot_no = (uint16_t)(g_ev_prefs.getUInt("boot", 0) + 1);
+  g_ev_prefs.putUInt("boot", g_boot_no);
+  {
+    esp_reset_reason_t rr = esp_reset_reason();
+    bool abnormal = rr == ESP_RST_PANIC || rr == ESP_RST_INT_WDT || rr == ESP_RST_TASK_WDT ||
+                    rr == ESP_RST_WDT || rr == ESP_RST_BROWNOUT;
+    if (abnormal) g_ev_log.add({g_boot_no, EV_S3_RESET, 0, 0, (uint32_t)rr, 0});
+    if (!enc_ok) g_ev_log.add({g_boot_no, EV_ENCODER_FAIL, 0, 0, 0, 0});
+  }
+  events_dump();
 #endif
   // Prime the ring with pre-encoded silence up front -- same fix as
   // fat12_disk.py's __init__, same rationale (see CLAUDE.md/STATUS.md):
@@ -801,6 +899,9 @@ static void usb_reattach_poll(uint32_t now_ms) {
     return;
   }
   if (g_native_usb_connected) {  // a host has us; re-arm for a later loss
+#ifdef LINK_EVENTS
+    if (tries) event_push(EV_USB_REATTACH, now_ms, tries, 0);
+#endif
     tries = 0;
     next_try_ms = now_ms + FIRST_WAIT_MS;
     return;
@@ -822,6 +923,9 @@ void loop() {
   // of stepping once a second.
   uint32_t now_ms = millis();
   usb_reattach_poll(now_ms);
+#if defined(LINK_EVENTS) && !defined(MSC_TRACE)  // MSC_TRACE reads the serial port itself
+  events_serial_commands();
+#endif
 
   // RGB status LED (see status_led/RGB_LED_PIN above). Priority-ordered:
   // hardware/link-health states take precedence over BT/audio states,
@@ -1078,13 +1182,6 @@ void loop() {
     static uint32_t heartbeat_n = 0;
     if (++heartbeat_n % 60 == 0) {
       print_build_line();
-#ifdef LINK_TOTALS
-      Serial.printf("[s3] link lifetime: boots=%lu crc_bad=%lu lost_frames=%lu outages=%lu (self_inflicted=%lu)\n",
-                    (unsigned long)g_boots, (unsigned long)(g_saved_crc_bad + g_link_rx.crc_bad),
-                    (unsigned long)(g_saved_lost + g_link_rx.lost_frames),
-                    (unsigned long)(g_saved_outages + g_link_rx.outages),
-                    (unsigned long)(g_saved_self + g_self_inflicted));
-#endif
     }
     Serial.printf("[s3] link heartbeat: bytes_read=%lu frames_ok=%lu frames_bad=%lu "
                   "write_pos=%lu total_written=%lu last_read_offset=%lu "
@@ -1160,14 +1257,8 @@ void loop() {
         g_diag_spikes.reset();
       }
 #endif
-#ifdef LINK_TOTALS
-      {
-        static uint32_t silent_since_ms = 0;
-        if (g_s3_audio_live) silent_since_ms = 0;
-        else if (!silent_since_ms) silent_since_ms = millis();
-        bool quiet = g_usb_suspended || (silent_since_ms && millis() - silent_since_ms > 10000);
-        link_totals_save(quiet);
-      }
+#ifdef LINK_EVENTS
+      events_tick(millis());
 #endif
     }
 #endif

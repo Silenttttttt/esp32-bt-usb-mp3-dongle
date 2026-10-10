@@ -7,7 +7,7 @@
 #   ./flash.sh --v1            the v1 build instead (see BUILD_FLAGS.md)
 #   ./flash.sh --v1 --s3-encode  v1, but the S3 runs the MP3 encoder (classic sends PCM)
 #   ./flash.sh --trace         + MSC_TRACE (log every SCSI command; car capture)
-#   ./flash.sh --fix-link      + the post-car link fix (-DLINK_Q -DLINK_TOTALS); flash BOTH boards with it or neither
+#   ./flash.sh --fix-link      + the post-car link fix (-DLINK_Q -DLINK_EVENTS); flash BOTH boards with it or neither
 #   ./flash.sh --diag          + LINK_DIAG debug lines (works with or without --fix-link)
 #   ./flash.sh --no-upload     compile only
 #   ./flash.sh -DSOME_FLAG     extra -D flags, appended
@@ -44,7 +44,7 @@ for a in "$@"; do
     --v1) V1=1 ;;
     --s3-encode) S3ENC=1 ;;
     --no-upload) UPLOAD=0 ;;
-    --fix-link) EXTRA+=(-DLINK_Q -DLINK_TOTALS) ;;  # opt-in link fix (BUILD_FLAGS.md); BOTH boards or neither
+    --fix-link) EXTRA+=(-DLINK_Q -DLINK_EVENTS) ;;  # opt-in link fix (BUILD_FLAGS.md); BOTH boards or neither
     --diag) EXTRA+=(-DLINK_DIAG) ;;  # opt-in debug lines (BUILD_FLAGS.md)
     --trace) TRACE=1 ;;
     -D*) EXTRA+=("$a") ;;

@@ -481,6 +481,7 @@ static volatile uint32_t g_live_read_cursor = 0;
 static volatile bool g_live_read_cursor_init = false;
 static volatile bool g_live_underrun = false;      // currently serving underrun silence
 static volatile uint32_t g_live_underruns = 0;     // reads served as underrun silence, for the heartbeat
+static volatile uint32_t g_live_jumps = 0;         // catch-up jumps (fell too far behind live), for LINK_EVENTS
 
 // How a radio OPENS a file (real Kenwood, car trace 2026-09-25): it reads the
 // start, a 2 KB probe every 512 KB, the last 2 KB (ID3v1), ~40 KB of the head,
@@ -1177,6 +1178,7 @@ static void disk_read_at(uint32_t abs_pos, uint8_t *buffer, uint32_t len,
             need_jump = behind > jump_limit;
           }
           if (need_jump) {
+            if (g_live_read_cursor_init) g_live_jumps++;  // not the first placement
             uint32_t target = (LIVE_TARGET_LAG_BYTES > n_safe) ? LIVE_TARGET_LAG_BYTES : n_safe;
             cursor = (wp >= target) ? (wp - target) : (lap_end - (target - wp));
             behind = target;

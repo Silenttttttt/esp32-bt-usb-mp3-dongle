@@ -81,13 +81,13 @@ overwrite).
 
 ### Link fix and debug (opt-in, `flash.sh --fix-link` / `--diag`, added 2026-10-05..10)
 
-Off by default: plain `flash.sh` builds the car build's behavior. `--fix-link` must go on **both
+Off by default: plain `flash.sh` builds the car build's behavior. `--fix-link` (`LINK_Q`, plus `LINK_EVENTS` on the S3) must go on **both
 boards or neither** (an S3 without it rejects 'R' frames: blinking WHITE).
 
 | Flag | Boards | Intent | Expected | Observed (real hardware) | Status |
 |---|---|---|---|---|---|
 | `LINK_Q` | both (`--fix-link`) | Stop the rough-road crackle: a loose classic -> S3 contact drops bytes or flips 0 -> 1 (RX pull-up), and unchecked `P` frames turn one missing byte into up to 23 ms of noise | 'R' frames: fixed 523 B (seq + 5.8 ms PCM + CRC-32). One flipped bit repaired; otherwise the frame is dropped, the bytes after it rescanned, and exactly the missing audio filled (pitch repeat, fades). Fixed delay < 5.8 ms, no drift | Bench 2026-10-10, shaking the box: S3 spikes 100-430/s -> **0** (crackle gone); ~240 -> 138 frames filled per ~13 s shake, 24 repaired (all 0 -> 1); cushion flat (+-0.1 s/hour); Muni: "nearly glitchless". Not yet in the car | Bench-verified. Next: car |
-| `LINK_TOTALS` | S3 (`--fix-link`) | See after a drive, without a laptop, whether the wire had errors | `[s3] link lifetime: boots= crc_bad= lost_frames= outages= (self_inflicted=)` at boot and every minute; saved to NVS only after 10 s of silence or on USB suspend (a flash write mid-music would drop a frame: the UART ISR isn't in IRAM) | Prints and counts on the bench; save path not yet exercised in a real car-off | Needs `LINK_Q` |
+| `LINK_EVENTS` | S3 (`--fix-link`) | After a drive, see only what went wrong, without a laptop in the car (Muni: "just save events, not full trash") | The last 64 unusual events in flash (`esp32-s3-msc/event_log.h`): link damage bursts (duration, frames filled / repaired), link down, abnormal classic restarts (reason), silence served, catch-up jumps, USB re-attaches, encoder failure, abnormal S3 reset. Each written once when it ends, when nothing is going wrong, at most every 10 s, at once on USB suspend. Printed at boot; `tools/s3_events.py` reads it (`E`), `--clear` clears it (`ZZ`) | Replaced `LINK_TOTALS` (2026-10-10), whose counts were never saved while music played | Needs `LINK_Q` |
 | `LINK_DIAG` | both (`--diag`) | Measure where corruption starts | Classic: `DIAG:` once a second (Bluetooth bytes and longest gap, loop max, spikes in the PCM it sends, drops, heap). S3: `[s3] diag:` (spikes in received PCM, bad headers, UART errors; with `LINK_Q` lost/fixed frames, flip direction, loss-run histogram), per-event lines, and the classic's `DIAG:` lines relayed | Found the cause 2026-10-10: classic clean, S3 spike storms with 0 UART errors = bytes vanishing on an open contact | Debug only; costs a few hundred bytes of flash |
 
 ### Board fixes that aren't flags (apply to every profile)
