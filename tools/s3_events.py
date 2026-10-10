@@ -9,6 +9,12 @@ logs/serial_logger.py running on that port: it sends 'E' and reads the reply
 (from the port, or from logs/s3_serial.log if the logger owns the port).
 Times are "boot N +h:mm:ss": the Nth S3 power-up (about one per drive) and
 how long after that power-up it happened.
+
+Opening the port resets the S3 (Linux raises the control lines on open and
+the DevKitC's auto-reset reacts), unless the logger already holds it. After a
+drive that's harmless -- the log is in flash and the boot prints it -- but
+don't run it while the radio is playing from the drive. Each read is a boot,
+so "boot N" counts these too.
 """
 import os, subprocess, sys, time
 import serial
@@ -52,6 +58,7 @@ def main():
                 break
             time.sleep(0.2)
     else:
+        print("(no logger on the port: opening it resets the S3; the log is printed at its boot)", file=sys.stderr)
         with open_port() as s:
             s.reset_input_buffer()
             s.write(b"E")
