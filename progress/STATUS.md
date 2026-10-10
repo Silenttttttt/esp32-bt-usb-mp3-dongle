@@ -5974,3 +5974,25 @@ Fix before it ever ran (found reviewing the counters): the S3's UART interrupt i
 save a minute later. Totals are now saved only after 10 s of silence or on USB suspend (car off);
 errors within 500 ms of a save count as `self_inflicted`. The boot-time `boots` write happens
 before `LinkSerial.begin()`.
+
+### 2026-10-10 -- Diagnosis round 1 (classic instrumented, S3 on the car build)
+
+Car build recorded (`KNOWN_BUILDS.md`, `tools/flash_build.sh car-2026-09-25 both`). The link fix is
+now opt-in (`flash.sh --fix-link`, `LINK_Q`/`LINK_TOTALS`); measurement is `--diag` (`LINK_DIAG`).
+Classic flashed at `7632711` with `--diag`; S3 unchanged (car build; its debug port not connected).
+Muni played music and jiggled the classic's micro USB; heard artifacts.
+
+| Evidence (00:20-00:24 GMT-3) | Result |
+|---|---|
+| Classic resets / USB link to the PC | none; no log gap > 2.5 s |
+| Classic Bluetooth input | ~176 KB/s steady, max callback gap 45 ms, 0 drops |
+| Spikes in the PCM the classic sent | 0 (max jump ~7000) |
+| PC's copy of the classic's TX stream (serial_logger) | 0 resyncs in 31.7 MB |
+| car_sim decode errors | none |
+| S3 MP3 write rate (from `S3_HB write_pos`, every ~2 s) | normal ~16,000 B/s, except 00:23:15-21 (14.6k/10.6k/12.6k) and 00:23:31-37 (13.3k/10.9k/15.0k) |
+
+Conclusion: the classic and its output were clean; the S3 lost ~1/3 of the PCM for 4-6 s per jiggle,
+i.e. whole frames dropped on the classic -> S3 wire (rate loss = discarded frames, not just flipped
+bits). Not a power problem. Heavy, sustained loss: beyond what FEC at 25% or concealment can make
+clean, so the connection is the fix. Open: plug movement vs jumper/breadboard contact vs ground via
+the USB shell. Round 2 needs the S3's debug port (S3 `--diag`).
