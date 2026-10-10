@@ -5996,3 +5996,22 @@ i.e. whole frames dropped on the classic -> S3 wire (rate loss = discarded frame
 bits). Not a power problem. Heavy, sustained loss: beyond what FEC at 25% or concealment can make
 clean, so the connection is the fix. Open: plug movement vs jumper/breadboard contact vs ground via
 the USB shell. Round 2 needs the S3's debug port (S3 `--diag`).
+
+### 2026-10-10 -- Diagnosis round 2 (both boards `--diag`, car build otherwise; Muni shook the whole box)
+
+| | Classic (before the wire) | S3 (after the wire) |
+|---|---|---|
+| Spikes (adjacent-sample jump > 30000) | 0 every second | 100-430/s while shaking |
+| Bad headers | - | 3-14/s |
+| UART errors (frame/parity/break/overflow) | - | 0 every second |
+| Bluetooth input | normal (gap <= 54 ms, 0 drops) | - |
+| PCM actually lost | - | ~2-10% per second while shaking |
+
+Mechanism: the classic -> S3 contact opens briefly; the S3 RX pin has the core's default internal
+pull-up (`_rxPullEnabled` default true, esp32-hal-uart.c), so an open line reads idle and bytes go
+missing silently (no framing errors). With unchecked `P` frames a missing byte misaligns the rest of
+the frame: every sample becomes noise (the spike storms = the crackle), then PCM is read as a header
+(bad headers) and the parser resyncs. Little audio is lost; the noise is what's heard.
+Implications: `LINK_Q` (CRC + 5.8 ms frames + seq fill) targets exactly this; Hamming/bit correction
+can't (deletions). Physical without solder: parallel jumpers for TX and GND. Next: flash both with
+`--fix-link --diag` and shake again (spikes should go to 0; run histogram decides FEC).
