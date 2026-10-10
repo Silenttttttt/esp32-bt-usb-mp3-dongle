@@ -305,11 +305,30 @@ int main() {
   expect("3 full-length files, fixed name Stream.mp3",
          get_file_declared_size(0) == DECLARED_FILE_SIZE && get_file_declared_size(1) == DECLARED_FILE_SIZE &&
          get_file_declared_size(2) == DECLARED_FILE_SIZE && g_long_len == 10 && g_long_name[0] == 'S');
+  // A Linux host's probing right after mount, as traced 2026-10-10 (MSC_TRACE,
+  // S3 boot on the bench): reads near the device's end (the last file's tail),
+  // signature offsets in file 0, then file 0's start. Must relay nothing.
+  {
+    int ln = g_callbacks_next, lp = g_callbacks_prev;
+    fatdisk_note_mount();
+    const uint32_t last = NUM_FILES - 1, sz = get_file_declared_size(last);
+    for (uint32_t off : {sz - 0x13a00u, sz - 0x2a00u, sz - 0xa00u, sz - 0x20a00u, sz - 0x8a00u, sz - 0x32a00u})
+      fatdisk_note_file_read(last, off, 4096);
+    for (uint32_t off : {0x1fc600u, 0xfc600u, 0x3600u, 0xb600u}) fatdisk_note_file_read(0, off, 4096);
+    for (uint32_t off = 0x600; off < 0x5c600; off += 4096) fatdisk_note_file_read(0, off, 4096);
+    for (uint32_t off = 0; off < 0x60000; off += 8192) fatdisk_note_file_read(last, sz - 0x80000 + off, 8192);
+    expect("Linux probing right after mount: nothing relayed", relays(ln, lp));
+    std::this_thread::sleep_for(std::chrono::milliseconds(3100));  // the host goes quiet: reader idle
+  }
   int n0 = g_callbacks_next, p0 = g_callbacks_prev;
   Kenwood r;
+  fatdisk_note_mount();
   r.open(1);  // mount: resumes the remembered track
   r.play(40);
   expect("mount on the remembered track: nothing relayed", relays(n0, p0) && g_current_file_index == 1);
+  // The radio keeps playing; a press comes later than the mount window. (The
+  // reader keeps reading, so this pause is not an idle gap.)
+  for (int i = 0; i < 50; i++) { std::this_thread::sleep_for(std::chrono::milliseconds(MOUNT_QUIET_MS / 50 + 1)); r.play(1); }
   r.next();
   r.play(20);
   expect("Next mid-file relayed once", relays(n0 + 1, p0));

@@ -525,10 +525,18 @@ static void usb_event_callback(void *arg, esp_event_base_t event_base, int32_t e
   (void)arg; (void)event_data;
   if (event_base == ARDUINO_USB_EVENTS) {
     switch (event_id) {
-      case ARDUINO_USB_STARTED_EVENT: Serial.println("[s3] USB PLUGGED"); g_native_usb_connected = true; g_usb_suspended = false; FATDISK_TRACE(USB_STARTED, 0, 0, 0); break;
+      case ARDUINO_USB_STARTED_EVENT: Serial.println("[s3] USB PLUGGED"); g_native_usb_connected = true; g_usb_suspended = false; FATDISK_TRACE(USB_STARTED, 0, 0, 0);
+#ifdef FATDISK_MULTI_FILE
+        fatdisk_note_mount();  // the host's own probing follows: don't relay it as Next/Back
+#endif
+        break;
       case ARDUINO_USB_STOPPED_EVENT: Serial.println("[s3] USB UNPLUGGED"); g_native_usb_connected = false; g_usb_suspended = false; FATDISK_TRACE(USB_STOPPED, 0, 0, 0); break;
       case ARDUINO_USB_SUSPEND_EVENT: Serial.println("[s3] USB SUSPENDED"); g_usb_suspended = true; FATDISK_TRACE(USB_SUSPEND, 0, 0, 0); break;
-      case ARDUINO_USB_RESUME_EVENT: Serial.println("[s3] USB RESUMED"); g_usb_suspended = false; FATDISK_TRACE(USB_RESUME, 0, 0, 0); break;
+      case ARDUINO_USB_RESUME_EVENT: Serial.println("[s3] USB RESUMED"); g_usb_suspended = false; FATDISK_TRACE(USB_RESUME, 0, 0, 0);
+#ifdef FATDISK_MULTI_FILE
+        fatdisk_note_mount();
+#endif
+        break;
       default: break;
     }
   }

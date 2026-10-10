@@ -906,6 +906,22 @@ static uint32_t get_file_declared_size(uint32_t file_index) {
 // signature offsets, some inside file 0's data) anchored file 0, and the
 // real reader then opening another file relayed a spurious "next".
 static const uint32_t READER_IDLE_RESET_MS = 3000;
+// For MOUNT_QUIET_MS after the host mounts the drive (fatdisk_note_mount(),
+// called on the USB mount/resume events) file switches are tracked but never
+// relayed. Found 2026-10-10 (MSC_TRACE at S3 boot on the bench): Linux
+// probing a new drive reads the device's end (file 3's tail), scattered
+// signature offsets in file 1, then file 1's start -- the detector saw two
+// "Back"s and the phone jumped to the previous song twice. The Kenwood opens
+// its remembered track inside this window too (car trace: mount -> open in
+// ~1-2 s), so the only cost is a Next/Back pressed within 5 s of the radio
+// coming up. Pauses don't start a window (the radio stays mounted).
+static const uint32_t MOUNT_QUIET_MS = 5000;
+static volatile uint32_t g_mount_ms = 0;
+static volatile bool g_mount_quiet = false;
+static inline void fatdisk_note_mount() {
+  g_mount_ms = FATDISK_MILLIS();
+  g_mount_quiet = true;
+}
 static volatile uint32_t g_last_file_read_ms = 0;
 static volatile bool g_any_file_read = false;
 static volatile bool g_reader_anchored = false;
@@ -967,8 +983,11 @@ static void fatdisk_note_file_read(uint32_t file_index, uint32_t file_rel_off, u
   // button.
   uint32_t re = g_current_file_read_end;
   bool natural_eof = (direction == 1) && re + NATURAL_EOF_TOLERANCE_BYTES >= get_file_declared_size(g_current_file_index);
+  if (g_mount_quiet && now - g_mount_ms >= MOUNT_QUIET_MS) g_mount_quiet = false;
+  bool quiet = g_mount_quiet;
+  bool relay = !natural_eof && direction != 0 && !quiet;
   FATDISK_TRACE(SWITCH, (g_current_file_index << 8) | file_index,
-                (natural_eof ? 1 : 0) | ((!natural_eof && direction != 0) ? 4 : 0), re);
+                (natural_eof ? 1 : 0) | ((quiet && !natural_eof && direction != 0) ? 2 : 0) | (relay ? 4 : 0), re);
   g_current_file_index = file_index;
   g_current_file_read_end = playback ? read_end : 0;
   g_candidate_bytes_read = 0;
@@ -976,7 +995,7 @@ static void fatdisk_note_file_read(uint32_t file_index, uint32_t file_rel_off, u
   // radio's own sequential file navigation) -- still adopt the new current
   // index so debounce tracking stays correct, just don't relay a command
   // for a jump that doesn't map to a real next/previous.
-  if (!natural_eof && direction != 0 && g_file_switch_callback) g_file_switch_callback(direction);
+  if (relay && g_file_switch_callback) g_file_switch_callback(direction);
 }
 
 #endif  // FATDISK_MULTI_FILE
