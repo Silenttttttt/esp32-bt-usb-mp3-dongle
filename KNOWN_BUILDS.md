@@ -8,6 +8,10 @@ run the same build (the link format must match).
 | Name | Commit | Where it ran | Classic flags | S3 flags | Reflash |
 |---|---|---|---|---|---|
 | `car-2026-09-25` | `4cef646` (firmware = `2593cf9`) | The car since 2026-09-25; 32 KB clusters car-verified 2026-09-26 | `-DINT2IDX_SIZE=4000 -DDIAG_LOOP_DRAIN -DDIAG_FRAG_TRACE -DV2_ALL -DENCODE_ON_S3` | `-DFATDISK_ALWAYS_SERVE_LIVE -DFATDISK_MULTI_FILE -DLED_RAINBOW_PLAYING -DENCODE_ON_S3` | `tools/flash_build.sh car-2026-09-25 both` |
+| `bench-2026-10-10-fixlink` | `d5369cf` | Bench 2026-10-10, both boards, shaken: crackle gone, "nearly glitchless". Not yet in the car | car flags + `-DLINK_Q -DLINK_DIAG` | car flags + `-DLINK_Q -DLINK_TOTALS -DLINK_DIAG` | `tools/flash_build.sh bench-2026-10-10-fixlink both --fix-link --diag` |
+
+`bench-2026-10-10-fixlink` is the plain v2 flag set plus `--fix-link --diag` (flash both boards
+together). Drop `--diag` for a quieter build; the fix doesn't depend on it.
 
 Evidence for `car-2026-09-25`: `logs/flash_history.log` (classic 2026-09-25 21:04 at `9c03c6c`, S3
 22:13 at `2593cf9`; no classic code changed between those two commits). Rebuilt 2026-10-10: the

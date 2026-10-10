@@ -15,6 +15,7 @@ ROOT=$PWD
 
 declare -A BUILDS=(
   [car-2026-09-25]=4cef646   # in the car since 2026-09-25 (32 KB clusters car-verified 09-26); plain flash.sh, v2 flags
+  [bench-2026-10-10-fixlink]=d5369cf  # bench-verified link fix; flash with: both --fix-link --diag
 )
 
 [[ $# -ge 2 ]] || { sed -n '2,12p' "$0"; exit 2; }

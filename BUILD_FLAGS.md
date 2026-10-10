@@ -79,6 +79,17 @@ overwrite).
 | `FATDISK_LIVE_TARGET_LAG=N` | v2 (default 12288) | How far behind live the cursor sits | ~0.77 s of cushion against Bluetooth stalls, paid for in delay | Tuned by the host-test sweep | Tuning |
 | `FATDISK_RADIO_READAHEAD=N` | v2 (default 61440) | The radio's read-ahead burst at a file open | After Next/Back/mount, the file starts this far back so the burst reads real audio | Kenwood's burst is ~58 KB; with this, 0 underruns at opens (bench) | Tuning |
 
+### Link fix and debug (opt-in, `flash.sh --fix-link` / `--diag`, added 2026-10-05..10)
+
+Off by default: plain `flash.sh` builds the car build's behavior. `--fix-link` must go on **both
+boards or neither** (an S3 without it rejects 'R' frames: blinking WHITE).
+
+| Flag | Boards | Intent | Expected | Observed (real hardware) | Status |
+|---|---|---|---|---|---|
+| `LINK_Q` | both (`--fix-link`) | Stop the rough-road crackle: a loose classic -> S3 contact drops bytes or flips 0 -> 1 (RX pull-up), and unchecked `P` frames turn one missing byte into up to 23 ms of noise | 'R' frames: fixed 523 B (seq + 5.8 ms PCM + CRC-32). One flipped bit repaired; otherwise the frame is dropped, the bytes after it rescanned, and exactly the missing audio filled (pitch repeat, fades). Fixed delay < 5.8 ms, no drift | Bench 2026-10-10, shaking the box: S3 spikes 100-430/s -> **0** (crackle gone); ~240 -> 138 frames filled per ~13 s shake, 24 repaired (all 0 -> 1); cushion flat (+-0.1 s/hour); Muni: "nearly glitchless". Not yet in the car | Bench-verified. Next: car |
+| `LINK_TOTALS` | S3 (`--fix-link`) | See after a drive, without a laptop, whether the wire had errors | `[s3] link lifetime: boots= crc_bad= lost_frames= outages= (self_inflicted=)` at boot and every minute; saved to NVS only after 10 s of silence or on USB suspend (a flash write mid-music would drop a frame: the UART ISR isn't in IRAM) | Prints and counts on the bench; save path not yet exercised in a real car-off | Needs `LINK_Q` |
+| `LINK_DIAG` | both (`--diag`) | Measure where corruption starts | Classic: `DIAG:` once a second (Bluetooth bytes and longest gap, loop max, spikes in the PCM it sends, drops, heap). S3: `[s3] diag:` (spikes in received PCM, bad headers, UART errors; with `LINK_Q` lost/fixed frames, flip direction, loss-run histogram), per-event lines, and the classic's `DIAG:` lines relayed | Found the cause 2026-10-10: classic clean, S3 spike storms with 0 UART errors = bytes vanishing on an open contact | Debug only; costs a few hundred bytes of flash |
+
 ### Board fixes that aren't flags (apply to every profile)
 - **S3 UART RX FIFO threshold 32** (was the driver's default 120 of 128). At 2 Mbaud the default
   left ~40 us of interrupt headroom, and the overflows were an occasional click (2026-09-25).
