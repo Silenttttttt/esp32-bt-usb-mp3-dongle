@@ -6068,3 +6068,5 @@ Not seen in the car (the Kenwood's mount was verified clean), but cheap insuranc
 Final bench build: both boards `c209365` `--fix-link --diag` (`KNOWN_BUILDS.md`:
 `bench-2026-10-10-fixlink`). Cushion trend measured flat (+-0.1 s/hour). FEC parked (Muni:
 "nearly glitchless now").
+
+Clean build flashed 2026-10-10 01:19: both boards `f978a5d` `--fix-link` (no `--diag`) = `car-candidate-2026-10-10`. Verified: build lines name `LINK_Q` (+ `LINK_TOTALS` on the S3), no debug lines, link clean, PCM 176 frames/s.
