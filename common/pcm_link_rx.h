@@ -18,6 +18,9 @@ class PcmLinkRx {
   uint32_t crc_bad = 0;      // 'Q' frames that failed their CRC
   uint32_t lost_frames = 0;  // frames filled with concealment (from sequence gaps)
   uint32_t outages = 0;      // gaps too long to fill (faded in from silence)
+  // Loss runs by length in frames: 1, 2, 3-4, 5-8, 9-16 (longer = outages).
+  uint32_t runs[5] = {0, 0, 0, 0, 0};
+  uint32_t last_gap = 0;     // frames missing before the latest good frame
 
   void on_crc_bad() { crc_bad++; }
 
@@ -35,8 +38,10 @@ class PcmLinkRx {
           emit(fill_, LINK_Q_MAX_PCM);
         }
         lost_frames += gap;
+        runs[gap == 1 ? 0 : gap == 2 ? 1 : gap <= 4 ? 2 : gap <= 8 ? 3 : 4]++;
       }
     }
+    last_gap = have_seq_ ? (uint8_t)(seq - (uint8_t)(last_seq_ + 1)) : 0;
     conceal_.good(pcm, len);
     emit(pcm, len);
     last_seq_ = seq;

@@ -23,6 +23,9 @@
 #include "AudioTools.h"
 #include "AudioTools/AudioCodecs/CodecMP3Shine.h"
 #include "../common/mp3_pipeline.h"  // shared encoder + link baud (ENCODE_ON_S3)
+#ifdef LINK_DIAG
+#include "../common/link_diag.h"     // spike meter (opt-in debug, see diag_report())
+#endif
 #include "BluetoothA2DPSink.h"
 #include "esp_gap_bt_api.h"
 
@@ -373,8 +376,8 @@ Mp3Pipeline mp3_out(serial_sink);  // the shared encoder, output as 'A' frames
 
 // Every path that hands mono PCM downstream goes through here: encoded on
 // this board (default) or shipped raw to the S3 as 'P' frames (ENCODE_ON_S3).
-#ifdef ENCODE_ON_S3
-// 'Q' frames (link_protocol.h): PCM split into LINK_Q_MAX_PCM-byte pieces, each
+#if defined(ENCODE_ON_S3) && defined(LINK_Q)
+// LINK_Q (opt-in, both boards): 'Q' frames (link_protocol.h): PCM split into LINK_Q_MAX_PCM-byte pieces, each
 // with a sequence number and a CRC-16, so the S3 can drop a piece corrupted
 // on the wire and fill exactly the audio that went missing.
 static void send_pcm_crc(const uint8_t *pcm, uint32_t len) {
@@ -404,9 +407,22 @@ static void send_pcm_crc(const uint8_t *pcm, uint32_t len) {
 }
 #endif
 
+#ifdef LINK_DIAG
+// LINK_DIAG (opt-in): what the classic itself sees, once a second as a
+// "DIAG:" control frame (the S3 prints these too, so one log has both sides).
+static PcmSpikeMeter g_diag_spikes;               // on the mono PCM going onto the wire
+static volatile uint32_t g_diag_cb_gap_max_ms = 0, g_diag_cb_bytes = 0, g_diag_cb_last_ms = 0;
+static uint32_t g_diag_loop_max_us = 0;
+#endif
+
 static inline void emit_mono(const uint8_t *pcm, uint32_t len) {
-#ifdef ENCODE_ON_S3
+#ifdef LINK_DIAG
+  g_diag_spikes.feed(pcm, len);
+#endif
+#if defined(ENCODE_ON_S3) && defined(LINK_Q)
   send_pcm_crc(pcm, len);
+#elif defined(ENCODE_ON_S3)
+  send_framed(LINK_FRAME_PCM, pcm, len);  // the car build: 'P', no check
 #else
   mp3_out.write_mono(pcm, len);
 #endif
@@ -548,6 +564,14 @@ volatile int16_t g_pcm_peak_since_report = 0;
 void audio_data_callback(const uint8_t *data, uint32_t length) {
   last_real_audio_ms = millis();
   g_audio_cb_count++;
+#ifdef LINK_DIAG
+  {
+    uint32_t now = millis();
+    if (g_diag_cb_last_ms && now - g_diag_cb_last_ms > g_diag_cb_gap_max_ms) g_diag_cb_gap_max_ms = now - g_diag_cb_last_ms;
+    g_diag_cb_last_ms = now;
+    g_diag_cb_bytes += length;
+  }
+#endif
   {
     const int16_t *samples = (const int16_t *)data;
     uint32_t n = length / 2;
@@ -1451,26 +1475,48 @@ void avrc_play_pos_callback(uint32_t play_pos) {
 #endif
 // Which build this is (flash.sh passes the commit): flags compiled in. Sent
 // at boot and once a minute, since a logger started after a flash misses boot.
-static void send_build_frame() {
-    char b[128];
-    snprintf(b, sizeof(b), "BUILD:commit=%07lx%s%s%s%s", (unsigned long)BUILD_GIT_SHA,
-             BUILD_GIT_DIRTY ? "+dirty" : "",
+// Every flag that changes behavior, by name.
 #ifdef V2_ALL
-             " V2_ALL",
+#define BF_V2_ALL " V2_ALL"
 #else
-             "",
+#define BF_V2_ALL ""
 #endif
 #ifdef ENCODE_ON_S3
-             " ENCODE_ON_S3",
+#define BF_ENCODE_ON_S3 " ENCODE_ON_S3"
 #else
-             "",
+#define BF_ENCODE_ON_S3 ""
 #endif
 #ifdef DIAG_LOOP_DRAIN
-             " DIAG_LOOP_DRAIN"
+#define BF_DIAG_LOOP_DRAIN " DIAG_LOOP_DRAIN"
 #else
-             ""
+#define BF_DIAG_LOOP_DRAIN ""
 #endif
-             );
+#ifdef DIAG_FRAG_TRACE
+#define BF_DIAG_FRAG_TRACE " DIAG_FRAG_TRACE"
+#else
+#define BF_DIAG_FRAG_TRACE ""
+#endif
+#ifdef A2DP_DISABLE_AVRC
+#define BF_A2DP_DISABLE_AVRC " A2DP_DISABLE_AVRC"
+#else
+#define BF_A2DP_DISABLE_AVRC ""
+#endif
+#ifdef LINK_Q
+#define BF_LINK_Q " LINK_Q"
+#else
+#define BF_LINK_Q ""
+#endif
+#ifdef LINK_DIAG
+#define BF_LINK_DIAG " LINK_DIAG"
+#else
+#define BF_LINK_DIAG ""
+#endif
+static const char BUILD_FLAGS_STR[] = BF_V2_ALL BF_ENCODE_ON_S3 BF_DIAG_LOOP_DRAIN BF_DIAG_FRAG_TRACE BF_A2DP_DISABLE_AVRC BF_LINK_Q BF_LINK_DIAG;
+
+static void send_build_frame() {
+    char b[192];
+    snprintf(b, sizeof(b), "BUILD:commit=%07lx%s%s", (unsigned long)BUILD_GIT_SHA,
+             BUILD_GIT_DIRTY ? "+dirty" : "", BUILD_FLAGS_STR);
     send_control(b);
 }
 
@@ -1807,7 +1853,36 @@ void manage_encoder() {
 #endif  // ENCODE_ON_S3: the S3 owns the encoder, nothing to manage here
 }
 
+#ifdef LINK_DIAG
+// Once a second: Bluetooth callbacks (bytes, longest gap), loop() longest
+// iteration, spikes in the PCM sent to the S3. Spikes here = damaged before
+// the wire (Bluetooth / decoding); compare with the S3's own spike count.
+static void diag_report() {
+  static uint32_t last_ms = 0;
+  uint32_t now = millis();
+  if (now - last_ms < 1000) return;
+  last_ms = now;
+  char b[160];
+  snprintf(b, sizeof(b), "DIAG:cb_bytes=%lu cb_gap_max_ms=%lu loop_max_us=%lu spikes=%lu max_jump=%ld drops=%lu heap_free=%u heap_min=%u",
+           (unsigned long)g_diag_cb_bytes, (unsigned long)g_diag_cb_gap_max_ms, (unsigned long)g_diag_loop_max_us,
+           (unsigned long)g_diag_spikes.spikes, (long)g_diag_spikes.max_jump, (unsigned long)pcm_drops,
+           (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMinFreeHeap());
+  g_diag_cb_bytes = 0; g_diag_cb_gap_max_ms = 0; g_diag_loop_max_us = 0;
+  g_diag_spikes.reset();
+  send_control(b);
+}
+#endif
+
 void loop() {
+#ifdef LINK_DIAG
+  {
+    static uint32_t prev_us = 0;
+    uint32_t now_us = micros();
+    if (prev_us && now_us - prev_us > g_diag_loop_max_us) g_diag_loop_max_us = now_us - prev_us;
+    prev_us = now_us;
+    diag_report();
+  }
+#endif
   manage_encoder();
   // Deferred from connection_state_changed() -- see its own comment and
   // g_need_avrc_ct_reregister's declaration for why this can't happen

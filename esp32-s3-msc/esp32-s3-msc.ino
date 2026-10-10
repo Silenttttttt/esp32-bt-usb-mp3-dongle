@@ -59,10 +59,29 @@
 #include "../common/link_protocol.h"  // LINK_BAUD + frame types, shared with the classic
 #ifdef ENCODE_ON_S3
 #include "../common/mp3_pipeline.h"   // the shared encoder (same source the classic uses by default)
+#endif
+// LINK_Q (opt-in, both boards, needs ENCODE_ON_S3): 'Q' frames with a sequence
+// number and CRC-16; the S3 drops a corrupted frame and fills the gap.
+// LINK_TOTALS (S3, needs LINK_Q): lifetime link-error totals in NVS.
+#if defined(LINK_Q) && !defined(ENCODE_ON_S3)
+#error "LINK_Q needs ENCODE_ON_S3"
+#endif
+#if defined(LINK_DIAG) && !defined(ENCODE_ON_S3)
+#error "LINK_DIAG needs ENCODE_ON_S3"
+#endif
+#if defined(LINK_TOTALS) && !defined(LINK_Q)
+#error "LINK_TOTALS needs LINK_Q"
+#endif
+#ifdef LINK_Q
 #include "../common/pcm_link_rx.h"    // 'Q' frames: fills PCM lost on the wire (pcm_conceal.h)
 #endif
+#ifdef LINK_DIAG
+#include "../common/link_diag.h"      // spike meter + single-bit check (opt-in debug)
+#endif
 #include <Adafruit_NeoPixel.h>
-#include <Preferences.h>  // lifetime link-error totals (ENCODE_ON_S3)
+#ifdef LINK_TOTALS
+#include <Preferences.h>
+#endif
 
 // UART pins to the classic ESP32's TX (its Serial/UART0 TX pin, wired
 // directly -- see CLAUDE.md's real end-state architecture diagram).
@@ -304,9 +323,29 @@ static volatile uint32_t g_enc_us_sum = 0, g_enc_us_max = 0, g_enc_n = 0, g_pcm_
 // Status LED inputs for this mode: encoder started OK, and when PCM last arrived.
 static volatile bool g_s3_encoder_ok = false;
 static volatile uint32_t g_pcm_last_ms = 0;
-// 'Q' frames: CRC failures, lost frames filled, and long gaps (link_rx), plus
-// lifetime totals kept in NVS so a drive with no laptop can be checked later.
+#ifdef LINK_Q
+// 'Q' frames: CRC failures, lost frames filled, and long gaps.
 static PcmLinkRx g_link_rx;
+#endif
+#ifdef LINK_DIAG
+// LINK_DIAG (opt-in): what the wire delivers. Spikes in received PCM (compare
+// with the classic's DIAG spikes: here only = the wire), bad headers, UART
+// errors, and with LINK_Q: CRC failures, single-bit-explainable failures,
+// loss-run lengths. Printed once a second when anything happened (else every
+// 10 s), plus one line per loss event (rate-limited).
+static PcmSpikeMeter g_diag_spikes;
+static volatile uint32_t g_diag_hdr_bad = 0, g_diag_crc_single = 0;
+static uint32_t g_diag_events_this_s = 0, g_diag_events_s = 0;
+static void diag_event(const char *what, uint32_t a, uint32_t b) {
+  uint32_t s = millis() / 1000;
+  if (s != g_diag_events_s) { g_diag_events_s = s; g_diag_events_this_s = 0; }
+  if (++g_diag_events_this_s > 10) return;  // at most 10 lines a second
+  Serial.printf("[s3] diag event t=%lu %s a=%lu b=%lu uart_frame=%lu ovf=%lu\n", (unsigned long)millis(), what,
+                (unsigned long)a, (unsigned long)b, (unsigned long)g_uart_errs[4], (unsigned long)g_uart_errs[3]);
+}
+#endif
+#ifdef LINK_TOTALS
+// Lifetime totals kept in NVS, so a drive with no laptop can be checked later.
 static Preferences g_link_prefs;
 static uint32_t g_saved_crc_bad = 0, g_saved_lost = 0, g_saved_outages = 0, g_saved_self = 0, g_boots = 0;
 
@@ -337,6 +376,7 @@ static void link_totals_save(bool quiet_now) {
   check_ms = millis();
   snap_sum = g_link_rx.crc_bad + g_link_rx.lost_frames + g_link_rx.outages;
 }
+#endif  // LINK_TOTALS
 static void encode_pcm(const uint8_t *pcm, uint32_t len) {
   uint32_t t0 = micros();
   g_s3_encoder.write_mono(pcm, len);
@@ -358,11 +398,17 @@ static void link_task(void *) {
 
     bool known = frame_type == LINK_FRAME_MP3 || frame_type == LINK_FRAME_CONTROL;
 #ifdef ENCODE_ON_S3
-    known = known || frame_type == LINK_FRAME_PCM ||
-            (frame_type == LINK_FRAME_PCM_CRC && link_q_len_ok(length));
+    known = known || frame_type == LINK_FRAME_PCM;
+#endif
+#ifdef LINK_Q
+    known = known || (frame_type == LINK_FRAME_PCM_CRC && link_q_len_ok(length));
 #endif
     if (!known || length > MAX_FRAME_LEN) {
       g_link_frames_bad++;
+#ifdef LINK_DIAG
+      g_diag_hdr_bad++;
+      diag_event("bad_header", (uint8_t)frame_type, length);
+#endif
       static uint32_t last_bad_log_ms = 0;  // one line per burst, for matching against clicks
       if (millis() - last_bad_log_ms > 2000) {
         last_bad_log_ms = millis();
@@ -373,11 +419,20 @@ static void link_task(void *) {
       continue;  // bad header -- rescan from find_sync(), same as the Python side
     }
     if (length) read_exact(payload, length);
-#ifdef ENCODE_ON_S3
+#ifdef LINK_Q
     if (frame_type == LINK_FRAME_PCM_CRC) {
       uint8_t trailer[2];
       read_exact(trailer, 2);
       if (!link_q_crc_ok(header, payload, length, trailer)) {
+#ifdef LINK_DIAG
+        {
+          uint16_t calc = link_crc16(payload, length, link_crc16(header, 5));
+          uint16_t syn = calc ^ (uint16_t)((trailer[0] << 8) | trailer[1]);
+          bool single = link_crc16_single_bit(syn, (5 + length) * 8);
+          if (single) g_diag_crc_single++;
+          diag_event(single ? "crc_fail single_bit" : "crc_fail multi_bit", payload[0], length);
+        }
+#endif
         g_link_rx.on_crc_bad();
         g_link_frames_bad++;
         continue;  // the sequence number of the next good frame says how much to fill
@@ -388,12 +443,28 @@ static void link_task(void *) {
 
     if (frame_type == LINK_FRAME_MP3) {
       append_mp3(payload, length);
-#ifdef ENCODE_ON_S3
+#ifdef LINK_Q
     } else if (frame_type == LINK_FRAME_PCM_CRC) {
       g_pcm_last_ms = millis();
+#ifdef LINK_DIAG
+      {
+        static uint8_t diag_last_seq = 0;
+        static bool diag_have_seq = false;
+        bool cont = diag_have_seq && payload[0] == (uint8_t)(diag_last_seq + 1);
+        if (diag_have_seq && !cont) diag_event("gap_frames", (uint8_t)(payload[0] - (uint8_t)(diag_last_seq + 1)), payload[0]);
+        g_diag_spikes.feed(payload + 1, length - 1, cont);
+        diag_last_seq = payload[0];
+        diag_have_seq = true;
+      }
+#endif
       g_link_rx.on_good(payload[0], payload + 1, length - 1, g_pcm_last_ms, encode_pcm);
-    } else if (frame_type == LINK_FRAME_PCM) {  // older classic: no CRC
+#endif
+#ifdef ENCODE_ON_S3
+    } else if (frame_type == LINK_FRAME_PCM) {  // no CRC (the car build)
       g_pcm_last_ms = millis();
+#ifdef LINK_DIAG
+      g_diag_spikes.feed(payload, length);
+#endif
       encode_pcm(payload, length);
 #endif
     } else {
@@ -416,6 +487,10 @@ static void link_task(void *) {
       } else if (msg_len == 15 && memcmp(msg, "BT_DISCONNECTED", 15) == 0) {
         g_s3_bt_connected = false;
         g_s3_audio_live = false;  // can't be "live" with no peer connected
+#ifdef LINK_DIAG
+      } else if (msg_len >= 5 && memcmp(msg, "DIAG:", 5) == 0) {
+        Serial.printf("[s3] classic %.*s\n", (int)msg_len, (const char *)msg);
+#endif
       } else if (msg_len >= 12 && memcmp(msg, "S3_RX:S3_HB:", 12) == 0) {
         // Our own return-channel heartbeat, echoed all the way back --
         // confirms the S3->classic wire is genuinely reaching its
@@ -454,34 +529,52 @@ static void usb_event_callback(void *arg, esp_event_base_t event_base, int32_t e
 // Which build this is (flash.sh passes the commit): flags compiled in.
 // Printed at boot and once a minute, since a logger started after a flash
 // misses the boot line.
-static void print_build_line() {
-  Serial.printf("[s3] build: commit %07lx%s flags:%s%s%s%s%s file=%lu x %lu KB clusters (%lu B) ring=%lu B\n", (unsigned long)BUILD_GIT_SHA,
-                BUILD_GIT_DIRTY ? "+dirty" : "",
+// Every flag that changes behavior, by name, so a log line identifies the build.
 #ifdef FATDISK_ALWAYS_SERVE_LIVE
-                " ALWAYS_SERVE_LIVE",
+#define BF_FATDISK_ALWAYS_SERVE_LIVE " FATDISK_ALWAYS_SERVE_LIVE"
 #else
-                "",
+#define BF_FATDISK_ALWAYS_SERVE_LIVE ""
 #endif
 #ifdef FATDISK_MULTI_FILE
-                " MULTI_FILE",
+#define BF_FATDISK_MULTI_FILE " FATDISK_MULTI_FILE"
 #else
-                "",
+#define BF_FATDISK_MULTI_FILE ""
 #endif
 #ifdef LED_RAINBOW_PLAYING
-                " LED_RAINBOW",
+#define BF_LED_RAINBOW_PLAYING " LED_RAINBOW_PLAYING"
 #else
-                "",
+#define BF_LED_RAINBOW_PLAYING ""
 #endif
 #ifdef ENCODE_ON_S3
-                " ENCODE_ON_S3",
+#define BF_ENCODE_ON_S3 " ENCODE_ON_S3"
 #else
-                "",
+#define BF_ENCODE_ON_S3 ""
 #endif
 #ifdef MSC_TRACE
-                " MSC_TRACE",
+#define BF_MSC_TRACE " MSC_TRACE"
 #else
-                "",
+#define BF_MSC_TRACE ""
 #endif
+#ifdef LINK_Q
+#define BF_LINK_Q " LINK_Q"
+#else
+#define BF_LINK_Q ""
+#endif
+#ifdef LINK_TOTALS
+#define BF_LINK_TOTALS " LINK_TOTALS"
+#else
+#define BF_LINK_TOTALS ""
+#endif
+#ifdef LINK_DIAG
+#define BF_LINK_DIAG " LINK_DIAG"
+#else
+#define BF_LINK_DIAG ""
+#endif
+static const char BUILD_FLAGS_STR[] = BF_FATDISK_ALWAYS_SERVE_LIVE BF_FATDISK_MULTI_FILE BF_LED_RAINBOW_PLAYING BF_ENCODE_ON_S3 BF_MSC_TRACE BF_LINK_Q BF_LINK_TOTALS BF_LINK_DIAG;
+
+static void print_build_line() {
+  Serial.printf("[s3] build: commit %07lx%s flags:%s file=%lu x %lu KB clusters (%lu B) ring=%lu B\n",
+                (unsigned long)BUILD_GIT_SHA, BUILD_GIT_DIRTY ? "+dirty" : "", BUILD_FLAGS_STR,
                 (unsigned long)DATA_CLUSTERS, (unsigned long)(CLUSTER_SIZE / 1024),
                 (unsigned long)DECLARED_FILE_SIZE, (unsigned long)RING_SIZE);
 }
@@ -526,6 +619,8 @@ void setup() {
   g_s3_encoder_ok = enc_ok;
   Serial.printf("[s3] encoder (ENCODE_ON_S3): %s, int_free=%u\n", enc_ok ? "on" : "FAILED",
                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+#endif
+#ifdef LINK_TOTALS
   g_link_prefs.begin("link", false);
   g_saved_crc_bad = g_link_prefs.getUInt("crc_bad", 0);
   g_saved_lost = g_link_prefs.getUInt("lost", 0);
@@ -963,7 +1058,7 @@ void loop() {
     static uint32_t heartbeat_n = 0;
     if (++heartbeat_n % 60 == 0) {
       print_build_line();
-#ifdef ENCODE_ON_S3
+#ifdef LINK_TOTALS
       Serial.printf("[s3] link lifetime: boots=%lu crc_bad=%lu lost_frames=%lu outages=%lu (self_inflicted=%lu)\n",
                     (unsigned long)g_boots, (unsigned long)(g_saved_crc_bad + g_link_rx.crc_bad),
                     (unsigned long)(g_saved_lost + g_link_rx.lost_frames),
@@ -994,10 +1089,54 @@ void loop() {
     {
       uint32_t n = g_enc_n, sum = g_enc_us_sum, mx = g_enc_us_max, pcm = g_pcm_bytes;
       g_enc_n = 0; g_enc_us_sum = 0; g_enc_us_max = 0; g_pcm_bytes = 0;
-      Serial.printf("[s3] enc: frames=%lu pcm_bytes=%lu avg_us=%lu max_us=%lu crc_bad=%lu lost_frames=%lu\n",
+      Serial.printf("[s3] enc: frames=%lu pcm_bytes=%lu avg_us=%lu max_us=%lu\n",
                     (unsigned long)n, (unsigned long)pcm,
-                    (unsigned long)(n ? sum / n : 0), (unsigned long)mx,
-                    (unsigned long)g_link_rx.crc_bad, (unsigned long)g_link_rx.lost_frames);
+                    (unsigned long)(n ? sum / n : 0), (unsigned long)mx);
+#ifdef LINK_Q
+      Serial.printf("[s3] linkq: crc_bad=%lu lost_frames=%lu outages=%lu\n",
+                    (unsigned long)g_link_rx.crc_bad, (unsigned long)g_link_rx.lost_frames,
+                    (unsigned long)g_link_rx.outages);
+#endif
+#ifdef LINK_DIAG
+      {
+        static uint32_t prev_hdr = 0, prev_err[6] = {0}, quiet_s = 0;
+#ifdef LINK_Q
+        static uint32_t prev_crc = 0, prev_single = 0, prev_runs[5] = {0}, prev_out = 0;
+#endif
+        uint32_t d_hdr = g_diag_hdr_bad - prev_hdr, d_frame = g_uart_errs[4] - prev_err[4],
+                 d_par = g_uart_errs[5] - prev_err[5], d_brk = g_uart_errs[1] - prev_err[1],
+                 d_ovf = g_uart_errs[3] - prev_err[3], d_full = g_uart_errs[2] - prev_err[2];
+        bool any = d_hdr || d_frame || d_par || d_brk || d_ovf || d_full || g_diag_spikes.spikes;
+#ifdef LINK_Q
+        uint32_t d_crc = g_link_rx.crc_bad - prev_crc, d_single = g_diag_crc_single - prev_single,
+                 d_out = g_link_rx.outages - prev_out, d_runs[5];
+        for (int i = 0; i < 5; i++) { d_runs[i] = g_link_rx.runs[i] - prev_runs[i]; any = any || d_runs[i]; }
+        any = any || d_crc || d_out;
+#endif
+        if (any || ++quiet_s >= 10) {
+          quiet_s = 0;
+          Serial.printf("[s3] diag: spikes=%lu max_jump=%ld hdr_bad=%lu uart frame=%lu parity=%lu brk=%lu ovf=%lu full=%lu",
+                        (unsigned long)g_diag_spikes.spikes, (long)g_diag_spikes.max_jump, (unsigned long)d_hdr,
+                        (unsigned long)d_frame, (unsigned long)d_par, (unsigned long)d_brk, (unsigned long)d_ovf,
+                        (unsigned long)d_full);
+#ifdef LINK_Q
+          Serial.printf(" crc_bad=%lu single_bit=%lu runs[1,2,3-4,5-8,9-16]=%lu,%lu,%lu,%lu,%lu outages=%lu",
+                        (unsigned long)d_crc, (unsigned long)d_single, (unsigned long)d_runs[0],
+                        (unsigned long)d_runs[1], (unsigned long)d_runs[2], (unsigned long)d_runs[3],
+                        (unsigned long)d_runs[4], (unsigned long)d_out);
+#endif
+          Serial.printf("%s\n", any ? "" : " (quiet)");
+        }
+        prev_hdr = g_diag_hdr_bad;
+        for (int i = 0; i < 6; i++) prev_err[i] = g_uart_errs[i];
+#ifdef LINK_Q
+        prev_crc = g_link_rx.crc_bad; prev_single = g_diag_crc_single; prev_out = g_link_rx.outages;
+        for (int i = 0; i < 5; i++) prev_runs[i] = g_link_rx.runs[i];
+#endif
+        g_diag_spikes.reset();
+      }
+#endif
+#ifdef LINK_TOTALS
       {
         static uint32_t silent_since_ms = 0;
         if (g_s3_audio_live) silent_since_ms = 0;
@@ -1005,6 +1144,7 @@ void loop() {
         bool quiet = g_usb_suspended || (silent_since_ms && millis() - silent_since_ms > 10000);
         link_totals_save(quiet);
       }
+#endif
     }
 #endif
 #ifdef FATDISK_ALWAYS_SERVE_LIVE

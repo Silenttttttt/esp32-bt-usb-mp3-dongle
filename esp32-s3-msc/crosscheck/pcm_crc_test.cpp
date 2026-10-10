@@ -19,6 +19,7 @@
 #include <cstring>
 #include <vector>
 #include "../../common/pcm_link_rx.h"
+#include "../../common/link_diag.h"
 
 static const uint8_t MAGIC = 0xAA;
 static const uint32_t MAX_FRAME_LEN = 4096;
@@ -207,6 +208,48 @@ int main() {
     int p_step = max_step(old.pcm);
     printf("  max step: %d\n", p_step);
     check(p_step > 4 * src_step, "spikes get through without the CRC (the test can see them)");
+  }
+
+  printf("LINK_DIAG helpers\n");
+  {
+    // single-bit check on 518-byte messages (a 'Q' frame's CRC coverage)
+    srand(3);
+    uint8_t m[518], e[518];
+    int one = 0, two = 0, burst = 0;
+    const int N = 2000;
+    for (int t = 0; t < N; t++) {
+      for (auto &x : m) x = (uint8_t)rand();
+      uint16_t c = link_crc16(m, sizeof m);
+      memcpy(e, m, sizeof m);
+      int k = rand() % (518 * 8);
+      e[k / 8] ^= 0x80 >> (k % 8);
+      one += link_crc16_single_bit(link_crc16(e, sizeof e) ^ c, 518 * 8);
+      memcpy(e, m, sizeof m);
+      for (int j = 0; j < 2; j++) { int q = rand() % (518 * 8); e[q / 8] ^= 0x80 >> (q % 8); }
+      uint16_t sy = link_crc16(e, sizeof e) ^ c;
+      two += sy && link_crc16_single_bit(sy, 518 * 8);
+      memcpy(e, m, sizeof m);
+      int at = rand() % 500;
+      for (int j = 0; j < 8; j++) e[at + j] = (uint8_t)rand();
+      sy = link_crc16(e, sizeof e) ^ c;
+      burst += sy && link_crc16_single_bit(sy, 518 * 8);
+    }
+    printf("  single-bit read as single: %d/%d; 2-bit: %d/%d; 8-byte bursts: %d/%d\n", one, N, two, N, burst, N);
+    check(one == N && two == 0, "single-bit check: every 1-bit error, never a 2-bit one");
+    check(burst < N / 10, "bursts read as single-bit under 10% (ratio, not a verdict)");
+    // spike meter: clean music none, corrupted 'P' stream many
+    std::vector<uint8_t> clean_pcm = make_pcm(200, 1);
+    PcmSpikeMeter a;
+    a.feed(clean_pcm.data(), clean_pcm.size());
+    std::vector<uint8_t> p;
+    for (int c = 0; c < 200; c++) send_p(p, &clean_pcm[c * CHUNK], CHUNK);
+    corrupt(p, 10, 5);
+    Out old;
+    parse(p, old);
+    PcmSpikeMeter b;
+    b.feed(old.pcm.data(), old.pcm.size());
+    printf("  spikes: clean %u (max jump %d), 10 bursts through 'P' %u (max jump %d)\n", a.spikes, a.max_jump, b.spikes, b.max_jump);
+    check(a.spikes == 0 && b.spikes > 10, "spike meter: silent on clean audio, fires on corruption");
   }
 
   printf(fails ? "FAILED (%d)\n" : "ALL OK\n", fails);

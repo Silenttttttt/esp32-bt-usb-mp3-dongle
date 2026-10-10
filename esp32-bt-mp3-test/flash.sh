@@ -5,6 +5,8 @@
 #   ./flash.sh              build + flash v2 (the car build)
 #   ./flash.sh --v1         the v1 build instead (see BUILD_FLAGS.md)
 #   ./flash.sh --v1 --s3-encode  v1, but send PCM and let the S3 encode
+#   ./flash.sh --fix-link      + the post-car link fix (-DLINK_Q); flash BOTH boards with it or neither
+#   ./flash.sh --diag          + LINK_DIAG debug lines (works with or without --fix-link)
 #   ./flash.sh --no-upload  compile only
 #   ./flash.sh -DSOME_FLAG  extra -D flags, appended
 # Options can come in any order. The S3 must be flashed with the same profile
@@ -43,6 +45,8 @@ for a in "$@"; do
     --v1) V1=1 ;;
     --s3-encode) S3ENC=1 ;;
     --no-upload) UPLOAD=0 ;;
+    --fix-link) EXTRA+=(-DLINK_Q) ;;  # opt-in link fix (BUILD_FLAGS.md); BOTH boards or neither
+    --diag) EXTRA+=(-DLINK_DIAG) ;;  # opt-in debug lines (BUILD_FLAGS.md)
     -D*) EXTRA+=("$a") ;;
     *) echo "unknown argument: $a" >&2; exit 2 ;;
   esac
