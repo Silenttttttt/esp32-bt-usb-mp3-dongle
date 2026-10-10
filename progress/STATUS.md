@@ -6054,3 +6054,17 @@ fills repeat a few ms). The classic logs every command it sends the phone (`CMD_
 `auto_skip_near_end` (7 s before track ends, intended v2 feature) and one `radio_prev`. The phone,
 with no command from us, repeatedly jumped back at ~1:00 into tracks: 60.3 s -> 56.2 s (7 times)
 and 56.1 s -> 49.2 s (3 times). Phone/app behavior, not the boards.
+
+### 2026-10-10 -- False Back at S3 boot (bench), fixed; final bench build `c209365`
+
+The S3 relayed `RADIO_CMD:prev` twice within 2 s of every reboot on the bench (the phone jumped to the
+previous song). Reproduced with `--trace` and `car_capture.sh replay`: Linux probing the new drive
+reads the device's end (file 3's tail), signature offsets in file 1, then file 1's start; the
+detector saw a natural end and two Backs. Fix: `fatdisk_note_mount()` on the USB mount/resume
+events; for 5 s after, switches are tracked but not relayed (trace flag `suppressed`). Pauses don't
+open a window. Host test replays the traced probe pattern and fails without the window. Hardware
+re-check: same reads, both switches `suppressed`, nothing sent to the phone.
+Not seen in the car (the Kenwood's mount was verified clean), but cheap insurance for any host.
+Final bench build: both boards `c209365` `--fix-link --diag` (`KNOWN_BUILDS.md`:
+`bench-2026-10-10-fixlink`). Cushion trend measured flat (+-0.1 s/hour). FEC parked (Muni:
+"nearly glitchless now").
