@@ -11,3 +11,5 @@ Started 2026-10-05. Context: progress/STATUS.md (2026-10-05 entries), ARCHITECTU
 | T5 | Pick the fix from T4's data (FEC 24+8, CRC-32 single-bit fix, or physical only) | P1 | T4 | todo | 2026-10-05 | Muni wants one-way, fixed small delay, no growing delay |
 | T6 | Drift fixes: exact 512 B frames, exact-length gap fill | P1 | - | done (flashed, awaiting shake test) | 2026-10-05 | |
 | T7 | Push the local commits (ask first) | P2 | - | todo | 2026-09-26 | 7+ local commits |
+| T8 | One-bit correction (CRC-32 'R' frames) + rescan after a failed frame | P0 | T4 | done (flashed, awaiting shake test) | 2026-10-10 | from shake data: 45% single-bit, runs of 2 |
+| T9 | Shake test with T8; decide on FEC from what's still lost | P0 | T8 | todo | 2026-10-10 | compare: 239 frames / 13 s before |

@@ -6027,3 +6027,17 @@ can't (deletions). Physical without solder: parallel jumpers for TX and GND. Nex
   exact-length silence when elapsed time agrees (else outage). Host test: output length == input
   with uneven chunks, a 232 ms gap, a 3 s restart. `tools/s3_lag.py` prints the live cushion.
 - Reflashed both at the drift fix. Next: shake test, read `[s3] diag`/`linkq` + `tools/s3_lag.py`.
+
+### 2026-10-10 -- Shake test with `--fix-link`: crackle gone; then one-bit correction + rescan
+
+Shake (00:47:32-44, `--fix-link --diag`, 'Q' frames): S3 spikes **0** (was 100-430/s), Muni: "less
+bad, missing parts but not crackle". 239 frames filled in ~13 s (~10% of the audio), runs mostly 1-2
+frames; cushion steady ~0.6 s (one dip to 0.34 s), no underruns, no drift. ~45% of CRC failures were
+explained by a single flipped bit (bursts alone read ~7%).
+
+So, zero-delay, one-way: 'R' frames = CRC-32 + fixed 523 B; one-bit correction (safe with CRC-32);
+the length field isn't trusted; after an uncorrectable frame the bytes after its magic are rescanned
+(a deleted byte no longer costs the next frame too). Parser shared with the host test
+(`common/link_rx_parser.h`). The new test found a real fill bug: the history skipped earlier fills,
+so a later fill could repeat across a jump (15-17k steps); fixed (history = what the encoder got).
+Flashed both (`--fix-link --diag`). Next: shake again and compare with 239 frames / 13 s.
